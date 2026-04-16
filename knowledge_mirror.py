@@ -209,9 +209,22 @@ def reconcile_mirrors():
         # {letta_file_id: {folder_id, filename, scope, scope_id, user_ids, project_name}}
         letta_files = {}
 
-        # 个人文件
+        # 个人文件（先补填缺失的 personal_folder_id）
+        from routing import get_or_create_personal_folder
+        missing_folder_users = db.execute(
+            "SELECT user_id FROM user_cache WHERE personal_folder_id IS NULL OR personal_folder_id = ''"
+        ).fetchall()
+        for u in missing_folder_users:
+            try:
+                fid = get_or_create_personal_folder(u["user_id"])
+                db.execute("UPDATE user_cache SET personal_folder_id = ? WHERE user_id = ?", (fid, u["user_id"]))
+            except Exception:
+                pass
+        if missing_folder_users:
+            db.commit()
+
         personal_rows = db.execute(
-            "SELECT user_id, personal_folder_id FROM user_cache WHERE personal_folder_id IS NOT NULL"
+            "SELECT user_id, personal_folder_id FROM user_cache WHERE personal_folder_id IS NOT NULL AND personal_folder_id != ''"
         ).fetchall()
         for row in personal_rows:
             for f in _list_folder_files(letta, row["personal_folder_id"]):
