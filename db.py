@@ -1,6 +1,7 @@
 """SQLite 数据库初始化和连接"""
 import sqlite3
 import os
+from contextlib import contextmanager
 from config import DB_PATH
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -9,6 +10,19 @@ def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+@contextmanager
+def use_db():
+    """Context manager：自动关闭连接，异常时 rollback"""
+    conn = get_db()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def init_db():
     db = get_db()

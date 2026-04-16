@@ -199,12 +199,12 @@ def _attach_agent_resources(db, agent_id: str, user_id: str, project: str):
     org = _get_org_resources(db)
     try:
         letta.agents.blocks.attach(agent_id=agent_id, block_id=org["block_id"])
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"attach org block to {agent_id}: {e}")
     try:
         letta.agents.folders.attach(agent_id=agent_id, folder_id=org["folder_id"])
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"attach org folder to {agent_id}: {e}")
 
     proj = db.execute(
         "SELECT project_block_id, project_folder_id FROM projects WHERE project_id = ?",
@@ -213,18 +213,18 @@ def _attach_agent_resources(db, agent_id: str, user_id: str, project: str):
     if proj:
         try:
             letta.agents.blocks.attach(agent_id=agent_id, block_id=proj["project_block_id"])
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"attach project block to {agent_id}: {e}")
         try:
             letta.agents.folders.attach(agent_id=agent_id, folder_id=proj["project_folder_id"])
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"attach project folder to {agent_id}: {e}")
 
     personal_folder_id = get_or_create_personal_folder(user_id)
     try:
         letta.agents.folders.attach(agent_id=agent_id, folder_id=personal_folder_id)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"attach personal folder to {agent_id}: {e}")
 
 
 def _get_org_resources(db):
