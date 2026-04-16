@@ -103,7 +103,8 @@ function Drop({ onUpload }) {
 function Home({ go, user, projects }) {
   return <div>
     <Anim><div style={{marginBottom:32}}><div style={{fontSize:10,fontWeight:800,color:C.terra,letterSpacing:2.5,textTransform:"uppercase",marginBottom:8,fontFamily:"var(--ft)"}}>Knowledge</div><h2 style={{fontSize:28,fontWeight:300,margin:0,color:C.slate}}>知识管理中心</h2></div></Anim>
-    <Card hover delay={50} onClick={()=>go("personal")} style={{marginBottom:10}}><div style={{display:"flex",alignItems:"center",gap:14}}><div style={{width:42,height:42,borderRadius:12,background:C.tealBg,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>👤</div><div style={{flex:1}}><span style={{fontSize:15,fontWeight:700,color:C.slate}}>我的文件</span><p style={{fontSize:12,color:C.slateL,margin:"2px 0 0"}}>只有你的 AI 助手能看到</p></div><span style={{fontSize:11,color:C.sand}}>→</span></div></Card>
+    <Card hover delay={50} onClick={()=>go("memory")} style={{marginBottom:10}}><div style={{display:"flex",alignItems:"center",gap:14}}><div style={{width:42,height:42,borderRadius:12,background:"#EDE9FE",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>🧠</div><div style={{flex:1}}><span style={{fontSize:15,fontWeight:700,color:C.slate}}>我的记忆</span><p style={{fontSize:12,color:C.slateL,margin:"2px 0 0"}}>AI 助手记住的关于你的信息</p></div><span style={{fontSize:11,color:C.sand}}>→</span></div></Card>
+    <Card hover delay={80} onClick={()=>go("personal")} style={{marginBottom:10}}><div style={{display:"flex",alignItems:"center",gap:14}}><div style={{width:42,height:42,borderRadius:12,background:C.tealBg,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>👤</div><div style={{flex:1}}><span style={{fontSize:15,fontWeight:700,color:C.slate}}>我的文件</span><p style={{fontSize:12,color:C.slateL,margin:"2px 0 0"}}>只有你的 AI 助手能看到</p></div><span style={{fontSize:11,color:C.sand}}>→</span></div></Card>
     <Anim delay={100}><div style={{padding:"10px 0 6px"}}><div style={{fontSize:10,fontWeight:800,color:C.sand,letterSpacing:2,textTransform:"uppercase",marginBottom:10,paddingLeft:2,fontFamily:"var(--ft)"}}>Projects</div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(260px, 1fr))",gap:8}}>
         {projects.map((p,i) => <Card key={p.id} hover delay={140+i*60} onClick={()=>go("project",p.id)}>
@@ -158,6 +159,7 @@ function OrgPage({ back, user }) {
 function ProjPage({ pid, back, user }) {
   const [proj, setProj] = useState(null); const [k, setK] = useState(""); const [kLimit, setKLimit] = useState(2000);
   const [files, setFiles] = useState([]); const [members, setMembers] = useState([]);
+  const [suggestions, setSuggestions] = useState([]);
   const [tab, setTab] = useState("knowledge"); const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(true);
   const [isA, setIsA] = useState(false);
@@ -168,12 +170,14 @@ function ProjPage({ pid, back, user }) {
       api(`/project/${pid}/knowledge`),
       api(`/project/${pid}/files`),
       api(`/project/${pid}/members`),
-    ]).then(([ps, kd, fd, md])=>{
+      api(`/project/${pid}/suggestions`),
+    ]).then(([ps, kd, fd, md, sg])=>{
       const p = (ps||[]).find(x=>x.id===pid);
       if(p) { setProj(p); setIsA(p.role==="admin"); }
       if(kd) { setK(kd.content||""); setKLimit(kd.limit||2000); }
       if(fd) setFiles(fd);
       if(md) setMembers(md);
+      if(sg) setSuggestions(sg);
       setLoading(false);
     }).catch(()=>setLoading(false));
   },[pid]);
@@ -202,10 +206,27 @@ function ProjPage({ pid, back, user }) {
     <Anim delay={40}><div style={{display:"flex",alignItems:"center",gap:12,marginBottom:24}}><h2 style={{fontSize:24,fontWeight:300,margin:0,color:C.slate}}>{proj.name}</h2><Tag v={proj.role}>{proj.role}</Tag></div></Anim>
     <Anim delay={80}><div style={{display:"flex",gap:2,marginBottom:22,background:"#f0f0f0",borderRadius:10,padding:3}}>{tabs.map(t=><button key={t.id} onClick={()=>setTab(t.id)} style={{flex:1,background:tab===t.id?"#fff":"transparent",border:"none",cursor:"pointer",fontSize:12,fontWeight:600,padding:"8px 0",color:tab===t.id?"#1a1a1a":"#8a8a8a",borderRadius:8,transition:"all 0.25s",fontFamily:"var(--ft)",boxShadow:tab===t.id?"0 1px 3px rgba(0,0,0,0.08)":"none"}}>{t.label}</button>)}</div></Anim>
 
-    {tab==="knowledge" && <Card delay={120}><SH sub="项目成员对话中可见">Project Memory</SH>
-      <textarea value={k} onChange={e=>setK(e.target.value)} readOnly={!isA} style={{width:"100%",minHeight:130,resize:"vertical",fontFamily:"var(--fn)",fontSize:12.5,lineHeight:1.8,padding:"14px 16px",boxSizing:"border-box",borderRadius:12,border:`1px solid ${C.bdrL}`,background:"#FAF6F1",color:C.slate,outline:"none"}}/>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:12}}><Progress v={k.length} max={kLimit}/>{isA && <Btn v="primary" onClick={saveK}>{saved?"已保存 ✓":"保存修改"}</Btn>}</div>
-    </Card>}
+    {tab==="knowledge" && <div>
+      <Card delay={120}><SH sub="项目成员对话中可见">Project Memory</SH>
+        <textarea value={k} onChange={e=>setK(e.target.value)} readOnly={!isA} style={{width:"100%",minHeight:130,resize:"vertical",fontFamily:"var(--fn)",fontSize:12.5,lineHeight:1.8,padding:"14px 16px",boxSizing:"border-box",borderRadius:12,border:`1px solid ${C.bdrL}`,background:"#FAF6F1",color:C.slate,outline:"none"}}/>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:12}}><Progress v={k.length} max={kLimit}/>{isA && <Btn v="primary" onClick={saveK}>{saved?"已保存 ✓":"保存修改"}</Btn>}</div>
+      </Card>
+      {suggestions.filter(s=>s.status==="pending").length > 0 && <Card delay={180}>
+        <SH sub="AI 助手从对话中提取的项目信息，需管理员审核">💡 知识建议 · {suggestions.filter(s=>s.status==="pending").length}</SH>
+        {suggestions.filter(s=>s.status==="pending").map((s,i)=><Anim key={s.id} delay={40+i*30}>
+          <div style={{padding:"12px 14px",marginBottom:8,background:"#FFFBEB",borderRadius:10,border:"1px solid #FDE68A"}}>
+            <div style={{fontSize:12.5,color:C.slate,lineHeight:1.7,whiteSpace:"pre-wrap",marginBottom:10}}>{s.content}</div>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+              <span style={{fontSize:10.5,color:C.sand}}>来自 {s.user_name} · {(s.created_at||"").slice(0,10)}</span>
+              {isA && <div style={{display:"flex",gap:6}}>
+                <Btn v="primary" onClick={()=>{ api(`/project/${pid}/suggestions/${s.id}/approve`,{method:"POST"}).then(()=>{load()}).catch(e=>alert(e.message)); }} style={{fontSize:11,padding:"4px 12px"}}>采纳</Btn>
+                <Btn v="ghost" onClick={()=>{ api(`/project/${pid}/suggestions/${s.id}/reject`,{method:"POST"}).then(()=>{setSuggestions(ss=>ss.map(x=>x.id===s.id?{...x,status:"rejected"}:x))}).catch(e=>alert(e.message)); }} style={{fontSize:11,padding:"4px 10px",color:C.sand}}>忽略</Btn>
+              </div>}
+            </div>
+          </div>
+        </Anim>)}
+      </Card>}
+    </div>}
 
     {tab==="files" && <Card delay={120}><SH sub="仅项目成员的 Agent 可检索">项目文档</SH>
       <div style={{marginBottom:14}}><Progress v={proj.used_mb||0} max={proj.quota_mb||1024} unit="MB"/></div>
@@ -241,6 +262,49 @@ function ProjPage({ pid, back, user }) {
       <Progress v={proj.used_mb||0} max={proj.quota_mb||1024} unit="MB"/>
       <div style={{marginTop:24,paddingTop:16,borderTop:`1px solid ${C.bdrL}`}}><SH sub="删除后不可恢复">危险操作</SH><Btn v="danger" onClick={delProject}>删除此项目</Btn></div>
     </Card>}
+  </div>;
+}
+
+// ===== MEMORY PAGE =====
+function MemoryPage({ back }) {
+  const [memories, setMemories] = useState([]); const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState(null); const [editVal, setEditVal] = useState("");
+  const [saved, setSaved] = useState({});
+  useEffect(()=>{ api("/personal/memory").then(m=>{if(m)setMemories(m);setLoading(false)}).catch(()=>setLoading(false)); },[]);
+  const startEdit = (m)=>{ setEditing(m.block_id); setEditVal(m.content); };
+  const saveEdit = (blockId)=>{
+    api(`/personal/memory/${blockId}`,{method:"PUT",body:{content:editVal}})
+      .then(()=>{ setMemories(ms=>ms.map(m=>m.block_id===blockId?{...m,content:editVal}:m)); setEditing(null); setSaved(s=>({...s,[blockId]:true})); setTimeout(()=>setSaved(s=>({...s,[blockId]:false})),2000); })
+      .catch(e=>alert(e.message));
+  };
+  if(loading) return <div><Back onClick={back}/><Loading/></div>;
+  return <div><Back onClick={back}/>
+    <Anim delay={40}><div style={{display:"flex",alignItems:"center",gap:12,marginBottom:6}}><h2 style={{fontSize:24,fontWeight:300,margin:0,color:C.slate}}>我的记忆</h2></div>
+    <p style={{fontSize:12,color:C.slateL,margin:"0 0 28px",lineHeight:1.6}}>AI 助手从对话中学到的关于你的信息。每个项目的助手有独立的记忆。</p></Anim>
+    {memories.length === 0 && <Card delay={80}><div style={{textAlign:"center",padding:"32px 0",color:C.sand,fontSize:13}}>还没有记忆，和 AI 助手多聊聊吧</div></Card>}
+    {memories.map((m,i)=><Card key={m.block_id} delay={80+i*60}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <div style={{width:28,height:28,borderRadius:8,background:"#EDE9FE",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>🧠</div>
+          <div><div style={{fontSize:13,fontWeight:700,color:C.slate}}>AI 助手 ({m.project_id})</div></div>
+        </div>
+        {editing!==m.block_id && <Btn v="ghost" onClick={()=>startEdit(m)} style={{fontSize:11}}>编辑</Btn>}
+      </div>
+      {editing===m.block_id
+        ? <div>
+            <textarea value={editVal} onChange={e=>setEditVal(e.target.value)} style={{width:"100%",minHeight:120,resize:"vertical",fontFamily:"var(--fn)",fontSize:12.5,lineHeight:1.8,padding:"14px 16px",boxSizing:"border-box",borderRadius:12,border:`1px solid ${C.terra}`,background:"#FAF6F1",color:C.slate,outline:"none"}}/>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:10}}>
+              <Progress v={editVal.length} max={m.limit}/>
+              <div style={{display:"flex",gap:6}}>
+                <Btn v="ghost" onClick={()=>setEditing(null)} style={{fontSize:11}}>取消</Btn>
+                <Btn v="primary" onClick={()=>saveEdit(m.block_id)} style={{fontSize:11}}>保存</Btn>
+              </div>
+            </div>
+          </div>
+        : <div style={{background:"#FAF6F1",borderRadius:12,padding:"14px 16px",fontSize:12.5,lineHeight:1.8,color:C.slate,fontFamily:"var(--fn)",whiteSpace:"pre-wrap"}}>{m.content || <span style={{color:C.sand,fontStyle:"italic"}}>(暂无记忆)</span>}</div>
+      }
+      {saved[m.block_id] && <div style={{marginTop:8,fontSize:11,color:C.teal,fontWeight:600}}>已保存 ✓</div>}
+    </Card>)}
   </div>;
 }
 
@@ -329,6 +393,7 @@ function App() {
         {page === "home" && <Home go={go} user={user} projects={projects}/>}
         {page === "org" && <OrgPage back={()=>go("home")} user={user}/>}
         {page === "project" && <ProjPage pid={arg} back={()=>go("home")} user={user}/>}
+        {page === "memory" && <MemoryPage back={()=>go("home")}/>}
         {page === "personal" && <PersonalPage back={()=>go("home")}/>}
         {page === "new-project" && <NewProjectPage back={()=>go("home")} go={go}/>}
       </div>

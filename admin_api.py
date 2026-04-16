@@ -619,6 +619,153 @@ async def delete_personal_file(file_id: str, request: Request):
     return {"status": "ok"}
 
 
+# ===== 个人记忆（human block） =====
+
+
+@router.get("/personal/memory")
+async def get_personal_memory(request: Request):
+    """读取用户的 human block（AI 学到的用户信息）"""
+    user = extract_user_from_admin(request)
+    db = get_db()
+    rows = db.execute(
+        "SELECT agent_id, project_id FROM user_agent_map WHERE user_id = ?",
+        (user["id"],),
+    ).fetchall()
+    db.close()
+    memories = []
+    for row in rows:
+        try:
+            agent = letta.agents.retrieve(agent_id=row["agent_id"])
+            for block in agent.memory.blocks:
+                if block.label == "human":
+                    memories.append({
+                        "project_id": row["project_id"],
+                        "agent_id": row["agent_id"],
+                        "block_id": block.id,
+                        "content": block.value,
+                        "limit": block.limit,
+                    })
+        except Exception:
+            pass
+    return memories
+
+
+@router.put("/personal/memory/{block_id}")
+async def update_personal_memory(block_id: str, request: Request):
+    """用户编辑自己的 human block"""
+    user = extract_user_from_admin(request)
+    # 校验 block 属于该用户的 agent
+    db = get_db()
+    agent_ids = [r["agent_id"] for r in db.execute(
+        "SELECT agent_id FROM user_agent_map WHERE user_id = ?", (user["id"],)
+    ).fetchall()]
+    db.close()
+    for aid in agent_ids:
+        try:
+            agent = letta.agents.retrieve(agent_id=aid)
+            for block in agent.memory.blocks:
+                if block.id == block_id and block.label == "human":
+                    body = await request.json()
+                    letta.blocks.modify(block_id=block_id, value=body["content"])
+                    return {"status": "ok"}
+        except Exception:
+            pass
+    raise HTTPException(403, "无权编辑此记忆块")
+
+
+# ===== 知识建议 =====
+
+
+@router.get("/project/{project_id}/suggestions")
+async def list_suggestions(project_id: str, request: Request):
+    """列出项目的待审批知识建议"""
+    require_project_member(request, project_id)
+    db = get_db()
+    rows = db.execute(
+        "SELECT s.id, s.content, s.user_id, s.status, s.created_at, uc.name "
+        "FROM knowledge_suggestions s "
+        "LEFT JOIN user_cache uc ON s.user_id = uc.user_id "
+        "WHERE s.project_id = ? ORDER BY s.created_at DESC",
+        (project_id,),
+    ).fetchall()
+    db.close()
+    return [
+        {
+            "id": r["id"],
+            "content": r["content"],
+            "user_name": r["name"] or r["user_id"][:8],
+            "status": r["status"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+@router.post("/project/{project_id}/suggestions/{suggestion_id}/approve")
+async def approve_suggestion(project_id: str, suggestion_id: int, request: Request):
+    """采纳建议：追加到项目知识 Block"""
+    user = require_project_admin(request, project_id)
+    db = get_db()
+    row = db.execute(
+        "SELECT content FROM knowledge_suggestions WHERE id = ? AND project_id = ? AND status = 'pending'",
+        (suggestion_id, project_id),
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "建议不存在或已处理")
+
+    # 追加到项目知识 Block
+    proj = db.execute(
+        "SELECT project_block_id FROM projects WHERE project_id = ?", (project_id,)
+    ).fetchone()
+    block = letta.blocks.retrieve(block_id=proj["project_block_id"])
+    new_content = block.value.rstrip() + "\n" + row["content"]
+    letta.blocks.modify(block_id=proj["project_block_id"], value=new_content)
+
+    db.execute(
+        "UPDATE knowledge_suggestions SET status = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (user["id"], suggestion_id),
+    )
+    db.commit()
+    db.close()
+    return {"status": "ok"}
+
+
+@router.post("/project/{project_id}/suggestions/{suggestion_id}/reject")
+async def reject_suggestion(project_id: str, suggestion_id: int, request: Request):
+    """拒绝建议"""
+    user = require_project_admin(request, project_id)
+    db = get_db()
+    db.execute(
+        "UPDATE knowledge_suggestions SET status = 'rejected', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (user["id"], suggestion_id),
+    )
+    db.commit()
+    db.close()
+    return {"status": "ok"}
+
+
+# ===== 知识建议提交（供 Letta Agent 工具调用） =====
+
+
+@router.post("/project/{project_id}/suggestions")
+async def submit_suggestion(project_id: str, request: Request):
+    """Agent 工具调用：提交项目知识建议"""
+    body = await request.json()
+    user_id = body.get("user_id", "")
+    content = body.get("content", "").strip()
+    if not content:
+        raise HTTPException(400, "内容不能为空")
+    db = get_db()
+    db.execute(
+        "INSERT INTO knowledge_suggestions (project_id, user_id, content) VALUES (?, ?, ?)",
+        (project_id, user_id, content),
+    )
+    db.commit()
+    db.close()
+    return {"status": "ok"}
+
+
 # ===== 用户搜索（添加成员用） =====
 
 
