@@ -34,8 +34,9 @@ def _get_admin_token(force_refresh=False):
 
 
 def _make_user_token(user_id):
-    """生成用户的 JWT token（和 Open WebUI 共享 secret）"""
-    return jwt.encode({"id": user_id}, OPENWEBUI_JWT_SECRET, algorithm="HS256")
+    """生成用户的 JWT token（和 Open WebUI 共享 secret，需要 jti 字段）"""
+    import uuid
+    return jwt.encode({"id": user_id, "jti": str(uuid.uuid4())}, OPENWEBUI_JWT_SECRET, algorithm="HS256")
 
 
 def _api(method, path, json_data=None, token=None):
