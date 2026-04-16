@@ -635,8 +635,9 @@ async def get_personal_memory(request: Request):
     memories = []
     for row in rows:
         try:
-            agent = letta.agents.retrieve(agent_id=row["agent_id"])
-            for block in agent.memory.blocks:
+            blocks = list(getattr(letta.agents.blocks.list(agent_id=row["agent_id"]), "items",
+                                  letta.agents.blocks.list(agent_id=row["agent_id"])))
+            for block in blocks:
                 if block.label == "human":
                     memories.append({
                         "project_id": row["project_id"],
@@ -660,12 +661,13 @@ async def update_personal_memory(block_id: str, request: Request):
         "SELECT agent_id FROM user_agent_map WHERE user_id = ?", (user["id"],)
     ).fetchall()]
     db.close()
+    body = await request.json()
     for aid in agent_ids:
         try:
-            agent = letta.agents.retrieve(agent_id=aid)
-            for block in agent.memory.blocks:
+            blocks = list(getattr(letta.agents.blocks.list(agent_id=aid), "items",
+                                  letta.agents.blocks.list(agent_id=aid)))
+            for block in blocks:
                 if block.id == block_id and block.label == "human":
-                    body = await request.json()
                     letta.blocks.update(block_id=block_id, value=body["content"])
                     return {"status": "ok"}
         except Exception:
