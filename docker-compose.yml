@@ -19,8 +19,7 @@ services:
       - "8000"
     volumes:
       - adapter_data:/data/serving/adapter
-      # 挂载 Open WebUI 的宿主机数据目录，供 webui_sync.py 直接访问 webui.db
-      - ${OPENWEBUI_DATA_DIR:-/data/serving/open-webui}:/data/open-webui:rw
+      - open-webui-data:/data/open-webui:rw
     env_file: .env
     environment:
       - LETTA_BASE_URL=http://letta-server:8283
@@ -62,3 +61,5 @@ services:
 volumes:
   adapter_data:
   letta_pgdata:
+  open-webui-data:
+    external: true
