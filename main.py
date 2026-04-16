@@ -228,6 +228,8 @@ async def chat_completions(request: Request):
 
     # 拦截 # 引用的 Letta 镜像文件
     ref_files = body.get("files", [])
+    if ref_files:
+        logging.info(f"# ref files: {ref_files}")
     if ref_files and user_message:
         from knowledge_mirror import get_letta_file_id_by_knowledge
         ref_context_parts = []
@@ -242,7 +244,7 @@ async def chat_completions(request: Request):
             try:
                 # 尝试语义搜索 passages
                 results = letta.agents.passages.search(agent_id=agent_id, query=user_message, top_k=5)
-                texts = [r.text for r in getattr(results, "results", []) if hasattr(r, "text") and r.text]
+                texts = [getattr(r, "content", "") or getattr(r, "text", "") for r in getattr(results, "results", []) if getattr(r, "content", "") or getattr(r, "text", "")]
                 if texts:
                     ref_context_parts.append(f"=== 引用文档：{file_name} ===\n" + "\n---\n".join(texts[:3]))
                     continue
