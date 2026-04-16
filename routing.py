@@ -110,7 +110,7 @@ def get_or_create_agent(user_id: str, project: str) -> str:
                 "model_endpoint_type": "openai",
                 "model_endpoint": VLLM_ENDPOINT,
                 "context_window": 32000,
-                "enable_reasoner": False,
+                "enable_reasoner": True,
             },
         )
 

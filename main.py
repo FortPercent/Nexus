@@ -77,19 +77,31 @@ async def start_reconcile_loop():
 # ===== 聊天 API（在下方 /v1/models 之后定义）=====
 
 
+def _extract_letta_response(response) -> str:
+    """从 Letta 响应中提取 reasoning + assistant_content，拼成 <think> 格式"""
+    reasoning_parts = []
+    assistant_content = ""
+    for msg in response.messages:
+        msg_type = getattr(msg, "message_type", "")
+        if msg_type == "reasoning_message":
+            text = getattr(msg, "reasoning", "") or ""
+            if text:
+                reasoning_parts.append(text)
+        elif msg_type == "assistant_message":
+            content = getattr(msg, "content", "")
+            if content:
+                assistant_content = str(content)
+    # 拼接：<think>reasoning</think>content
+    if reasoning_parts:
+        return f"<think>{''.join(reasoning_parts)}</think>{assistant_content}"
+    return assistant_content
+
+
 async def non_stream_response(agent_id: str, message: str, model: str):
     response = letta.agents.messages.create(
         agent_id=agent_id, messages=[{"role": "user", "content": message}]
     )
-
-    assistant_content = ""
-    for msg in response.messages:
-        if hasattr(msg, "content") and msg.content:
-            msg_type = getattr(msg, "message_type", "")
-            # 只取 assistant_message，跳过 system_alert / tool_call_message 等内部消息
-            if msg_type and msg_type != "assistant_message":
-                continue
-            assistant_content = str(msg.content)
+    assistant_content = _extract_letta_response(response)
 
     return {
         "id": f"chatcmpl-{agent_id[:8]}",
@@ -111,15 +123,7 @@ async def fake_stream_from_letta(agent_id: str, message: str, model: str):
     response = letta.agents.messages.create(
         agent_id=agent_id, messages=[{"role": "user", "content": message}]
     )
-
-    assistant_content = ""
-    for msg in response.messages:
-        if hasattr(msg, "content") and msg.content:
-            msg_type = getattr(msg, "message_type", "")
-            # 只取 assistant_message，跳过 system_alert / tool_call_message 等内部消息
-            if msg_type and msg_type != "assistant_message":
-                continue
-            assistant_content = str(msg.content)
+    assistant_content = _extract_letta_response(response)
 
     # 把完整回复按字符切成 chunk 发送（模拟打字效果）
     chunk_size = 4
