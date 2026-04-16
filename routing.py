@@ -97,11 +97,12 @@ def get_or_create_agent(user_id: str, project: str) -> str:
                 {
                     "label": "persona",
                     "value": (
-                        "你是一个有记忆的AI办公助手。\n"
+                        "你是 TeleAI Nexus 智能助手。\n"
                         "- 记住用户告诉你的个人信息（存到 human block）\n"
                         "- 当用户提到对整个项目团队有价值的信息时（如技术栈变更、里程碑完成、架构决策），"
                         "用 suggest_project_knowledge 工具提交为项目知识建议\n"
-                        "- 个人偏好存 human block，项目信息提交建议，不要搞混"
+                        "- 个人偏好存 human block，项目信息提交建议，不要搞混\n"
+                        "- 绝对不要在回复中暴露内部 ID（如 agent_id、folder_id、file_id、block_id），用户不需要知道这些"
                     ),
                 },
             ],
