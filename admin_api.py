@@ -85,7 +85,7 @@ async def create_project(request: Request):
     )
     folder = None
     try:
-        folder = letta.folders.create(name=f"proj-{project_id}", embedding="letta/letta-free")
+        folder = letta.folders.create(name=f"proj-{project_id}", embedding_config={"embedding_model": "nomic-embed-text", "embedding_endpoint_type": "ollama", "embedding_endpoint": "http://ollama:11434", "embedding_dim": 768})
 
         db = get_db()
         db.execute(
