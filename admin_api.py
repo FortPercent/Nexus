@@ -394,7 +394,7 @@ async def update_project_knowledge(project_id: str, request: Request):
         "SELECT project_block_id FROM projects WHERE project_id = ?", (project_id,)
     ).fetchone()
     db.close()
-    letta.blocks.modify(block_id=row["project_block_id"], value=body["content"])
+    letta.blocks.update(block_id=row["project_block_id"], value=body["content"])
     return {"status": "ok"}
 
 
@@ -666,7 +666,7 @@ async def update_personal_memory(block_id: str, request: Request):
             for block in agent.memory.blocks:
                 if block.id == block_id and block.label == "human":
                     body = await request.json()
-                    letta.blocks.modify(block_id=block_id, value=body["content"])
+                    letta.blocks.update(block_id=block_id, value=body["content"])
                     return {"status": "ok"}
         except Exception:
             pass
@@ -720,7 +720,7 @@ async def approve_suggestion(project_id: str, suggestion_id: int, request: Reque
     ).fetchone()
     block = letta.blocks.retrieve(block_id=proj["project_block_id"])
     new_content = block.value.rstrip() + "\n" + row["content"]
-    letta.blocks.modify(block_id=proj["project_block_id"], value=new_content)
+    letta.blocks.update(block_id=proj["project_block_id"], value=new_content)
 
     db.execute(
         "UPDATE knowledge_suggestions SET status = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
