@@ -75,17 +75,27 @@ def _make_display_name(filename, scope, project_name=""):
 def mirror_file_for_user(letta_file_id, letta_folder_id, filename, scope, scope_id, user_id, project_name=""):
     """为某个用户创建一份镜像 Knowledge Collection"""
     display_name = _make_display_name(filename, scope, project_name)
-    user_token = _make_user_token(user_id)
 
+    # 用 admin token 创建，然后直接在 SQLite 里改 user_id
     result = _api("POST", "/api/v1/knowledge/create", {
         "name": display_name,
         "description": f"letta-mirror:{letta_file_id}",
-    }, token=user_token)
+    })
 
     if not result:
         return None
 
     knowledge_id = result.get("id", "")
+
+    # 直接改 Open WebUI SQLite，把 user_id 改成目标用户
+    try:
+        import sqlite3
+        conn = sqlite3.connect("/data/open-webui/webui.db", timeout=5)
+        conn.execute("UPDATE knowledge SET user_id = ? WHERE id = ?", (user_id, knowledge_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"failed to update knowledge user_id: {e}")
 
     db = get_db()
     try:
