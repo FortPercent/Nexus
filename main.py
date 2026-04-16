@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse
 from config import ADAPTER_API_KEY, VLLM_ENDPOINT, VLLM_API_KEY
 from db import init_db
 from auth import get_current_user
@@ -192,7 +192,8 @@ async def chat_completions(request: Request):
 
         # 关闭 thinking 模式，否则 content 为 null
         # 剔除 files 字段：qwen-no-mem 不处理 # 引用，避免无用数据透传
-        vllm_body = {k: v for k, v in body.items() if k != "files"}
+        _internal_keys = {"files", "_letta_files", "user_id", "user_name", "user_email", "user_role", "user"}
+        vllm_body = {k: v for k, v in body.items() if k not in _internal_keys}
         vllm_body["model"] = "Qwen3.5-122B-A10B"
         vllm_body["chat_template_kwargs"] = {"enable_thinking": False}
 

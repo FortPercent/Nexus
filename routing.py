@@ -53,76 +53,78 @@ def _get_suggest_tool_id() -> str:
 def get_or_create_agent(user_id: str, project: str) -> str:
     """获取用户对应的 Agent，不存在则自动创建并挂载分级知识。"""
     db = get_db()
-
-    is_member = db.execute(
-        "SELECT 1 FROM project_members WHERE user_id = ? AND project_id = ?",
-        (user_id, project),
-    ).fetchone()
-    if not is_member:
-        db.close()
-        raise HTTPException(403, f"你不是项目 {project} 的成员，请联系项目管理员添加")
-
-    row = db.execute(
-        "SELECT agent_id FROM user_agent_map WHERE user_id = ? AND project_id = ?",
-        (user_id, project),
-    ).fetchone()
-
-    if row:
-        agent_id = row["agent_id"]
-        db.close()
-
-        agent = letta.agents.retrieve(agent_id=agent_id)
-        owner = agent.metadata.get("owner")
-        if owner != user_id:
-            raise HTTPException(
-                500,
-                f"安全校验失败: agent {agent_id} 归属 {owner}，但映射表指向 user {user_id}",
-            )
-        return agent_id
-
-    # 获取知识建议工具
-    suggest_tool_id = None
     try:
-        suggest_tool_id = _get_suggest_tool_id()
-    except Exception as e:
-        logging.warning(f"failed to get suggest tool: {e}")
+        is_member = db.execute(
+            "SELECT 1 FROM project_members WHERE user_id = ? AND project_id = ?",
+            (user_id, project),
+        ).fetchone()
+        if not is_member:
+            raise HTTPException(403, f"你不是项目 {project} 的成员，请联系项目管理员添加")
 
-    agent = letta.agents.create(
-        name=f"user-{user_id}-{project}",
-        model="openai/Qwen3.5-122B-A10B",
-        metadata={"owner": user_id, "project": project},
-        tool_ids=[suggest_tool_id] if suggest_tool_id else [],
-        memory_blocks=[
-            {"label": "human", "value": "(新用户，信息未知)"},
-            {
-                "label": "persona",
-                "value": (
-                    "你是一个有记忆的AI办公助手。\n"
-                    "- 记住用户告诉你的个人信息（存到 human block）\n"
-                    "- 当用户提到对整个项目团队有价值的信息时（如技术栈变更、里程碑完成、架构决策），"
-                    "用 suggest_project_knowledge 工具提交为项目知识建议\n"
-                    "- 个人偏好存 human block，项目信息提交建议，不要搞混"
-                ),
+        row = db.execute(
+            "SELECT agent_id FROM user_agent_map WHERE user_id = ? AND project_id = ?",
+            (user_id, project),
+        ).fetchone()
+
+        if row:
+            agent_id = row["agent_id"]
+            db.close()
+            db = None
+
+            agent = letta.agents.retrieve(agent_id=agent_id)
+            owner = agent.metadata.get("owner")
+            if owner != user_id:
+                raise HTTPException(
+                    500,
+                    f"安全校验失败: agent {agent_id} 归属 {owner}，但映射表指向 user {user_id}",
+                )
+            return agent_id
+
+        # 获取知识建议工具
+        suggest_tool_id = None
+        try:
+            suggest_tool_id = _get_suggest_tool_id()
+        except Exception as e:
+            logging.warning(f"failed to get suggest tool: {e}")
+
+        agent = letta.agents.create(
+            name=f"user-{user_id}-{project}",
+            model="openai/Qwen3.5-122B-A10B",
+            metadata={"owner": user_id, "project": project},
+            tool_ids=[suggest_tool_id] if suggest_tool_id else [],
+            memory_blocks=[
+                {"label": "human", "value": "(新用户，信息未知)"},
+                {
+                    "label": "persona",
+                    "value": (
+                        "你是一个有记忆的AI办公助手。\n"
+                        "- 记住用户告诉你的个人信息（存到 human block）\n"
+                        "- 当用户提到对整个项目团队有价值的信息时（如技术栈变更、里程碑完成、架构决策），"
+                        "用 suggest_project_knowledge 工具提交为项目知识建议\n"
+                        "- 个人偏好存 human block，项目信息提交建议，不要搞混"
+                    ),
+                },
+            ],
+            llm_config={
+                "model": "Qwen3.5-122B-A10B",
+                "model_endpoint_type": "openai",
+                "model_endpoint": VLLM_ENDPOINT,
+                "context_window": 32000,
+                "enable_reasoner": False,
             },
-        ],
-        llm_config={
-            "model": "Qwen3.5-122B-A10B",
-            "model_endpoint_type": "openai",
-            "model_endpoint": VLLM_ENDPOINT,
-            "context_window": 32000,
-            "enable_reasoner": False,
-        },
-    )
+        )
 
-    _attach_agent_resources(db, agent.id, user_id, project)
+        _attach_agent_resources(db, agent.id, user_id, project)
 
-    db.execute(
-        "INSERT INTO user_agent_map (user_id, project_id, agent_id) VALUES (?, ?, ?)",
-        (user_id, project, agent.id),
-    )
-    db.commit()
-    db.close()
-    return agent.id
+        db.execute(
+            "INSERT INTO user_agent_map (user_id, project_id, agent_id) VALUES (?, ?, ?)",
+            (user_id, project, agent.id),
+        )
+        db.commit()
+        return agent.id
+    finally:
+        if db:
+            db.close()
 
 
 def get_or_create_org_resources() -> dict:

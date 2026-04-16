@@ -835,12 +835,21 @@ async def submit_suggestion(project_id: str, request: Request):
     if not content:
         raise HTTPException(400, "内容不能为空")
     db = get_db()
-    db.execute(
-        "INSERT INTO knowledge_suggestions (project_id, user_id, content) VALUES (?, ?, ?)",
-        (project_id, user_id, content),
-    )
-    db.commit()
-    db.close()
+    try:
+        # 验证 user_id 是项目成员（防止伪造提交）
+        member = db.execute(
+            "SELECT 1 FROM project_members WHERE user_id = ? AND project_id = ?",
+            (user_id, project_id),
+        ).fetchone()
+        if not member:
+            raise HTTPException(403, "非项目成员无法提交建议")
+        db.execute(
+            "INSERT INTO knowledge_suggestions (project_id, user_id, content) VALUES (?, ?, ?)",
+            (project_id, user_id, content),
+        )
+        db.commit()
+    finally:
+        db.close()
     return {"status": "ok"}
 
 
