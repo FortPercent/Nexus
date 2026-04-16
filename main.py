@@ -226,18 +226,33 @@ async def chat_completions(request: Request):
             user_message = msg["content"]
             break
 
-    # 拦截 # 引用的 Letta 镜像文件，把文件名提示拼入消息让 Agent 检索
+    # 拦截 # 引用的 Letta 镜像文件
     ref_files = body.get("files", [])
     if ref_files and user_message:
         from knowledge_mirror import get_letta_file_id_by_knowledge
-        ref_names = []
+        ref_context_parts = []
         for rf in ref_files:
             kid = rf.get("id") or rf.get("collection_name") or ""
-            if kid and get_letta_file_id_by_knowledge(kid):
-                ref_names.append(rf.get("name", kid))
-        if ref_names:
-            refs = "、".join(ref_names)
-            user_message = f"（请先搜索以下引用文档的内容：{refs}）\n\n{user_message}"
+            if not kid:
+                continue
+            mirror = get_letta_file_id_by_knowledge(kid)
+            if not mirror:
+                continue
+            file_name = rf.get("name", kid)
+            try:
+                # 尝试语义搜索 passages
+                results = letta.agents.passages.search(agent_id=agent_id, query=user_message, top_k=5)
+                texts = [r.text for r in getattr(results, "results", []) if hasattr(r, "text") and r.text]
+                if texts:
+                    ref_context_parts.append(f"=== 引用文档：{file_name} ===\n" + "\n---\n".join(texts[:3]))
+                    continue
+            except Exception:
+                pass
+            # passages 不可用时，提示 Agent 搜索
+            ref_context_parts.append(f"[用户引用了文档「{file_name}」，请使用 archival memory search 搜索该文档的相关内容来回答]")
+        if ref_context_parts:
+            context = "\n".join(ref_context_parts)
+            user_message = f"{context}\n\n{user_message}"
 
     if not user_message:
         return {"error": "No user message found"}
