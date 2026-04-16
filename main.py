@@ -231,8 +231,7 @@ async def chat_completions(request: Request):
 
     # 拦截 # 引用的 Letta 镜像文件
     ref_files = body.get("files", [])
-    if ref_files:
-        logging.info(f"# ref files: {ref_files}")
+    logging.info(f"# ref debug: files={ref_files}, body_keys={list(body.keys())}")
     if ref_files and user_message:
         from knowledge_mirror import get_letta_file_id_by_knowledge
         ref_context_parts = []
