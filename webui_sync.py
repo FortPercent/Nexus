@@ -105,11 +105,29 @@ def reconcile_common_model(model_id: str = "qwen-no-mem"):
         db.close()
 
 
-def reconcile_project_model(project_id: str, model_id: str, member_user_ids: list):
+def _ensure_model_registered(db, model_id: str, name: str):
+    """确保模型在 Open WebUI 的 model 表中注册。
+    Open WebUI 只对 model 表中存在的模型检查 access_grant，
+    未注册的"连接模型"只有 admin 可见。"""
+    existing = db.execute("SELECT id FROM model WHERE id = ?", (model_id,)).fetchone()
+    if not existing:
+        now = int(time.time())
+        db.execute(
+            "INSERT INTO model (id, user_id, base_model_id, name, meta, params, created_at, updated_at, is_active) "
+            "VALUES (?, '', NULL, ?, '{\"profile_image_url\": \"/static/favicon.png\"}', '{}', ?, ?, 1)",
+            (model_id, name, now, now)
+        )
+        logging.info(f"_ensure_model_registered: registered {model_id} as '{name}'")
+
+
+def reconcile_project_model(project_id: str, model_id: str, model_name: str, member_user_ids: list):
     """全量对账：确保项目模型的 access_grant 和成员列表完全一致。
     letta-* 项目模型由适配层全权托管：先删该模型的所有 read grant，再按成员列表重建。幂等。"""
     db = _get_webui_db()
     try:
+        # 确保模型在 model 表中注册，否则 access_grant 不生效
+        _ensure_model_registered(db, model_id, model_name)
+
         db.execute(
             "DELETE FROM access_grant WHERE resource_type='model' AND resource_id=? "
             "AND permission='read'",
@@ -140,12 +158,12 @@ def reconcile_all():
 
     # 2. 所有项目模型
     adapter_db = get_db()
-    projects = adapter_db.execute("SELECT project_id FROM projects").fetchall()
+    projects = adapter_db.execute("SELECT project_id, name FROM projects").fetchall()
     for proj in projects:
         pid = proj["project_id"]
         members = adapter_db.execute(
             "SELECT user_id FROM project_members WHERE project_id = ?", (pid,)
         ).fetchall()
         member_ids = [m["user_id"] for m in members]
-        reconcile_project_model(pid, f"letta-{pid}", member_ids)
+        reconcile_project_model(pid, f"letta-{pid}", f"AI 助手 ({proj['name']})", member_ids)
     adapter_db.close()

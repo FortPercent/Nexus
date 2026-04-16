@@ -95,8 +95,8 @@ function FileRow({ f, canDel, onDel, i = 0 }) {
 }
 function Drop({ onUpload }) {
   const [ov, setOv] = useState(false);
-  const handle = (e) => { e.preventDefault(); setOv(false); const f=e.dataTransfer?e.dataTransfer.files:e.target.files; if(f&&f[0]&&onUpload)onUpload(f[0]); };
-  return <div onDragOver={e=>{e.preventDefault();setOv(true)}} onDragLeave={()=>setOv(false)} onDrop={handle} onClick={()=>{const i=document.createElement("input");i.type="file";i.onchange=handle;i.click()}} style={{ border:`1.5px dashed ${ov?C.terra:C.bdr}`, borderRadius:14, padding:"24px 16px", textAlign:"center", cursor:"pointer", transition:"all 0.3s", background: ov?C.terraBg:"transparent" }}><div style={{fontSize:13,color:C.slateL}}>拖拽文件到此处，或<span style={{color:C.terra,fontWeight:700}}> 点击上传</span></div><div style={{fontSize:11,color:C.sand,marginTop:3}}>PDF / DOCX / TXT / MD · 最大 50MB</div></div>;
+  const handle = (e) => { e.preventDefault(); setOv(false); const f=e.dataTransfer?e.dataTransfer.files:e.target.files; if(f&&onUpload) for(let k=0;k<f.length;k++) onUpload(f[k]); };
+  return <div onDragOver={e=>{e.preventDefault();setOv(true)}} onDragLeave={()=>setOv(false)} onDrop={handle} onClick={()=>{const i=document.createElement("input");i.type="file";i.multiple=true;i.onchange=handle;i.click()}} style={{ border:`1.5px dashed ${ov?C.terra:C.bdr}`, borderRadius:14, padding:"24px 16px", textAlign:"center", cursor:"pointer", transition:"all 0.3s", background: ov?C.terraBg:"transparent" }}><div style={{fontSize:13,color:C.slateL}}>拖拽文件到此处，或<span style={{color:C.terra,fontWeight:700}}> 点击上传</span></div><div style={{fontSize:11,color:C.sand,marginTop:3}}>PDF / DOCX / TXT / MD · 最大 50MB</div></div>;
 }
 
 // ===== HOME =====
