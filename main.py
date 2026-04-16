@@ -231,12 +231,10 @@ async def chat_completions(request: Request):
             break
 
     # 拦截 # 引用的 Letta 镜像文件
-    ref_files = body.get("files", [])
-    # 完整 dump body（排除 messages 正文避免过长）
-    debug_body = {k: v for k, v in body.items() if k != "messages"}
-    debug_body["messages_count"] = len(body.get("messages", []))
-    debug_body["last_user_msg"] = next((m for m in reversed(body.get("messages", [])) if m.get("role") == "user"), {})
-    logging.info(f"chat req full: {json.dumps(debug_body, ensure_ascii=False, default=str)}")
+    # Open WebUI 会 pop 掉 files 做自己的 RAG，Pipeline Filter 提前备份到 _letta_files
+    ref_files = body.get("_letta_files", []) or body.get("files", [])
+    if ref_files:
+        logging.info(f"# ref: {json.dumps(ref_files, ensure_ascii=False, default=str)}")
     if ref_files and user_message:
         from knowledge_mirror import get_letta_file_id_by_knowledge
         ref_context_parts = []

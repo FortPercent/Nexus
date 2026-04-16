@@ -14,9 +14,12 @@ class Filter:
         pass
 
     def inlet(self, body: dict, __user__: dict) -> dict:
-        """请求发给适配层之前，注入用户身份"""
+        """请求发给适配层之前，注入用户身份 + 保留 # 引用文件信息"""
         body["user_id"] = __user__.get("id", "")
         body["user_name"] = __user__.get("name", "")
         body["user_email"] = __user__.get("email", "")
         body["user_role"] = __user__.get("role", "user")
+        # 保留 files 到自定义字段，防止 Open WebUI 后续 pop 掉
+        if body.get("files"):
+            body["_letta_files"] = body["files"]
         return body
