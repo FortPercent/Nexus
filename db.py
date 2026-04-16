@@ -69,16 +69,18 @@ def init_db():
     db.execute("""
         CREATE TABLE IF NOT EXISTS knowledge_mirrors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            letta_file_id TEXT NOT NULL UNIQUE,
+            letta_file_id TEXT NOT NULL,
             letta_folder_id TEXT NOT NULL,
-            knowledge_id TEXT NOT NULL,
+            knowledge_id TEXT NOT NULL UNIQUE,
             scope TEXT NOT NULL,
             scope_id TEXT DEFAULT '',
             owner_id TEXT DEFAULT '',
+            for_user_id TEXT NOT NULL,
             display_name TEXT NOT NULL,
             sync_status TEXT DEFAULT 'synced',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(letta_file_id, for_user_id)
         )
     """)
 
