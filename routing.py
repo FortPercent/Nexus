@@ -29,19 +29,17 @@ def _get_suggest_tool_id() -> str:
         Returns:
             提交结果
         """
-        import sqlite3 as _sqlite3
+        import urllib.request
+        import json as _json
         project_id = agent_state.metadata.get("project", "")
         user_id = agent_state.metadata.get("owner", "")
         if not project_id or not content.strip():
             return "提交失败：缺少项目信息或内容为空"
         try:
-            conn = _sqlite3.connect("/data/serving/adapter/adapter.db", timeout=5)
-            conn.execute(
-                "INSERT INTO knowledge_suggestions (project_id, user_id, content) VALUES (?, ?, ?)",
-                (project_id, user_id, content.strip()),
-            )
-            conn.commit()
-            conn.close()
+            url = f"http://teleai-adapter:8000/admin/api/project/{project_id}/suggestions"
+            data = _json.dumps({"user_id": user_id, "content": content.strip()}).encode()
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            resp = urllib.request.urlopen(req, timeout=5)
             return "已提交知识建议，等待项目管理员审核"
         except Exception as e:
             return f"提交失败：{e}"
