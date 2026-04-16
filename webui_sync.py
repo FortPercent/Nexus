@@ -134,8 +134,9 @@ def reconcile_common_model(model_id: str = "qwen-no-mem"):
     logger.info(f"reconcile_common_model: set {model_id} to public")
 
 
-def reconcile_project_model(project_id: str, model_id: str, member_user_ids: list):
-    """对账项目模型：access_grants 全量覆盖为成员列表。"""
+def reconcile_project_model(project_id: str, model_id: str, model_name: str, member_user_ids: list):
+    """对账项目模型：access_grants 全量覆盖为成员列表。
+    access/update API 在模型不存在时会自动创建，无需额外注册。"""
     grants = [
         {"principal_type": "user", "principal_id": uid, "permission": "read"}
         for uid in member_user_ids
@@ -152,12 +153,12 @@ def reconcile_all():
     reconcile_common_model("qwen-no-mem")
 
     adapter_db = get_db()
-    projects = adapter_db.execute("SELECT project_id FROM projects").fetchall()
+    projects = adapter_db.execute("SELECT project_id, name FROM projects").fetchall()
     for proj in projects:
         pid = proj["project_id"]
         members = adapter_db.execute(
             "SELECT user_id FROM project_members WHERE project_id = ?", (pid,)
         ).fetchall()
         member_ids = [m["user_id"] for m in members]
-        reconcile_project_model(pid, f"letta-{pid}", member_ids)
+        reconcile_project_model(pid, f"letta-{pid}", f"AI 助手 ({proj['name']})", member_ids)
     adapter_db.close()
