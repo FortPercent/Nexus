@@ -165,7 +165,7 @@ async def list_models(request: Request):
             "id": "qwen-no-mem",
             "object": "model",
             "owned_by": "vllm",
-            "name": "Qwen3.5 无记忆版",
+            "name": "Nexus Lite",
         },
     ]
     # Letta 项目模型
@@ -174,7 +174,7 @@ async def list_models(request: Request):
             "id": f"letta-{r['project_id']}",
             "object": "model",
             "owned_by": "ai-infra",
-            "name": f"AI 助手 ({r['name']})",
+            "name": f"Nexus · {r['name']}",
         })
 
     return {"object": "list", "data": models}

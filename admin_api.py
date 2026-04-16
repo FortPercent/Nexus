@@ -104,7 +104,7 @@ async def create_project(request: Request):
         model_id = f"letta-{project_id}"
         webui_db = _get_webui_db()
         try:
-            _ensure_model_registered(webui_db, model_id, f"AI 助手 ({name})")
+            _ensure_model_registered(webui_db, model_id, f"Nexus · {name}")
             webui_db.commit()
         finally:
             webui_db.close()

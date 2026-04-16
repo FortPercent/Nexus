@@ -173,5 +173,5 @@ def reconcile_all():
             "SELECT user_id FROM project_members WHERE project_id = ?", (pid,)
         ).fetchall()
         member_ids = [m["user_id"] for m in members]
-        reconcile_project_model(pid, f"letta-{pid}", f"AI 助手 ({proj['name']})", member_ids)
+        reconcile_project_model(pid, f"letta-{pid}", f"Nexus · {proj['name']}", member_ids)
     adapter_db.close()
