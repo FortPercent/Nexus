@@ -2,6 +2,7 @@
 import json
 import asyncio
 import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -231,7 +232,7 @@ async def chat_completions(request: Request):
 
     # 拦截 # 引用的 Letta 镜像文件
     ref_files = body.get("files", [])
-    print(f"# ref debug: files={ref_files}, body_keys={list(body.keys())}", flush=True)
+    logging.info(f"chat req: model={model}, files={ref_files}, keys={list(body.keys())}")
     if ref_files and user_message:
         from knowledge_mirror import get_letta_file_id_by_knowledge
         ref_context_parts = []
