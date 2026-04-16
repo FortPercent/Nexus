@@ -12,6 +12,7 @@ from db import init_db
 from auth import get_current_user
 from routing import get_or_create_agent, get_or_create_org_resources, sync_org_resources_to_all_agents, letta
 from webui_sync import reconcile_all
+from knowledge_mirror import reconcile_mirrors
 
 app = FastAPI(title="TeleAI Adapter")
 
@@ -42,11 +43,15 @@ def startup():
         sync_org_resources_to_all_agents()
     except Exception as e:
         logging.error(f"startup org resource init failed: {e}")
-    # 启动时全量对账 Open WebUI 模型权限
+    # 启动时全量对账
     try:
         reconcile_all()
     except Exception as e:
         logging.error(f"startup reconcile failed: {e}")
+    try:
+        reconcile_mirrors()
+    except Exception as e:
+        logging.error(f"startup mirror reconcile failed: {e}")
 
 
 async def _reconcile_loop():
@@ -57,6 +62,10 @@ async def _reconcile_loop():
             reconcile_all()
         except Exception as e:
             logging.error(f"periodic reconcile failed: {e}")
+        try:
+            reconcile_mirrors()
+        except Exception as e:
+            logging.error(f"periodic mirror reconcile failed: {e}")
 
 
 @app.on_event("startup")
@@ -216,6 +225,19 @@ async def chat_completions(request: Request):
         if msg["role"] == "user":
             user_message = msg["content"]
             break
+
+    # 拦截 # 引用的 Letta 镜像文件，把文件名提示拼入消息让 Agent 检索
+    ref_files = body.get("files", [])
+    if ref_files and user_message:
+        from knowledge_mirror import get_letta_file_id_by_knowledge
+        ref_names = []
+        for rf in ref_files:
+            kid = rf.get("id") or rf.get("collection_name") or ""
+            if kid and get_letta_file_id_by_knowledge(kid):
+                ref_names.append(rf.get("name", kid))
+        if ref_names:
+            refs = "、".join(ref_names)
+            user_message = f"（请先搜索以下引用文档的内容：{refs}）\n\n{user_message}"
 
     if not user_message:
         return {"error": "No user message found"}

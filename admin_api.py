@@ -14,6 +14,7 @@ from auth import (
 )
 from routing import letta, get_or_create_org_resources, get_or_create_personal_folder
 from webui_sync import grant_model_access, revoke_model_access, revoke_all_model_access, reconcile_all
+from knowledge_mirror import mirror_file, unmirror_file
 
 router = APIRouter(prefix="/admin/api")
 
@@ -454,7 +455,16 @@ async def upload_project_file(project_id: str, request: Request, file: UploadFil
     ).fetchone()
     db.close()
     _check_folder_size(row["project_folder_id"], file, project_id)
-    letta.folders.files.upload(folder_id=row["project_folder_id"], file=(file.filename, file.file, file.content_type))
+    proj = db.execute("SELECT name FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+    db.close()
+    uploaded = letta.folders.files.upload(folder_id=row["project_folder_id"], file=(file.filename, file.file, file.content_type))
+    # 镜像到 Open WebUI Knowledge
+    try:
+        fid = uploaded.id if hasattr(uploaded, "id") else None
+        if fid:
+            mirror_file(fid, row["project_folder_id"], file.filename, "project", project_id, "", proj["name"] if proj else "")
+    except Exception as e:
+        logging.warning(f"mirror failed for {file.filename}: {e}")
     return {"status": "ok", "filename": file.filename}
 
 
@@ -467,6 +477,10 @@ async def delete_project_file(project_id: str, file_id: str, request: Request):
     ).fetchone()
     db.close()
     letta.folders.files.delete(folder_id=row["project_folder_id"], file_id=file_id)
+    try:
+        unmirror_file(file_id)
+    except Exception as e:
+        logging.warning(f"unmirror failed for {file_id}: {e}")
     return {"status": "ok"}
 
 
@@ -525,6 +539,8 @@ async def manual_reconcile(request: Request):
     """手动触发全量对账（POST，会修改 Open WebUI 数据库状态）"""
     require_org_admin(request)
     reconcile_all()
+    from knowledge_mirror import reconcile_mirrors
+    reconcile_mirrors()
     return {"status": "ok"}
 
 
@@ -568,10 +584,16 @@ async def upload_org_file(request: Request, file: UploadFile = File(...)):
     extract_user_from_admin(request)
     resources = get_or_create_org_resources()
     _check_folder_size(resources["folder_id"], file)
-    letta.folders.files.upload(
+    uploaded = letta.folders.files.upload(
         folder_id=resources["folder_id"],
         file=(file.filename, file.file, file.content_type),
     )
+    try:
+        fid = uploaded.id if hasattr(uploaded, "id") else None
+        if fid:
+            mirror_file(fid, resources["folder_id"], file.filename, "org")
+    except Exception as e:
+        logging.warning(f"mirror failed for org file {file.filename}: {e}")
     return {"status": "ok", "filename": file.filename}
 
 
@@ -580,6 +602,10 @@ async def delete_org_file(file_id: str, request: Request):
     require_org_admin(request)
     resources = get_or_create_org_resources()
     letta.folders.files.delete(folder_id=resources["folder_id"], file_id=file_id)
+    try:
+        unmirror_file(file_id)
+    except Exception as e:
+        logging.warning(f"unmirror failed for org file {file_id}: {e}")
     return {"status": "ok"}
 
 
@@ -607,7 +633,13 @@ async def upload_personal_file(request: Request, file: UploadFile = File(...)):
     user = extract_user_from_admin(request)
     folder_id = get_or_create_personal_folder(user["id"])
     _check_folder_size(folder_id, file)
-    letta.folders.files.upload(folder_id=folder_id, file=(file.filename, file.file, file.content_type))
+    uploaded = letta.folders.files.upload(folder_id=folder_id, file=(file.filename, file.file, file.content_type))
+    try:
+        fid = uploaded.id if hasattr(uploaded, "id") else None
+        if fid:
+            mirror_file(fid, folder_id, file.filename, "personal", "", user["id"])
+    except Exception as e:
+        logging.warning(f"mirror failed for personal file {file.filename}: {e}")
     return {"status": "ok", "filename": file.filename}
 
 
@@ -616,6 +648,10 @@ async def delete_personal_file(file_id: str, request: Request):
     user = extract_user_from_admin(request)
     folder_id = get_or_create_personal_folder(user["id"])
     letta.folders.files.delete(folder_id=folder_id, file_id=file_id)
+    try:
+        unmirror_file(file_id)
+    except Exception as e:
+        logging.warning(f"unmirror failed for personal file {file_id}: {e}")
     return {"status": "ok"}
 
 
