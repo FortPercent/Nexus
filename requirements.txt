@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+letta-client
+pyjwt
+python-multipart
+httpx

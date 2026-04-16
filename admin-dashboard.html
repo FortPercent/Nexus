@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TeleAI Nexus · 知识管理</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>body { margin: 0; padding: 0; background: #f9fafb; min-height: 100vh; }</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+// ===== API 工具 =====
+function getToken() {
+  return localStorage.getItem("token") || "";
+}
+async function api(path, opts = {}) {
+  const token = getToken();
+  const headers = { "Authorization": `Bearer ${token}`, ...opts.headers };
+  if (opts.body && !(opts.body instanceof FormData)) {
+    headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(opts.body);
+  }
+  const resp = await fetch(`/admin/api${path}`, { ...opts, headers });
+  if (resp.status === 401) { window.location.href = "/"; return null; }
+  if (!resp.ok) { const e = await resp.text(); throw new Error(e); }
+  return resp.json();
+}
+
+// ===== 样式常量 =====
+// Open WebUI 浅色风格
+const C = {
+  bg: "#f9fafb", card: "#ffffff", cardH: "#f8fafc",
+  bdr: "#e5e7eb", bdrL: "#f0f1f3",
+  terra: "#dc2626", terraBg: "#fef2f2",
+  teal: "#059669", tealBg: "#ecfdf5",
+  slate: "#111827", slateL: "#4b5563", slateXL: "#9ca3af",
+  sand: "#9ca3af",
+};
+const EC = { pdf: "#dc2626", md: "#059669", docx: "#2563eb", xlsx: "#059669", txt: "#9ca3af" };
+
+// ===== 基础 UI 组件（不变）=====
+function Anim({ children, delay = 0 }) {
+  const [v, setV] = useState(false);
+  useEffect(() => { const t = setTimeout(() => setV(true), 40 + delay); return () => clearTimeout(t); }, []);
+  return <div style={{ opacity: v ? 1 : 0, transform: v ? "translateY(0)" : "translateY(14px)", transition: `all 0.5s cubic-bezier(0.16,1,0.3,1) ${delay}ms` }}>{children}</div>;
+}
+function FIcon({ name, size = 32 }) {
+  const ext = (name || "txt").split(".").pop().toLowerCase();
+  const c = EC[ext] || "#9B9187";
+  return <svg width={size} height={size * 1.18} viewBox="0 0 32 38" style={{ flexShrink: 0 }}><path d="M3 1h17l8 8v26a3 3 0 01-3 3H3a3 3 0 01-3-3V4a3 3 0 013-3z" fill={c + "0C"} stroke={c + "30"} strokeWidth="0.8"/><path d="M20 1l8 8h-5a3 3 0 01-3-3V1z" fill={c + "18"}/><text x="16" y="27" textAnchor="middle" fontSize="8" fontWeight="700" fill={c} style={{ fontFamily: "var(--fn)" }}>{ext.toUpperCase()}</text></svg>;
+}
+function Av({ name, size = 30 }) {
+  const pals = [[C.terraBg, C.terra], [C.tealBg, C.teal], ["#F0EBF5", "#6B4FA0"], ["#FFF3E0", "#B8763A"]];
+  const [bg, fg] = pals[(name || "?").charCodeAt(0) % pals.length];
+  return <div style={{ width: size, height: size, borderRadius: size * 0.32, background: bg, display: "flex", alignItems: "center", justifyContent: "center", fontSize: size * 0.36, fontWeight: 700, color: fg, flexShrink: 0 }}>{(name || "?").slice(-2)}</div>;
+}
+function Tag({ children, v = "default" }) {
+  const m = { admin: ["#dbeafe", "#1d4ed8"], member: ["#f3f4f6", "#6b7280"], creator: ["#fef3c7", "#92400e"] };
+  const [bg, fg] = m[v] || ["#f3f4f6", "#6b7280"];
+  return <span style={{ fontSize: 10, fontWeight: 600, padding: "2px 8px", borderRadius: 5, background: bg, color: fg, letterSpacing: 0.3, fontFamily: "var(--ft)" }}>{children}</span>;
+}
+function Progress({ v, max, unit = "" }) {
+  const p = Math.min(Math.round((v / max) * 100), 100);
+  return <div style={{ display: "flex", alignItems: "center", gap: 10 }}><div style={{ flex: 1, height: 3, borderRadius: 2, background: C.bdrL, overflow: "hidden" }}><div style={{ width: `${p}%`, height: "100%", borderRadius: 2, background: p > 80 ? C.terra : C.teal, transition: "width 0.6s" }}/></div><span style={{ fontSize: 11, color: C.sand, fontFamily: "var(--fn)", whiteSpace: "nowrap" }}>{v}/{max}{unit && ` ${unit}`}</span></div>;
+}
+function Btn({ children, onClick, v = "default", style: sx = {} }) {
+  const vs = { primary: { background: "#111827", color: "#fff" }, default: { background: "#f3f4f6", color: "#374151" }, danger: { background: "#fef2f2", color: "#dc2626" }, ghost: { background: "transparent", color: "#9ca3af" } };
+  return <button onClick={onClick} style={{ border: "none", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 600, padding: "7px 16px", transition: "all 0.15s", display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "var(--ft)", ...vs[v], ...sx }}>{children}</button>;
+}
+function Card({ children, style: sx = {}, onClick, hover, delay = 0 }) {
+  const [h, setH] = useState(false);
+  return <Anim delay={delay}><div onClick={onClick} onMouseEnter={() => hover && setH(true)} onMouseLeave={() => hover && setH(false)} style={{ background: h ? C.cardH : C.card, border: `1px solid ${h ? C.bdr : C.bdrL}`, borderRadius: 16, padding: "1.25rem 1.35rem", transition: "all 0.35s", cursor: onClick ? "pointer" : "default", transform: h ? "translateY(-2px)" : "none", boxShadow: h ? "0 8px 32px rgba(60,48,36,0.08)" : "0 1px 4px rgba(60,48,36,0.03)", ...sx }}>{children}</div></Anim>;
+}
+function Back({ onClick }) {
+  return <Anim><button onClick={onClick} style={{ background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, color: C.sand, fontSize: 11, fontWeight: 700, padding: 0, marginBottom: 28, fontFamily: "var(--ft)", letterSpacing: 1, textTransform: "uppercase" }}>← 返回</button></Anim>;
+}
+function SH({ children, sub }) {
+  return <div style={{ marginBottom: 16 }}><div style={{ fontSize: 13, fontWeight: 700, color: "#111827", marginBottom: sub ? 4 : 0, fontFamily: "var(--ft)" }}>{children}</div>{sub && <div style={{ fontSize: 12, color: "#9ca3af" }}>{sub}</div>}</div>;
+}
+function Hint({ children }) {
+  return <div style={{ fontSize: 11, color: "#6b7280", marginTop: 14, padding: "10px 12px", background: "#f9fafb", lineHeight: 1.7, borderLeft: "2px solid #e5e7eb", borderRadius: "0 6px 6px 0" }}>{children}</div>;
+}
+function Loading() {
+  return <div style={{ textAlign: "center", padding: "40px 0", color: C.sand, fontSize: 13 }}>加载中...</div>;
+}
+function FileRow({ f, canDel, onDel, i = 0 }) {
+  const [h, setH] = useState(false);
+  const sz = f.size > 1024*1024 ? `${(f.size/1024/1024).toFixed(1)} MB` : `${Math.round(f.size/1024)} KB`;
+  return <Anim delay={50+i*30}><div onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)} style={{ display:"flex", alignItems:"center", gap:14, padding:"10px 12px", borderRadius:11, transition:"background 0.2s", background: h ? "#F8F3ED" : "transparent" }}><FIcon name={f.name}/><div style={{flex:1,minWidth:0}}><div style={{fontSize:13,fontWeight:600,color:C.slate,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.name}</div><div style={{fontSize:10.5,color:C.sand,marginTop:2,fontFamily:"var(--fn)"}}>{sz} · {(f.created_at||"").slice(0,10)}</div></div>{canDel && h && <Btn v="danger" onClick={()=>onDel&&onDel(f.id)} style={{fontSize:11,padding:"4px 10px"}}>删除</Btn>}</div></Anim>;
+}
+function Drop({ onUpload }) {
+  const [ov, setOv] = useState(false);
+  const handle = (e) => { e.preventDefault(); setOv(false); const f=e.dataTransfer?e.dataTransfer.files:e.target.files; if(f&&f[0]&&onUpload)onUpload(f[0]); };
+  return <div onDragOver={e=>{e.preventDefault();setOv(true)}} onDragLeave={()=>setOv(false)} onDrop={handle} onClick={()=>{const i=document.createElement("input");i.type="file";i.onchange=handle;i.click()}} style={{ border:`1.5px dashed ${ov?C.terra:C.bdr}`, borderRadius:14, padding:"24px 16px", textAlign:"center", cursor:"pointer", transition:"all 0.3s", background: ov?C.terraBg:"transparent" }}><div style={{fontSize:13,color:C.slateL}}>拖拽文件到此处，或<span style={{color:C.terra,fontWeight:700}}> 点击上传</span></div><div style={{fontSize:11,color:C.sand,marginTop:3}}>PDF / DOCX / TXT / MD · 最大 50MB</div></div>;
+}
+
+// ===== HOME =====
+function Home({ go, user, projects }) {
+  return <div>
+    <Anim><div style={{marginBottom:32}}><div style={{fontSize:10,fontWeight:800,color:C.terra,letterSpacing:2.5,textTransform:"uppercase",marginBottom:8,fontFamily:"var(--ft)"}}>Knowledge</div><h2 style={{fontSize:28,fontWeight:300,margin:0,color:C.slate}}>知识管理中心</h2></div></Anim>
+    <Card hover delay={50} onClick={()=>go("personal")} style={{marginBottom:10}}><div style={{display:"flex",alignItems:"center",gap:14}}><div style={{width:42,height:42,borderRadius:12,background:C.tealBg,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>👤</div><div style={{flex:1}}><span style={{fontSize:15,fontWeight:700,color:C.slate}}>我的文件</span><p style={{fontSize:12,color:C.slateL,margin:"2px 0 0"}}>只有你的 AI 助手能看到</p></div><span style={{fontSize:11,color:C.sand}}>→</span></div></Card>
+    <Anim delay={100}><div style={{padding:"10px 0 6px"}}><div style={{fontSize:10,fontWeight:800,color:C.sand,letterSpacing:2,textTransform:"uppercase",marginBottom:10,paddingLeft:2,fontFamily:"var(--ft)"}}>Projects</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(260px, 1fr))",gap:8}}>
+        {projects.map((p,i) => <Card key={p.id} hover delay={140+i*60} onClick={()=>go("project",p.id)}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:15,fontWeight:700,color:C.slate}}>{p.name}</span><Tag v={p.role}>{p.role}</Tag></div>
+          <p style={{fontSize:11,color:C.slateXL,margin:"0 0 10px",lineHeight:1.5}}>{p.desc||""}</p>
+          <div style={{display:"flex",gap:14,marginBottom:8,fontSize:11,color:C.sand,fontFamily:"var(--fn)"}}><span>👥 {p.members}</span><span>{p.used_mb||0}MB</span></div>
+          <Progress v={p.used_mb||0} max={p.quota_mb||1024} unit="MB"/>
+        </Card>)}
+      </div>
+      <Anim delay={260}><button onClick={()=>go("new-project")} style={{width:"100%",marginTop:8,padding:"11px",background:"none",border:`1.5px dashed ${C.bdr}`,borderRadius:12,cursor:"pointer",fontSize:12,color:C.sand,fontWeight:700,fontFamily:"var(--ft)"}}>+ 创建新项目</button></Anim>
+    </div></Anim>
+    <Anim delay={300}><div style={{padding:"10px 0 0"}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12,paddingLeft:2}}><div><div style={{fontSize:10,fontWeight:800,color:C.sand,letterSpacing:2,textTransform:"uppercase",fontFamily:"var(--ft)"}}>Organization</div><span style={{fontSize:13,fontWeight:600,color:C.slate}}>组织知识</span></div><Btn v="default" onClick={()=>go("org")} style={{fontSize:11,padding:"5px 12px"}}>管理 →</Btn></div></div></Anim>
+  </div>;
+}
+
+// ===== ORG PAGE =====
+function OrgPage({ back, user }) {
+  const [k, setK] = useState(""); const [limit, setLimit] = useState(2000);
+  const [files, setFiles] = useState([]); const [saved, setSaved] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const isAdmin = user.is_org_admin;
+  useEffect(()=>{
+    Promise.all([api("/org/knowledge"), api("/org/files")]).then(([kd, fd])=>{
+      if(kd) { setK(kd.content||""); setLimit(kd.limit||2000); }
+      if(fd) setFiles(fd);
+      setLoading(false);
+    }).catch(()=>setLoading(false));
+  },[]);
+  const save = ()=>{ api("/org/knowledge",{method:"PUT",body:{content:k}}).then(()=>{setSaved(true);setTimeout(()=>setSaved(false),2000)}).catch(e=>alert(e.message)); };
+  const upload = (file)=>{ const fd=new FormData(); fd.append("file",file); api("/org/files",{method:"POST",body:fd,headers:{}}).then(()=>api("/org/files").then(f=>f&&setFiles(f))).catch(e=>alert(e.message)); };
+  const del = (fid)=>{ api(`/org/files/${fid}`,{method:"DELETE"}).then(()=>setFiles(fs=>fs.filter(f=>f.id!==fid))).catch(e=>alert(e.message)); };
+  if(loading) return <div><Back onClick={back}/><Loading/></div>;
+  return <div><Back onClick={back}/>
+    <Anim delay={40}><h2 style={{fontSize:24,fontWeight:300,margin:"0 0 28px",color:C.slate}}>组织知识</h2></Anim>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(320px, 1fr))",gap:12,alignItems:"start"}}>
+      <Card delay={80}><SH sub="所有人的对话中始终可见">Core Memory</SH>
+        <textarea value={k} onChange={e=>setK(e.target.value)} readOnly={!isAdmin} style={{width:"100%",minHeight:200,resize:"vertical",fontFamily:"var(--fn)",fontSize:12.5,lineHeight:1.8,padding:"14px 16px",boxSizing:"border-box",borderRadius:12,border:`1px solid ${C.bdrL}`,background:isAdmin?"#FAF6F1":"#F5F1EC",color:C.slate,outline:"none",opacity:isAdmin?1:0.7}}/>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:12}}><Progress v={k.length} max={limit}/>{isAdmin && <Btn v="primary" onClick={save} style={{marginLeft:12}}>{saved?"已保存 ✓":"保存修改"}</Btn>}</div>
+        {!isAdmin && <Hint>核心知识仅组织管理员可编辑。</Hint>}
+      </Card>
+      <Card delay={160}><SH sub="Agent 按需检索">文档库</SH>
+        {files.map((f,i)=><FileRow key={f.id} f={f} canDel={isAdmin} onDel={del} i={i}/>)}
+        {files.length===0 && <div style={{textAlign:"center",padding:"20px 0",color:C.sand,fontSize:13}}>暂无文档</div>}
+        <div style={{marginTop:16}}><Drop onUpload={upload}/></div>
+        <Hint>所有人可上传，仅组织管理员可删除。</Hint>
+      </Card>
+    </div>
+  </div>;
+}
+
+// ===== PROJECT PAGE =====
+function ProjPage({ pid, back, user }) {
+  const [proj, setProj] = useState(null); const [k, setK] = useState(""); const [kLimit, setKLimit] = useState(2000);
+  const [files, setFiles] = useState([]); const [members, setMembers] = useState([]);
+  const [tab, setTab] = useState("knowledge"); const [saved, setSaved] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [isA, setIsA] = useState(false);
+
+  const load = useCallback(()=>{
+    Promise.all([
+      api("/projects"),
+      api(`/project/${pid}/knowledge`),
+      api(`/project/${pid}/files`),
+      api(`/project/${pid}/members`),
+    ]).then(([ps, kd, fd, md])=>{
+      const p = (ps||[]).find(x=>x.id===pid);
+      if(p) { setProj(p); setIsA(p.role==="admin"); }
+      if(kd) { setK(kd.content||""); setKLimit(kd.limit||2000); }
+      if(fd) setFiles(fd);
+      if(md) setMembers(md);
+      setLoading(false);
+    }).catch(()=>setLoading(false));
+  },[pid]);
+  useEffect(()=>{ load(); },[load]);
+
+  const saveK = ()=>{ api(`/project/${pid}/knowledge`,{method:"PUT",body:{content:k}}).then(()=>{setSaved(true);setTimeout(()=>setSaved(false),2000)}).catch(e=>alert(e.message)); };
+  const uploadFile = (file)=>{ const fd=new FormData(); fd.append("file",file); api(`/project/${pid}/files`,{method:"POST",body:fd,headers:{}}).then(()=>api(`/project/${pid}/files`).then(f=>f&&setFiles(f))).catch(e=>alert(e.message)); };
+  const delFile = (fid)=>{ api(`/project/${pid}/files/${fid}`,{method:"DELETE"}).then(()=>setFiles(fs=>fs.filter(f=>f.id!==fid))).catch(e=>alert(e.message)); };
+  const removeMember = (mid)=>{ if(!confirm("确定移除？")) return; api(`/project/${pid}/members/${mid}`,{method:"DELETE"}).then(()=>setMembers(ms=>ms.filter(m=>m.id!==mid))).catch(e=>alert(e.message)); };
+  const toggleRole = (mid, cur)=>{ const nr = cur==="admin"?"member":"admin"; api(`/project/${pid}/members/${mid}/role`,{method:"PUT",body:{role:nr}}).then(()=>load()).catch(e=>alert(e.message)); };
+  const addMember = ()=>{ const uid=prompt("输入用户 ID:"); if(!uid) return; api(`/project/${pid}/members`,{method:"POST",body:{user_id:uid}}).then(()=>load()).catch(e=>alert(e.message)); };
+  const delProject = ()=>{ if(!confirm(`确定删除项目「${proj?.name}」？不可恢复。`)) return; api(`/projects/${pid}`,{method:"DELETE"}).then(()=>back()).catch(e=>alert(e.message)); };
+
+  if(loading) return <div><Back onClick={back}/><Loading/></div>;
+  if(!proj) return <div><Back onClick={back}/><div style={{textAlign:"center",padding:"40px",color:C.sand}}>项目不存在或无权访问</div></div>;
+
+  const tabs = [{id:"knowledge",label:"核心知识"},{id:"files",label:`文档 · ${files.length}`},{id:"members",label:`成员 · ${members.length}`}];
+  if(isA) tabs.push({id:"settings",label:"设置"});
+
+  return <div><Back onClick={back}/>
+    <Anim delay={40}><div style={{display:"flex",alignItems:"center",gap:12,marginBottom:24}}><h2 style={{fontSize:24,fontWeight:300,margin:0,color:C.slate}}>{proj.name}</h2><Tag v={proj.role}>{proj.role}</Tag></div></Anim>
+    <Anim delay={80}><div style={{display:"flex",gap:2,marginBottom:22,background:"#f0f0f0",borderRadius:10,padding:3}}>{tabs.map(t=><button key={t.id} onClick={()=>setTab(t.id)} style={{flex:1,background:tab===t.id?"#fff":"transparent",border:"none",cursor:"pointer",fontSize:12,fontWeight:600,padding:"8px 0",color:tab===t.id?"#1a1a1a":"#8a8a8a",borderRadius:8,transition:"all 0.25s",fontFamily:"var(--ft)",boxShadow:tab===t.id?"0 1px 3px rgba(0,0,0,0.08)":"none"}}>{t.label}</button>)}</div></Anim>
+
+    {tab==="knowledge" && <Card delay={120}><SH sub="项目成员对话中可见">Project Memory</SH>
+      <textarea value={k} onChange={e=>setK(e.target.value)} readOnly={!isA} style={{width:"100%",minHeight:130,resize:"vertical",fontFamily:"var(--fn)",fontSize:12.5,lineHeight:1.8,padding:"14px 16px",boxSizing:"border-box",borderRadius:12,border:`1px solid ${C.bdrL}`,background:"#FAF6F1",color:C.slate,outline:"none"}}/>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:12}}><Progress v={k.length} max={kLimit}/>{isA && <Btn v="primary" onClick={saveK}>{saved?"已保存 ✓":"保存修改"}</Btn>}</div>
+    </Card>}
+
+    {tab==="files" && <Card delay={120}><SH sub="仅项目成员的 Agent 可检索">项目文档</SH>
+      <div style={{marginBottom:14}}><Progress v={proj.used_mb||0} max={proj.quota_mb||1024} unit="MB"/></div>
+      {files.length ? files.map((f,i)=><FileRow key={f.id} f={f} canDel={isA} onDel={delFile} i={i}/>) : <div style={{textAlign:"center",padding:"32px 0",color:C.sand,fontSize:13}}>暂无文档</div>}
+      <div style={{marginTop:16}}><Drop onUpload={uploadFile}/></div>
+    </Card>}
+
+    {tab==="members" && <Card delay={120}><SH sub={isA?"管理项目成员和权限":"当前项目成员"}>成员列表</SH>
+      {members.map((m,i)=><Anim key={m.id} delay={40+i*30}><div style={{display:"flex",alignItems:"center",gap:12,padding:"10px 10px",borderRadius:10}}>
+        <Av name={m.name||"?"} size={30}/>
+        <div style={{flex:1,minWidth:0}}><div style={{display:"flex",alignItems:"center",gap:6}}><span style={{fontSize:13,fontWeight:600,color:C.slate}}>{m.name||m.id.slice(0,8)}</span>{m.creator&&<Tag v="creator">创建者</Tag>}</div><div style={{fontSize:10.5,color:C.sand,fontFamily:"var(--fn)",marginTop:1}}>{m.email||""}</div></div>
+        <Tag v={m.role}>{m.role}</Tag>
+        {isA && !m.creator && <div style={{display:"flex",gap:4}}><Btn v="ghost" onClick={()=>toggleRole(m.id,m.role)} style={{fontSize:11}}>{m.role==="member"?"升级":"降级"}</Btn><Btn v="ghost" onClick={()=>removeMember(m.id)} style={{fontSize:11,color:C.terra}}>移除</Btn></div>}
+      </div></Anim>)}
+      {isA && <Anim delay={180}><button onClick={addMember} style={{width:"100%",marginTop:10,padding:"10px",background:"none",border:`1.5px dashed ${C.bdr}`,borderRadius:10,cursor:"pointer",fontSize:12,color:C.sand,fontWeight:700,fontFamily:"var(--ft)"}}>+ 添加成员</button></Anim>}
+      <Hint>添加成员 → Agent 自动挂载项目知识</Hint>
+    </Card>}
+
+    {tab==="settings" && isA && <Card delay={120}><SH sub="项目设置">设置</SH>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}><span style={{fontSize:13,color:C.slateL}}>存储限额: {proj.quota_mb||1024} MB · 已用: {proj.used_mb||0} MB</span></div>
+      <Progress v={proj.used_mb||0} max={proj.quota_mb||1024} unit="MB"/>
+      <div style={{marginTop:24,paddingTop:16,borderTop:`1px solid ${C.bdrL}`}}><SH sub="删除后不可恢复">危险操作</SH><Btn v="danger" onClick={delProject}>删除此项目</Btn></div>
+    </Card>}
+  </div>;
+}
+
+// ===== PERSONAL PAGE =====
+function PersonalPage({ back }) {
+  const [files, setFiles] = useState([]); const [loading, setLoading] = useState(true);
+  useEffect(()=>{ api("/personal/files").then(f=>{if(f)setFiles(f);setLoading(false)}).catch(()=>setLoading(false)); },[]);
+  const upload = (file)=>{ const fd=new FormData(); fd.append("file",file); api("/personal/files",{method:"POST",body:fd,headers:{}}).then(()=>api("/personal/files").then(f=>f&&setFiles(f))).catch(e=>alert(e.message)); };
+  const del = (fid)=>{ api(`/personal/files/${fid}`,{method:"DELETE"}).then(()=>setFiles(fs=>fs.filter(f=>f.id!==fid))).catch(e=>alert(e.message)); };
+  if(loading) return <div><Back onClick={back}/><Loading/></div>;
+  return <div><Back onClick={back}/>
+    <Anim delay={40}><h2 style={{fontSize:24,fontWeight:300,margin:"0 0 28px",color:C.slate}}>我的文件</h2></Anim>
+    <Card delay={80}><SH sub="仅自己的 Agent 可检索">个人文件</SH>
+      {files.map((f,i)=><FileRow key={f.id} f={f} canDel onDel={del} i={i}/>)}
+      {files.length===0 && <div style={{textAlign:"center",padding:"20px 0",color:C.sand,fontSize:13}}>暂无文件</div>}
+      <div style={{marginTop:16}}><Drop onUpload={upload}/></div>
+      <Hint>上传的文件只有你的 AI 助手能看到。</Hint>
+    </Card>
+  </div>;
+}
+
+// ===== NEW PROJECT PAGE =====
+function NewProjectPage({ back, go }) {
+  const [pid, setPid] = useState(""); const [pname, setPname] = useState("");
+  const [desc, setDesc] = useState(""); const [creating, setCreating] = useState(false);
+  const create = ()=>{
+    if(!pid.trim()||!pname.trim()) return;
+    setCreating(true);
+    api("/projects",{method:"POST",body:{id:pid,name:pname,desc}})
+      .then(()=>{ setTimeout(()=>go("project",pid), 500); })
+      .catch(e=>{ alert(e.message); setCreating(false); });
+  };
+  return <div><Back onClick={back}/>
+    <Anim delay={40}><h2 style={{fontSize:24,fontWeight:300,margin:"0 0 28px",color:C.slate}}>创建新项目</h2></Anim>
+    <Card delay={80}><SH sub="创建后你将自动成为 admin">项目信息</SH>
+      <div style={{display:"flex",flexDirection:"column",gap:14}}>
+        <div><label style={{fontSize:12,fontWeight:600,color:C.slateL,display:"block",marginBottom:5}}>项目 ID</label><input value={pid} onChange={e=>setPid(e.target.value.replace(/[^a-z0-9-]/g,""))} placeholder="如 ai-infra" style={{width:"100%",padding:"10px 14px",borderRadius:10,border:`1px solid ${C.bdrL}`,background:"#FAF6F1",color:C.slate,fontSize:13,fontFamily:"var(--fn)",outline:"none",boxSizing:"border-box"}}/></div>
+        <div><label style={{fontSize:12,fontWeight:600,color:C.slateL,display:"block",marginBottom:5}}>项目名称</label><input value={pname} onChange={e=>setPname(e.target.value)} placeholder="如 AI Infra" style={{width:"100%",padding:"10px 14px",borderRadius:10,border:`1px solid ${C.bdrL}`,background:"#FAF6F1",color:C.slate,fontSize:13,fontFamily:"var(--ft)",outline:"none",boxSizing:"border-box"}}/></div>
+        <div><label style={{fontSize:12,fontWeight:600,color:C.slateL,display:"block",marginBottom:5}}>简介（选填）</label><input value={desc} onChange={e=>setDesc(e.target.value)} placeholder="如 GPU 集群 · 模型推理" style={{width:"100%",padding:"10px 14px",borderRadius:10,border:`1px solid ${C.bdrL}`,background:"#FAF6F1",color:C.slate,fontSize:13,fontFamily:"var(--ft)",outline:"none",boxSizing:"border-box"}}/></div>
+        <div style={{display:"flex",alignItems:"center",gap:12,marginTop:4}}><Btn v="primary" onClick={create} style={{opacity:(!pid.trim()||!pname.trim()||creating)?0.4:1}}>{creating?"创建中...":"创建项目"}</Btn><Btn v="ghost" onClick={back}>取消</Btn></div>
+      </div>
+    </Card>
+  </div>;
+}
+
+// ===== APP =====
+function App() {
+  const [page, setPage] = useState("home");
+  const [arg, setArg] = useState(null);
+  const [user, setUser] = useState(null);
+  const [projects, setProjects] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const go = (p, a = null) => { setPage(p); setArg(a); if(p==="home") loadData(); };
+
+  const loadData = () => {
+    Promise.all([api("/me"), api("/projects")]).then(([me, ps]) => {
+      if(me) setUser(me);
+      if(ps) setProjects(ps);
+      setLoading(false);
+    }).catch(() => {
+      setLoading(false);
+      window.location.href = "/";
+    });
+  };
+
+  useEffect(() => { loadData(); }, []);
+
+  if (loading) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",color:C.sand,fontSize:14}}>加载中...</div>;
+  if (!user) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",color:C.terra,fontSize:14}}>请先在 Open WebUI 登录后再访问此页面</div>;
+
+  return (
+    <div style={{"--ft":"'DM Sans', sans-serif","--fn":"'JetBrains Mono', monospace",fontFamily:"var(--ft)"}}>
+      <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet"/>
+      <style>{`* { box-sizing: border-box; margin: 0; } textarea:focus { border-color: #9ca3af !important; } input:focus { border-color: #9ca3af !important; } button:hover { filter: brightness(0.95); } button:active { transform: scale(0.98); } ::selection { background: #dbeafe; }`}</style>
+      <div style={{background:C.bg,padding:"clamp(16px,3vw,36px) clamp(14px,4vw,48px) 40px",position:"relative",overflow:"hidden",width:"100%",margin:"0 auto",minHeight:"100vh",boxSizing:"border-box"}}>
+        <Anim><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:28,flexWrap:"wrap",gap:10,borderBottom:"1px solid #e5e7eb",paddingBottom:16}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer"}} onClick={()=>go("home")}><div style={{width:28,height:28,borderRadius:7,background:"#111827",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:12,fontWeight:700}}>T</div><div><div style={{fontSize:14,fontWeight:700,color:"#111827"}}>TeleAI Nexus</div><div style={{fontSize:10,color:"#9ca3af",fontWeight:500}}>知识管理</div></div></div>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            {user.is_org_admin && <Btn onClick={()=>go("org")} style={{fontSize:11,padding:"5px 12px"}}>组织管理</Btn>}
+            <Av name={user.name||"?"} size={26}/>
+            <span style={{fontSize:12,color:"#4b5563",fontWeight:500}}>{user.name||user.email}</span>
+            <a href="/" style={{fontSize:11,color:"#059669",textDecoration:"none",fontWeight:600}}>← 返回聊天</a>
+          </div>
+        </div></Anim>
+        {page === "home" && <Home go={go} user={user} projects={projects}/>}
+        {page === "org" && <OrgPage back={()=>go("home")} user={user}/>}
+        {page === "project" && <ProjPage pid={arg} back={()=>go("home")} user={user}/>}
+        {page === "personal" && <PersonalPage back={()=>go("home")}/>}
+        {page === "new-project" && <NewProjectPage back={()=>go("home")} go={go}/>}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
