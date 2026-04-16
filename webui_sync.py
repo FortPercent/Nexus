@@ -105,19 +105,27 @@ def reconcile_common_model(model_id: str = "qwen-no-mem"):
         db.close()
 
 
+MODEL_META = '{"profile_image_url": "/static/favicon.png", "filterIds": ["user_inject"]}'
+
+
 def _ensure_model_registered(db, model_id: str, name: str):
     """确保模型在 Open WebUI 的 model 表中注册。
     Open WebUI 只对 model 表中存在的模型检查 access_grant，
-    未注册的"连接模型"只有 admin 可见。"""
-    existing = db.execute("SELECT id FROM model WHERE id = ?", (model_id,)).fetchone()
+    未注册的"连接模型"只有 admin 可见。
+    自动绑定 user_inject Filter，注入用户身份到请求体。"""
+    existing = db.execute("SELECT id, meta FROM model WHERE id = ?", (model_id,)).fetchone()
     if not existing:
         now = int(time.time())
         db.execute(
             "INSERT INTO model (id, user_id, base_model_id, name, meta, params, created_at, updated_at, is_active) "
-            "VALUES (?, '', NULL, ?, '{\"profile_image_url\": \"/static/favicon.png\"}', '{}', ?, ?, 1)",
-            (model_id, name, now, now)
+            "VALUES (?, '', NULL, ?, ?, '{}', ?, ?, 1)",
+            (model_id, name, MODEL_META, now, now)
         )
         logging.info(f"_ensure_model_registered: registered {model_id} as '{name}'")
+    elif existing["meta"] and '"filterIds"' not in existing["meta"]:
+        # 已注册但没绑 Filter，补上
+        db.execute("UPDATE model SET meta = ? WHERE id = ?", (MODEL_META, model_id))
+        logging.info(f"_ensure_model_registered: added filterIds to {model_id}")
 
 
 def reconcile_project_model(project_id: str, model_id: str, model_name: str, member_user_ids: list):
