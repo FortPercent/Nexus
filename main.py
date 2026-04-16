@@ -16,7 +16,7 @@ from webui_sync import reconcile_all
 app = FastAPI(title="TeleAI Adapter")
 
 
-@app.get("/km", response_class=HTMLResponse)
+@app.get("/knowledge", response_class=HTMLResponse)
 async def admin_page():
     """知识管理页面"""
     try:
