@@ -31,4 +31,7 @@ class Filter:
                 features.pop("web_search", None)
                 features.pop("image_generation", None)
                 body["features"] = features
+            # 清空 files，阻止 Open WebUI 做无用的 RAG 检索
+            # 引用数据已备份到 _letta_files，adapter 从那里读
+            body["files"] = []
         return body
