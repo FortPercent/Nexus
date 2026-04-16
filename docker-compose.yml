@@ -19,14 +19,13 @@ services:
       - "8000"
     volumes:
       - adapter_data:/data/serving/adapter
-      - open-webui-data:/data/open-webui:rw
     env_file: .env
     environment:
       - LETTA_BASE_URL=http://letta-server:8283
       - ORG_ADMIN_EMAILS=wuxn5@chinatelecom.cn,wengqzh@chinatelecom.cn
       - DEFAULT_FOLDER_QUOTA_MB=1024
       - DB_PATH=/data/serving/adapter/adapter.db
-      - WEBUI_DB_PATH=/data/open-webui/webui.db
+      - OPENWEBUI_URL=http://<临港集群地址>:<端口>
     depends_on:
       - letta-server
     restart: unless-stopped
@@ -61,5 +60,3 @@ services:
 volumes:
   adapter_data:
   letta_pgdata:
-  open-webui-data:
-    external: true

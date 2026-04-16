@@ -1,144 +1,156 @@
-"""同步适配层项目成员到 Open WebUI 模型权限
+"""同步适配层项目成员到 Open WebUI 模型权限（V2: API 版）
 
-直接操作 Open WebUI 的私有 SQLite，属于短期方案。
-Open WebUI 升级时需要回归测试 access_grant 表结构和行为。
-
-托管边界:
-- letta-* 项目模型由适配层全权托管，reconcile 全量覆盖所有 grant
-- qwen-no-mem 通用模型的 grant 用 teleai-adapter- 前缀标识，保留手工配置
+通过 Open WebUI 的 Model API 控制模型可见性，不再直连 SQLite。
+要求 Open WebUI >= 0.8.x（支持 /api/v1/models/model/access/update）。
 """
-import sqlite3
-import uuid
-import time
 import logging
+import httpx
 
-from config import WEBUI_DB_PATH
+from config import OPENWEBUI_URL, OPENWEBUI_ADMIN_EMAIL, OPENWEBUI_ADMIN_PASSWORD
 
-GRANT_SOURCE = "teleai-adapter"
+logger = logging.getLogger(__name__)
 
-
-def _get_webui_db():
-    """获取 Open WebUI SQLite 连接，设置 5 秒超时防并发锁"""
-    conn = sqlite3.connect(WEBUI_DB_PATH, timeout=5)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Admin token 缓存
+_token_cache = {"token": None}
 
 
-def _make_grant_id():
-    return f"{GRANT_SOURCE}-{uuid.uuid4()}"
+def _get_admin_token(force_refresh: bool = False) -> str:
+    """获取 Open WebUI admin token，缓存 + 自动刷新。"""
+    if _token_cache["token"] and not force_refresh:
+        return _token_cache["token"]
+    try:
+        resp = httpx.post(
+            f"{OPENWEBUI_URL}/api/v1/auths/signin",
+            json={"email": OPENWEBUI_ADMIN_EMAIL, "password": OPENWEBUI_ADMIN_PASSWORD},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            _token_cache["token"] = resp.json().get("token", "")
+            return _token_cache["token"]
+    except Exception as e:
+        logger.error(f"login Open WebUI failed: {e}")
+    return ""
+
+
+def _api_call(method: str, path: str, json_data: dict = None) -> dict | None:
+    """调 Open WebUI API，401/403 时自动刷新 token 重试一次。"""
+    token = _get_admin_token()
+    if not token:
+        return None
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        if method == "GET":
+            resp = httpx.get(f"{OPENWEBUI_URL}{path}", headers=headers, timeout=10)
+        else:
+            resp = httpx.post(f"{OPENWEBUI_URL}{path}", headers=headers, json=json_data, timeout=10)
+        if resp.status_code in (401, 403):
+            token = _get_admin_token(force_refresh=True)
+            if not token:
+                return None
+            headers = {"Authorization": f"Bearer {token}"}
+            if method == "GET":
+                resp = httpx.get(f"{OPENWEBUI_URL}{path}", headers=headers, timeout=10)
+            else:
+                resp = httpx.post(f"{OPENWEBUI_URL}{path}", headers=headers, json=json_data, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+        logger.warning(f"API {method} {path} returned {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        logger.error(f"API {method} {path} failed: {e}")
+    return None
+
+
+def _get_model_grants(model_id: str) -> list | None:
+    """获取模型当前的 access_grants 列表。"""
+    data = _api_call("GET", "/api/v1/models")
+    if not data:
+        return None
+    for m in data.get("data", []):
+        if m["id"] == model_id:
+            return m.get("info", {}).get("access_grants", [])
+    return None  # 模型不存在
+
+
+def _update_model_grants(model_id: str, grants: list) -> bool:
+    """全量覆盖模型的 access_grants。
+    注意：如果模型不存在，此 API 会自动创建模型。调用前应确认模型存在。"""
+    result = _api_call("POST", "/api/v1/models/model/access/update", {
+        "id": model_id,
+        "access_grants": grants,
+    })
+    return result is not None
+
+
+# ===== 增量操作 =====
 
 
 def grant_model_access(user_id: str, model_id: str):
-    """给用户授予模型的 read 权限。异常上抛，由调用方决定是否阻塞。"""
-    db = _get_webui_db()
-    try:
-        existing = db.execute(
-            "SELECT id FROM access_grant WHERE resource_type='model' AND resource_id=? "
-            "AND principal_type='user' AND principal_id=? AND permission='read'",
-            (model_id, user_id)
-        ).fetchone()
-        if not existing:
-            db.execute(
-                "INSERT INTO access_grant (id, resource_type, resource_id, principal_type, principal_id, permission, created_at) "
-                "VALUES (?, 'model', ?, 'user', ?, 'read', ?)",
-                (_make_grant_id(), model_id, user_id, int(time.time()))
-            )
-            db.commit()
-    finally:
-        db.close()
+    """给用户授予模型 read 权限（增量添加，不影响其他用户的 grant）。"""
+    current = _get_model_grants(model_id)
+    if current is None:
+        raise RuntimeError(f"model {model_id} not found or API unreachable")
+    for g in current:
+        if g["principal_type"] == "user" and g["principal_id"] == user_id and g["permission"] == "read":
+            return  # 已存在
+    new_grants = [
+        {"principal_type": g["principal_type"], "principal_id": g["principal_id"], "permission": g["permission"]}
+        for g in current
+    ]
+    new_grants.append({"principal_type": "user", "principal_id": user_id, "permission": "read"})
+    if not _update_model_grants(model_id, new_grants):
+        raise RuntimeError(f"failed to update grants for {model_id}")
 
 
 def revoke_model_access(user_id: str, model_id: str):
-    """撤销用户的模型 read 权限。
-    letta-* 项目模型由适配层全权托管，删除所有 grant（不限来源）。"""
-    db = _get_webui_db()
-    try:
-        db.execute(
-            "DELETE FROM access_grant WHERE resource_type='model' AND resource_id=? "
-            "AND principal_type='user' AND principal_id=? AND permission='read'",
-            (model_id, user_id)
-        )
-        db.commit()
-    finally:
-        db.close()
+    """撤销用户的模型 read 权限。"""
+    current = _get_model_grants(model_id)
+    if current is None:
+        raise RuntimeError(f"model {model_id} not found or API unreachable")
+    new_grants = [
+        {"principal_type": g["principal_type"], "principal_id": g["principal_id"], "permission": g["permission"]}
+        for g in current
+        if not (g["principal_type"] == "user" and g["principal_id"] == user_id and g["permission"] == "read")
+    ]
+    if not _update_model_grants(model_id, new_grants):
+        raise RuntimeError(f"failed to update grants for {model_id}")
 
 
 def revoke_all_model_access(model_id: str):
-    """删除某个模型的所有 access_grant。
-    用于删除项目时清理，letta-* 模型由适配层全权托管。"""
-    db = _get_webui_db()
-    try:
-        db.execute(
-            "DELETE FROM access_grant WHERE resource_type='model' AND resource_id=? "
-            "AND permission='read'",
-            (model_id,)
-        )
-        db.commit()
-    finally:
-        db.close()
+    """清空模型的所有 read 权限。用于删除项目时清理。"""
+    if not _update_model_grants(model_id, []):
+        raise RuntimeError(f"failed to clear grants for {model_id}")
+
+
+# ===== 全量对账 =====
 
 
 def reconcile_common_model(model_id: str = "qwen-no-mem"):
-    """全量对账：确保所有 Open WebUI 用户都能看到通用模型。幂等。"""
-    db = _get_webui_db()
-    try:
-        users = db.execute("SELECT id FROM user").fetchall()
-        for row in users:
-            uid = row["id"]
-            existing = db.execute(
-                "SELECT id FROM access_grant WHERE resource_type='model' AND resource_id=? "
-                "AND principal_type='user' AND principal_id=? AND permission='read'",
-                (model_id, uid)
-            ).fetchone()
-            if not existing:
-                db.execute(
-                    "INSERT INTO access_grant (id, resource_type, resource_id, principal_type, principal_id, permission, created_at) "
-                    "VALUES (?, 'model', ?, 'user', ?, 'read', ?)",
-                    (_make_grant_id(), model_id, uid, int(time.time()))
-                )
-        db.commit()
-        logging.info(f"reconcile_common_model: synced {len(users)} users for {model_id}")
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+    """对账通用模型：设为全员公开（通配符 *）。
+    一条 grant 搞定，新用户自动可见，不再需要逐用户扫描。"""
+    if not _update_model_grants(model_id, [
+        {"principal_type": "user", "principal_id": "*", "permission": "read"},
+    ]):
+        raise RuntimeError(f"failed to reconcile common model {model_id}")
+    logger.info(f"reconcile_common_model: set {model_id} to public")
 
 
 def reconcile_project_model(project_id: str, model_id: str, member_user_ids: list):
-    """全量对账：确保项目模型的 access_grant 和成员列表完全一致。
-    letta-* 项目模型由适配层全权托管：先删该模型的所有 read grant，再按成员列表重建。幂等。"""
-    db = _get_webui_db()
-    try:
-        db.execute(
-            "DELETE FROM access_grant WHERE resource_type='model' AND resource_id=? "
-            "AND permission='read'",
-            (model_id,)
-        )
-        now = int(time.time())
-        for uid in member_user_ids:
-            db.execute(
-                "INSERT INTO access_grant (id, resource_type, resource_id, principal_type, principal_id, permission, created_at) "
-                "VALUES (?, 'model', ?, 'user', ?, 'read', ?)",
-                (_make_grant_id(), model_id, uid, now)
-            )
-        db.commit()
-        logging.info(f"reconcile_project_model: synced {len(member_user_ids)} members for {model_id}")
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+    """对账项目模型：access_grants 全量覆盖为成员列表。"""
+    grants = [
+        {"principal_type": "user", "principal_id": uid, "permission": "read"}
+        for uid in member_user_ids
+    ]
+    if not _update_model_grants(model_id, grants):
+        raise RuntimeError(f"failed to reconcile project model {model_id}")
+    logger.info(f"reconcile_project_model: synced {len(member_user_ids)} members for {model_id}")
 
 
 def reconcile_all():
     """全量对账入口：同步所有通用模型 + 所有项目模型。"""
     from db import get_db
 
-    # 1. 通用模型
     reconcile_common_model("qwen-no-mem")
 
-    # 2. 所有项目模型
     adapter_db = get_db()
     projects = adapter_db.execute("SELECT project_id FROM projects").fetchall()
     for proj in projects:

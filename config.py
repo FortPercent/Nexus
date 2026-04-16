@@ -7,7 +7,6 @@ LETTA_BASE_URL = os.getenv("LETTA_BASE_URL", "http://localhost:8283")
 ORG_ADMIN_EMAILS = [e.strip() for e in os.getenv("ORG_ADMIN_EMAILS", "").split(",") if e.strip()]
 DEFAULT_FOLDER_QUOTA_MB = int(os.getenv("DEFAULT_FOLDER_QUOTA_MB", "1024"))
 DB_PATH = os.getenv("DB_PATH", "/data/serving/adapter/adapter.db")
-WEBUI_DB_PATH = os.getenv("WEBUI_DB_PATH", "/data/open-webui/webui.db")
 
 # Open WebUI admin 凭证（用于查用户详情）
 OPENWEBUI_URL = os.getenv("OPENWEBUI_URL", "http://172.17.0.1:3000")
