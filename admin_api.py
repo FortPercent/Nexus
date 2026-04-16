@@ -617,3 +617,26 @@ async def delete_personal_file(file_id: str, request: Request):
     folder_id = get_or_create_personal_folder(user["id"])
     letta.folders.files.delete(folder_id=folder_id, file_id=file_id)
     return {"status": "ok"}
+
+
+# ===== 用户搜索（添加成员用） =====
+
+
+@router.get("/users/search")
+async def search_users(request: Request, q: str = ""):
+    """搜索 Open WebUI 用户（按姓名或邮箱匹配），用于添加项目成员"""
+    extract_user_from_admin(request)
+    from auth import _admin_api_get
+    data = _admin_api_get("/api/v1/users/")
+    if not data:
+        return []
+    users = data.get("users", data) if isinstance(data, dict) else data
+    q = q.lower().strip()
+    results = []
+    for u in users:
+        name = u.get("name", "")
+        email = u.get("email", "")
+        if q and q not in name.lower() and q not in email.lower():
+            continue
+        results.append({"id": u["id"], "name": name, "email": email})
+    return results

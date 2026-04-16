@@ -184,7 +184,12 @@ function ProjPage({ pid, back, user }) {
   const delFile = (fid)=>{ api(`/project/${pid}/files/${fid}`,{method:"DELETE"}).then(()=>setFiles(fs=>fs.filter(f=>f.id!==fid))).catch(e=>alert(e.message)); };
   const removeMember = (mid)=>{ if(!confirm("确定移除？")) return; api(`/project/${pid}/members/${mid}`,{method:"DELETE"}).then(()=>setMembers(ms=>ms.filter(m=>m.id!==mid))).catch(e=>alert(e.message)); };
   const toggleRole = (mid, cur)=>{ const nr = cur==="admin"?"member":"admin"; api(`/project/${pid}/members/${mid}/role`,{method:"PUT",body:{role:nr}}).then(()=>load()).catch(e=>alert(e.message)); };
-  const addMember = ()=>{ const uid=prompt("输入用户 ID:"); if(!uid) return; api(`/project/${pid}/members`,{method:"POST",body:{user_id:uid}}).then(()=>load()).catch(e=>alert(e.message)); };
+  const [searchQ, setSearchQ] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [showSearch, setShowSearch] = useState(false);
+  const searchTimer = React.useRef(null);
+  const doSearch = (q)=>{ setSearchQ(q); clearTimeout(searchTimer.current); if(!q.trim()){setSearchResults([]); return;} searchTimer.current=setTimeout(()=>{api(`/users/search?q=${encodeURIComponent(q)}`).then(r=>{if(r){const mids=new Set(members.map(m=>m.id)); setSearchResults(r.filter(u=>!mids.has(u.id)));}}).catch(()=>{});},300); };
+  const addMember = (uid)=>{ setShowSearch(false); setSearchQ(""); setSearchResults([]); api(`/project/${pid}/members`,{method:"POST",body:{user_id:uid}}).then(()=>load()).catch(e=>alert(e.message)); };
   const delProject = ()=>{ if(!confirm(`确定删除项目「${proj?.name}」？不可恢复。`)) return; api(`/projects/${pid}`,{method:"DELETE"}).then(()=>back()).catch(e=>alert(e.message)); };
 
   if(loading) return <div><Back onClick={back}/><Loading/></div>;
@@ -215,7 +220,19 @@ function ProjPage({ pid, back, user }) {
         <Tag v={m.role}>{m.role}</Tag>
         {isA && !m.creator && <div style={{display:"flex",gap:4}}><Btn v="ghost" onClick={()=>toggleRole(m.id,m.role)} style={{fontSize:11}}>{m.role==="member"?"升级":"降级"}</Btn><Btn v="ghost" onClick={()=>removeMember(m.id)} style={{fontSize:11,color:C.terra}}>移除</Btn></div>}
       </div></Anim>)}
-      {isA && <Anim delay={180}><button onClick={addMember} style={{width:"100%",marginTop:10,padding:"10px",background:"none",border:`1.5px dashed ${C.bdr}`,borderRadius:10,cursor:"pointer",fontSize:12,color:C.sand,fontWeight:700,fontFamily:"var(--ft)"}}>+ 添加成员</button></Anim>}
+      {isA && <Anim delay={180}><div style={{marginTop:10,position:"relative"}}>
+        {!showSearch ? <button onClick={()=>setShowSearch(true)} style={{width:"100%",padding:"10px",background:"none",border:`1.5px dashed ${C.bdr}`,borderRadius:10,cursor:"pointer",fontSize:12,color:C.sand,fontWeight:700,fontFamily:"var(--ft)"}}>+ 添加成员</button>
+        : <div>
+          <input autoFocus value={searchQ} onChange={e=>doSearch(e.target.value)} onBlur={()=>setTimeout(()=>setShowSearch(false),200)} placeholder="搜索用户姓名或邮箱..." style={{width:"100%",padding:"10px 14px",border:`1.5px solid ${C.terra}`,borderRadius:10,fontSize:12,outline:"none",boxSizing:"border-box",fontFamily:"var(--fn)"}}/>
+          {searchResults.length>0 && <div style={{position:"absolute",left:0,right:0,top:"100%",zIndex:10,background:"#fff",border:`1px solid ${C.bdrL}`,borderRadius:10,marginTop:4,boxShadow:"0 4px 12px rgba(0,0,0,0.1)",maxHeight:200,overflowY:"auto"}}>
+            {searchResults.map(u=><div key={u.id} onMouseDown={()=>addMember(u.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 14px",cursor:"pointer",fontSize:12,borderBottom:`1px solid ${C.bdrL}`}} onMouseEnter={e=>e.currentTarget.style.background="#f5f0ea"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+              <Av name={u.name||"?"} size={24}/>
+              <div><div style={{fontWeight:600,color:C.slate}}>{u.name}</div><div style={{fontSize:10.5,color:C.sand}}>{u.email}</div></div>
+            </div>)}
+          </div>}
+          {searchQ && searchResults.length===0 && <div style={{position:"absolute",left:0,right:0,top:"100%",zIndex:10,background:"#fff",border:`1px solid ${C.bdrL}`,borderRadius:10,marginTop:4,padding:"12px",textAlign:"center",fontSize:12,color:C.sand}}>未找到匹配用户</div>}
+        </div>}
+      </div></Anim>}
       <Hint>添加成员 → Agent 自动挂载项目知识</Hint>
     </Card>}
 
