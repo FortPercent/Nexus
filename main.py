@@ -190,16 +190,15 @@ async def chat_completions(request: Request):
     if model == "qwen-no-mem":
         import httpx
 
-        # 关闭 thinking 模式，否则 content 为 null
-        # 剔除 files 字段：qwen-no-mem 不处理 # 引用，避免无用数据透传
         _internal_keys = {"files", "_letta_files", "user_id", "user_name", "user_email", "user_role", "user"}
         vllm_body = {k: v for k, v in body.items() if k not in _internal_keys}
         vllm_body["model"] = "Qwen3.5-122B-A10B"
-        vllm_body["chat_template_kwargs"] = {"enable_thinking": False}
+        vllm_body["chat_template_kwargs"] = {"enable_thinking": True}
 
         if body.get("stream", False):
-            # 流式：直接透传 SSE
+            # 流式：把 vLLM 的 delta.reasoning 转成 <think> 标签包裹的 delta.content
             async def proxy_stream():
+                in_thinking = False
                 async with httpx.AsyncClient(timeout=300) as client:
                     async with client.stream(
                         "POST",
@@ -208,7 +207,27 @@ async def chat_completions(request: Request):
                         headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
                     ) as resp:
                         async for line in resp.aiter_lines():
-                            if line:
+                            if not line or not line.startswith("data: "):
+                                continue
+                            if line == "data: [DONE]":
+                                yield line + "\n\n"
+                                continue
+                            try:
+                                chunk = json.loads(line[6:])
+                                delta = chunk["choices"][0].get("delta", {})
+                                reasoning = delta.pop("reasoning", None)
+                                if reasoning:
+                                    if not in_thinking:
+                                        reasoning = "<think>" + reasoning
+                                        in_thinking = True
+                                    delta["content"] = reasoning
+                                elif in_thinking and delta.get("content") is not None:
+                                    # reasoning 结束，content 开始
+                                    delta["content"] = "</think>" + (delta["content"] or "")
+                                    in_thinking = False
+                                chunk["choices"][0]["delta"] = delta
+                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                            except (json.JSONDecodeError, KeyError, IndexError):
                                 yield line + "\n\n"
             return StreamingResponse(proxy_stream(), media_type="text/event-stream")
         else:
@@ -218,7 +237,16 @@ async def chat_completions(request: Request):
                     json=vllm_body,
                     headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
                 )
-                return resp.json()
+                data = resp.json()
+                # 非流式：把 reasoning 转成 <think> 标签拼入 content
+                try:
+                    msg = data["choices"][0]["message"]
+                    reasoning = msg.pop("reasoning", None)
+                    if reasoning:
+                        msg["content"] = f"<think>{reasoning}</think>{msg.get('content') or ''}"
+                except (KeyError, IndexError):
+                    pass
+                return data
 
     # letta-* 模型: 走 Letta 记忆链路
     user = get_current_user(request, body)
