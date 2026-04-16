@@ -95,7 +95,10 @@ def mirror_file_for_user(letta_file_id, letta_folder_id, filename, scope, scope_
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.warning(f"failed to update knowledge user_id: {e}")
+        logger.warning(f"failed to update knowledge user_id, rolling back: {e}")
+        # 回滚：删除刚创建的 Knowledge Collection，不写本地映射
+        _api("DELETE", f"/api/v1/knowledge/{knowledge_id}/delete")
+        return None
 
     db = get_db()
     try:
@@ -165,7 +168,7 @@ def get_letta_file_id_by_knowledge(knowledge_id):
     db = get_db()
     try:
         row = db.execute(
-            "SELECT letta_file_id, letta_folder_id, scope, scope_id FROM knowledge_mirrors WHERE knowledge_id = ?",
+            "SELECT letta_file_id, letta_folder_id, scope, scope_id, display_name FROM knowledge_mirrors WHERE knowledge_id = ?",
             (knowledge_id,),
         ).fetchone()
         if row:
@@ -174,6 +177,7 @@ def get_letta_file_id_by_knowledge(knowledge_id):
                 "letta_folder_id": row["letta_folder_id"],
                 "scope": row["scope"],
                 "scope_id": row["scope_id"],
+                "display_name": row["display_name"],
             }
     finally:
         db.close()

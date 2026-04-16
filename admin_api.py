@@ -111,9 +111,15 @@ async def create_project(request: Request):
                 pass
         raise
 
-    # 同步 Open WebUI 模型权限
+    # 注册模型到 Open WebUI + 授权创建者
     try:
-        grant_model_access(user["id"], f"letta-{project_id}")
+        from webui_sync import _ensure_model_registered, _get_webui_db
+        model_id = f"letta-{project_id}"
+        webui_db = _get_webui_db()
+        _ensure_model_registered(webui_db, model_id, f"AI 助手 ({name})")
+        webui_db.commit()
+        webui_db.close()
+        grant_model_access(user["id"], model_id)
     except Exception as e:
         logging.warning(f"sync grant failed for create_project {project_id}: {e}")
 
@@ -282,6 +288,21 @@ async def add_member(project_id: str, request: Request):
     except Exception as e:
         logging.warning(f"sync grant failed for add_member {new_user_id} to {project_id}: {e}")
 
+    # 为新成员创建该项目所有文件的镜像
+    try:
+        from knowledge_mirror import mirror_file_for_user, _list_folder_files, _get_file_name
+        db3 = get_db()
+        proj_row = db3.execute(
+            "SELECT project_folder_id, name FROM projects WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        db3.close()
+        if proj_row:
+            for f in _list_folder_files(letta, proj_row["project_folder_id"]):
+                mirror_file_for_user(f.id, proj_row["project_folder_id"], _get_file_name(f),
+                                     "project", project_id, new_user_id, proj_row["name"])
+    except Exception as e:
+        logging.warning(f"mirror creation failed for add_member {new_user_id} to {project_id}: {e}")
+
     return {"status": "ok"}
 
 
@@ -332,6 +353,26 @@ async def remove_member(project_id: str, member_id: str, request: Request):
         revoke_model_access(member_id, f"letta-{project_id}")
     except Exception as e:
         logging.warning(f"sync revoke failed for remove_member {member_id} from {project_id}: {e}")
+
+    # 删除该成员的项目文件镜像
+    try:
+        from knowledge_mirror import _get_admin_token, _api as mirror_api
+        mirror_db = get_db()
+        mirrors = mirror_db.execute(
+            "SELECT knowledge_id FROM knowledge_mirrors WHERE scope = 'project' AND scope_id = ? AND for_user_id = ?",
+            (project_id, member_id),
+        ).fetchall()
+        admin_token = _get_admin_token()
+        for m in mirrors:
+            mirror_api("DELETE", f"/api/v1/knowledge/{m['knowledge_id']}/delete", token=admin_token)
+        mirror_db.execute(
+            "DELETE FROM knowledge_mirrors WHERE scope = 'project' AND scope_id = ? AND for_user_id = ?",
+            (project_id, member_id),
+        )
+        mirror_db.commit()
+        mirror_db.close()
+    except Exception as e:
+        logging.warning(f"mirror cleanup failed for remove_member {member_id} from {project_id}: {e}")
 
     return {"status": "ok"}
 
@@ -580,7 +621,7 @@ async def list_org_files(request: Request):
 
 @router.post("/org/files")
 async def upload_org_file(request: Request, file: UploadFile = File(...)):
-    extract_user_from_admin(request)
+    require_org_admin(request)
     resources = get_or_create_org_resources()
     _check_folder_size(resources["folder_id"], file)
     uploaded = letta.folders.files.upload(

@@ -84,10 +84,9 @@ async def non_stream_response(agent_id: str, message: str, model: str):
     assistant_content = ""
     for msg in response.messages:
         if hasattr(msg, "content") and msg.content:
-            if (
-                hasattr(msg, "message_type")
-                and msg.message_type == "tool_call_message"
-            ):
+            msg_type = getattr(msg, "message_type", "")
+            # 只取 assistant_message，跳过 system_alert / tool_call_message 等内部消息
+            if msg_type and msg_type != "assistant_message":
                 continue
             assistant_content = str(msg.content)
 
@@ -115,7 +114,9 @@ async def fake_stream_from_letta(agent_id: str, message: str, model: str):
     assistant_content = ""
     for msg in response.messages:
         if hasattr(msg, "content") and msg.content:
-            if hasattr(msg, "message_type") and msg.message_type == "tool_call_message":
+            msg_type = getattr(msg, "message_type", "")
+            # 只取 assistant_message，跳过 system_alert / tool_call_message 等内部消息
+            if msg_type and msg_type != "assistant_message":
                 continue
             assistant_content = str(msg.content)
 
@@ -189,7 +190,9 @@ async def chat_completions(request: Request):
         import httpx
 
         # 关闭 thinking 模式，否则 content 为 null
-        vllm_body = {**body, "model": "Qwen3.5-122B-A10B"}
+        # 剔除 files 字段：qwen-no-mem 不处理 # 引用，避免无用数据透传
+        vllm_body = {k: v for k, v in body.items() if k != "files"}
+        vllm_body["model"] = "Qwen3.5-122B-A10B"
         vllm_body["chat_template_kwargs"] = {"enable_thinking": False}
 
         if body.get("stream", False):
@@ -240,18 +243,22 @@ async def chat_completions(request: Request):
             mirror = get_letta_file_id_by_knowledge(kid)
             if not mirror:
                 continue
-            file_name = rf.get("name", kid)
+            file_name = mirror.get("display_name") or rf.get("name", kid)
+            letta_file_id = mirror["letta_file_id"]
             try:
-                # 尝试语义搜索 passages
-                results = letta.agents.passages.search(agent_id=agent_id, query=user_message, top_k=5)
-                texts = [getattr(r, "content", "") or getattr(r, "text", "") for r in getattr(results, "results", []) if getattr(r, "content", "") or getattr(r, "text", "")]
+                # 按 source_id（即 letta_file_id）过滤搜索该文件的 passages
+                results = letta.agents.passages.search(
+                    agent_id=agent_id, query=user_message, top_k=5,
+                    source_id=letta_file_id,
+                )
+                texts = [getattr(r, "content", "") or getattr(r, "text", "") for r in getattr(results, "results", results) if getattr(r, "content", "") or getattr(r, "text", "")]
                 if texts:
                     ref_context_parts.append(f"=== 引用文档：{file_name} ===\n" + "\n---\n".join(texts[:3]))
                     continue
             except Exception:
                 pass
-            # passages 不可用时，提示 Agent 搜索
-            ref_context_parts.append(f"[用户引用了文档「{file_name}」，请使用 archival memory search 搜索该文档的相关内容来回答]")
+            # passages API 不支持 source_id 过滤时，提示 Agent 按文件名搜索
+            ref_context_parts.append(f"[用户引用了文档「{file_name}」，请使用 archival memory search 搜索关键词「{file_name}」的相关内容来回答]")
         if ref_context_parts:
             context = "\n".join(ref_context_parts)
             user_message = f"{context}\n\n{user_message}"
