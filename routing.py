@@ -148,7 +148,7 @@ def get_or_create_personal_folder(user_id: str) -> str:
 
     folder_name = f"personal-{user_id}"
     try:
-        folder = letta.folders.create(name=folder_name, embedding_config={"embedding_model": "nomic-embed-text", "embedding_endpoint_type": "ollama", "embedding_endpoint": "http://ollama:11434", "embedding_dim": 768})
+        folder = letta.folders.create(name=folder_name, embedding_config={"embedding_model": "nomic-embed-text", "embedding_endpoint_type": "openai", "embedding_endpoint": "http://ollama:11434/v1", "embedding_dim": 768})
     except ConflictError:
         logging.warning(f"folder {folder_name} already exists in Letta, looking up")
         page = letta.folders.list(name=folder_name, limit=1)
@@ -256,7 +256,7 @@ def _get_org_resources(db):
         )
     if not folder:
         try:
-            folder = letta.folders.create(name="org-shared", embedding_config={"embedding_model": "nomic-embed-text", "embedding_endpoint_type": "ollama", "embedding_endpoint": "http://ollama:11434", "embedding_dim": 768})
+            folder = letta.folders.create(name="org-shared", embedding_config={"embedding_model": "nomic-embed-text", "embedding_endpoint_type": "openai", "embedding_endpoint": "http://ollama:11434/v1", "embedding_dim": 768})
         except ConflictError:
             logging.warning("folder org-shared already exists in Letta, looking up")
             page = letta.folders.list(name="org-shared", limit=1)
