@@ -22,11 +22,13 @@ class Filter:
         # 保留 files 到自定义字段，防止 Open WebUI 后续 pop 掉
         if body.get("files"):
             body["_letta_files"] = body["files"]
-        # letta-* 模型关闭 Open WebUI Memory（和 Letta Core Memory 冲突）
+        # letta-* 模型：关闭 Open WebUI 所有注入功能，全部走 Letta 逻辑
         model = body.get("model", "")
         if model.startswith("letta-"):
             features = body.get("features", {})
             if isinstance(features, dict):
                 features.pop("memory", None)
+                features.pop("web_search", None)
+                features.pop("image_generation", None)
                 body["features"] = features
         return body
