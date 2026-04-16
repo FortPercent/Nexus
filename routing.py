@@ -1,11 +1,55 @@
 """路由模块 —— user_id + project → agent_id，含双向校验和知识挂载"""
 import logging
+import sqlite3
 from fastapi import HTTPException
 from letta_client import Letta, ConflictError
-from config import LETTA_BASE_URL, VLLM_ENDPOINT
+from config import LETTA_BASE_URL, VLLM_ENDPOINT, DB_PATH
 from db import get_db
 
 letta = Letta(base_url=LETTA_BASE_URL)
+
+# 知识建议工具缓存
+_suggest_tool_id = None
+
+
+def _get_suggest_tool_id() -> str:
+    """获取或创建 suggest_project_knowledge 工具，返回 tool_id"""
+    global _suggest_tool_id
+    if _suggest_tool_id:
+        return _suggest_tool_id
+
+    def suggest_project_knowledge(content: str, agent_state: "AgentState") -> str:
+        """当用户在对话中提到了与项目相关的重要信息（如技术栈变更、新成员加入、里程碑完成、架构决策等），
+        调用此工具将信息提交为项目知识建议，等待项目管理员审核后纳入项目知识库。
+        不要提交用户的个人信息（那属于 human block），只提交对整个项目团队有价值的信息。
+
+        Args:
+            content: 建议的知识内容，简洁准确，一两句话概括关键信息
+
+        Returns:
+            提交结果
+        """
+        import sqlite3 as _sqlite3
+        project_id = agent_state.metadata.get("project", "")
+        user_id = agent_state.metadata.get("owner", "")
+        if not project_id or not content.strip():
+            return "提交失败：缺少项目信息或内容为空"
+        try:
+            conn = _sqlite3.connect("/data/serving/adapter/adapter.db", timeout=5)
+            conn.execute(
+                "INSERT INTO knowledge_suggestions (project_id, user_id, content) VALUES (?, ?, ?)",
+                (project_id, user_id, content.strip()),
+            )
+            conn.commit()
+            conn.close()
+            return "已提交知识建议，等待项目管理员审核"
+        except Exception as e:
+            return f"提交失败：{e}"
+
+    tool = letta.tools.upsert_from_function(func=suggest_project_knowledge)
+    _suggest_tool_id = tool.id
+    logging.info(f"suggest_project_knowledge tool: {tool.id}")
+    return _suggest_tool_id
 
 
 def get_or_create_agent(user_id: str, project: str) -> str:
@@ -38,15 +82,29 @@ def get_or_create_agent(user_id: str, project: str) -> str:
             )
         return agent_id
 
+    # 获取知识建议工具
+    suggest_tool_id = None
+    try:
+        suggest_tool_id = _get_suggest_tool_id()
+    except Exception as e:
+        logging.warning(f"failed to get suggest tool: {e}")
+
     agent = letta.agents.create(
         name=f"user-{user_id}-{project}",
         model="openai/Qwen3.5-122B-A10B",
         metadata={"owner": user_id, "project": project},
+        tool_ids=[suggest_tool_id] if suggest_tool_id else [],
         memory_blocks=[
             {"label": "human", "value": "(新用户，信息未知)"},
             {
                 "label": "persona",
-                "value": "你是一个有记忆的AI办公助手。记住用户告诉你的信息，提供个性化服务。",
+                "value": (
+                    "你是一个有记忆的AI办公助手。\n"
+                    "- 记住用户告诉你的个人信息（存到 human block）\n"
+                    "- 当用户提到对整个项目团队有价值的信息时（如技术栈变更、里程碑完成、架构决策），"
+                    "用 suggest_project_knowledge 工具提交为项目知识建议\n"
+                    "- 个人偏好存 human block，项目信息提交建议，不要搞混"
+                ),
             },
         ],
         llm_config={
