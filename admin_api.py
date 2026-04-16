@@ -451,18 +451,17 @@ async def upload_project_file(project_id: str, request: Request, file: UploadFil
     require_project_member(request, project_id)
     db = get_db()
     row = db.execute(
-        "SELECT project_folder_id FROM projects WHERE project_id = ?", (project_id,)
+        "SELECT project_folder_id, name FROM projects WHERE project_id = ?", (project_id,)
     ).fetchone()
     db.close()
     _check_folder_size(row["project_folder_id"], file, project_id)
-    proj = db.execute("SELECT name FROM projects WHERE project_id = ?", (project_id,)).fetchone()
-    db.close()
+    proj_name = row["name"] if row else ""
     uploaded = letta.folders.files.upload(folder_id=row["project_folder_id"], file=(file.filename, file.file, file.content_type))
     # 镜像到 Open WebUI Knowledge
     try:
         fid = uploaded.id if hasattr(uploaded, "id") else None
         if fid:
-            mirror_file(fid, row["project_folder_id"], file.filename, "project", project_id, "", proj["name"] if proj else "")
+            mirror_file(fid, row["project_folder_id"], file.filename, "project", project_id, "", proj_name)
     except Exception as e:
         logging.warning(f"mirror failed for {file.filename}: {e}")
     return {"status": "ok", "filename": file.filename}
