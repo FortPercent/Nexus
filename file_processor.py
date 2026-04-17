@@ -18,7 +18,7 @@ ZIP_MAX_DEPTH = 3
 ZIP_MAX_FILES = 50
 ZIP_MAX_UNCOMPRESSED = 200 * 1024 * 1024  # 200 MB
 
-PASSTHROUGH_EXTS = {"pdf", "docx", "txt", "md"}
+PASSTHROUGH_EXTS = {"pdf", "txt", "md"}  # Letta 原生支持的；docx 需转 markdown（Letta 415）
 
 
 def _ext(filename: str) -> str:
@@ -87,6 +87,73 @@ def _xlsx_to_markdown(data: bytes) -> str:
             out.append(f"_(…另有 {len(rows) - header_idx - 1 - MAX_ROWS_PER_SHEET} 行已省略)_")
         out.append("")
     wb.close()
+    return "\n".join(out)
+
+
+def _docx_to_markdown(data: bytes) -> str:
+    """python-docx 按节读 docx：标题/正文/表格转 markdown。图片/批注/tracked changes 不处理。"""
+    try:
+        import docx as _docx
+    except ImportError:
+        raise HTTPException(500, "服务端未装 python-docx")
+    doc = _docx.Document(io.BytesIO(data))
+    out = []
+
+    # 遍历 paragraphs + tables（按文档顺序）
+    # docx body 下元素包含 w:p 和 w:tbl，用 body._element 原生顺序
+    body = doc.element.body
+    tbl_iter = iter(doc.tables)
+
+    def _para_to_md(para):
+        text = para.text.strip()
+        if not text:
+            return None
+        s = (para.style.name or "").lower()
+        if "heading 1" in s or s == "title":
+            return f"# {text}"
+        if "heading 2" in s:
+            return f"## {text}"
+        if "heading 3" in s:
+            return f"### {text}"
+        if "heading 4" in s:
+            return f"#### {text}"
+        if "list" in s or "bullet" in s:
+            return f"- {text}"
+        return text
+
+    def _table_to_md(table):
+        if not table.rows:
+            return None
+        header = [_fmt_cell(c.text) for c in table.rows[0].cells]
+        lines = ["", "| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+        for row in table.rows[1:]:
+            cells = [_fmt_cell(c.text) for c in row.cells]
+            while len(cells) < len(header):
+                cells.append("")
+            lines.append("| " + " | ".join(cells[: len(header)]) + " |")
+        lines.append("")
+        return "\n".join(lines)
+
+    # 按 body 顺序遍历
+    para_idx = 0
+    tbl_idx = 0
+    for child in body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            if para_idx < len(doc.paragraphs):
+                md = _para_to_md(doc.paragraphs[para_idx])
+                if md:
+                    out.append(md)
+                para_idx += 1
+        elif tag == "tbl":
+            if tbl_idx < len(doc.tables):
+                md = _table_to_md(doc.tables[tbl_idx])
+                if md:
+                    out.append(md)
+                tbl_idx += 1
+
+    if not out:
+        out.append("_(文档无可提取内容；可能仅含图片或表单)_")
     return "\n".join(out)
 
 
@@ -171,6 +238,19 @@ def _process(filename: str, data: bytes, depth: int = 0, counter=None) -> List[P
         except Exception as e:
             raise HTTPException(400, f"csv 解析失败: {e}")
         return [(filename + ".md", md.encode("utf-8"), "text/markdown")]
+
+    if ext == "docx":
+        try:
+            md = _docx_to_markdown(data)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logging.warning(f"docx 提取失败 {filename}: {e}")
+            raise HTTPException(400, f"docx 解析失败: {e}")
+        return [(filename + ".md", md.encode("utf-8"), "text/markdown")]
+
+    if ext == "doc":
+        raise HTTPException(400, ".doc 旧版格式暂不支持，请另存为 .docx 后上传")
 
     if ext == "zip":
         return _unzip(data, filename, depth=depth, counter=counter)

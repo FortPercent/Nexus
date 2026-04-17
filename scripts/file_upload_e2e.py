@@ -72,6 +72,21 @@ def t_zip():
     assert has_csv and has_md, f'missing expected: {uploaded}'
     return f'→ {uploaded}'
 
+def t_docx():
+    from docx import Document
+    d = Document()
+    d.add_heading('测试标题', 0)
+    d.add_paragraph('段落内容测试 123')
+    d.add_heading('子标题', 1)
+    d.add_paragraph('列表项 A', style='List Bullet')
+    t = d.add_table(rows=2, cols=2)
+    t.cell(0,0).text='字段'; t.cell(0,1).text='值'
+    t.cell(1,0).text='环境'; t.cell(1,1).text='生产'
+    buf = io.BytesIO(); d.save(buf); buf.seek(0)
+    r = upload('TEST_doc.docx', buf.getvalue(), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+    assert 'TEST_doc.docx.md' in (r.get('uploaded') or []), f'expected .md: {r}'
+    return f'→ {r["uploaded"]}'
+
 def t_pdf_passthrough():
     # 最小 pdf header
     content = b'%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Size 1/Root 1 0 R>>\n%%EOF'
@@ -90,11 +105,12 @@ def t_unsupported_ext():
 
 run('xlsx → markdown', t_xlsx)
 run('csv → markdown', t_csv)
+run('docx → markdown', t_docx)
 run('zip 递归展开', t_zip)
 run('pdf 原样透传', t_pdf_passthrough)
 run('未知扩展 → 400', t_unsupported_ext)
 
 delete_test_files()
 print()
-print(f'==== {5-fails}/5 ====')
+print(f'==== {6-fails}/6 ====')
 import sys; sys.exit(fails)
