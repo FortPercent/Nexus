@@ -51,9 +51,16 @@ async def health():
         result["letta"] = "ok" if r.status_code == 200 else f"http {r.status_code}"
     except Exception as e:
         result["letta"] = f"err: {type(e).__name__}"
-    # vLLM
+    # vLLM（经代理网关访问，需 Content-Type + Auth）
     try:
-        r = _httpx.get(f"{config.VLLM_ENDPOINT}/models", timeout=3, headers={"Authorization": f"Bearer {config.VLLM_API_KEY}"})
+        r = _httpx.get(
+            f"{config.VLLM_ENDPOINT}/models",
+            timeout=3,
+            headers={
+                "Authorization": f"Bearer {config.VLLM_API_KEY}",
+                "Content-Type": "application/json",
+            },
+        )
         result["vllm"] = "ok" if r.status_code == 200 else f"http {r.status_code}"
     except Exception as e:
         result["vllm"] = f"err: {type(e).__name__}"
