@@ -734,6 +734,56 @@ async def delete_personal_file(file_id: str, request: Request):
     return {"status": "ok"}
 
 
+# ===== 批量文件 embedding 状态 —— 前端索引徽章用 =====
+
+
+@router.get("/file-statuses")
+async def file_statuses(request: Request):
+    """返回当前用户能看到的所有 Letta 文件的 embedding 状态。
+
+    前端在 Knowledge 列表页调用这个端点，按 letta_file_id 建 map，
+    然后给每个 letta-mirror KB 行打"索引中 N/M"徽章。
+    """
+    user = extract_user_from_admin(request)
+    out = {}
+
+    def _collect(folder_id):
+        try:
+            for f in _file_items(letta.folders.files.list(folder_id=folder_id)):
+                out[f.id] = {
+                    "processing_status": getattr(getattr(f, "processing_status", None), "value", getattr(f, "processing_status", None)),
+                    "total_chunks": getattr(f, "total_chunks", None),
+                    "chunks_embedded": getattr(f, "chunks_embedded", None),
+                }
+        except Exception as e:
+            logging.warning(f"file_statuses collect {folder_id} failed: {e}")
+
+    # 个人
+    try:
+        _collect(get_or_create_personal_folder(user["id"]))
+    except Exception as e:
+        logging.warning(f"file_statuses personal failed: {e}")
+
+    # 组织
+    try:
+        _collect(get_or_create_org_resources()["folder_id"])
+    except Exception as e:
+        logging.warning(f"file_statuses org failed: {e}")
+
+    # 项目（用户所在所有项目）
+    with use_db() as db:
+        rows = db.execute(
+            "SELECT p.project_folder_id FROM projects p "
+            "JOIN project_members pm ON p.project_id = pm.project_id "
+            "WHERE pm.user_id = ?",
+            (user["id"],),
+        ).fetchall()
+    for r in rows:
+        _collect(r["project_folder_id"])
+
+    return out
+
+
 # ===== 个人记忆（human block）—— 跨项目共享一份 =====
 
 
