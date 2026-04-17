@@ -166,7 +166,28 @@ def t_admin_personal_files():
     _admin_get("/admin/api/personal/files")
 
 def t_admin_personal_memory():
-    _admin_get("/admin/api/personal/memory")
+    data = _admin_get("/admin/api/personal/memory")
+    assert isinstance(data, dict), f"memory should be single dict, got {type(data).__name__}"
+    assert "block_id" in data and "content" in data, f"missing keys: {list(data.keys())}"
+    return f"block={data['block_id'][:16]} len={len(data.get('content',''))}"
+
+
+def t_admin_conversations_overview():
+    data = _admin_get("/admin/api/personal/conversations")
+    assert isinstance(data, list)
+    return f"{len(data)} projects"
+
+
+def t_admin_conversations_project():
+    _admin_get(f"/admin/api/personal/conversations/{TEST_PROJECT}")
+
+
+def t_human_block_shared_cached():
+    a = sqlite3.connect(DB_PATH); a.row_factory = sqlite3.Row
+    rows = a.execute("SELECT COUNT(*) as n FROM user_cache WHERE personal_human_block_id IS NOT NULL").fetchall()
+    a.close()
+    assert rows[0]["n"] > 0, "no user has cached human block_id — migration 未跑"
+    return f"{rows[0]['n']} users cached"
 
 
 # ---------- 聊天 ----------
@@ -406,7 +427,9 @@ def main():
     T(f"/admin/api/project/{TEST_PROJECT}/knowledge", t_admin_project_knowledge)
     T(f"/admin/api/project/{TEST_PROJECT}/suggestions", t_admin_project_suggestions)
     T("/admin/api/personal/files", t_admin_personal_files)
-    T("/admin/api/personal/memory", t_admin_personal_memory)
+    T("/admin/api/personal/memory（单份共享）", t_admin_personal_memory)
+    T("/admin/api/personal/conversations（概览）", t_admin_conversations_overview)
+    T("/admin/api/personal/conversations/{project}（消息）", t_admin_conversations_project)
 
     print("\n── 聊天 ──")
     T("qwen-no-mem 非流式", t_chat_qwen_nonstream)
@@ -424,6 +447,7 @@ def main():
     T("knowledge_mirrors > 0", t_knowledge_mirrors_count)
     T("project_members > 0", t_project_members_count)
     T("user_agent_map > 0", t_user_agent_map_count)
+    T("user_cache.personal_human_block_id 已缓存（合一 migration 已跑）", t_human_block_shared_cached)
 
     print("\n── Pipeline Filter / # 按模型过滤 ──")
     T("filter 已注册并激活", t_pipeline_filter_registered)
