@@ -148,6 +148,17 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     in_thinking = False
+    # tool_call 是流式 delta：name 先来一次，args 分多片。聚合后在 tool_return 或 flush 时整体输出。
+    pending_tc = {"name": "", "args": ""}
+
+    def flush_tool_call():
+        if not pending_tc["name"] and not pending_tc["args"]:
+            return None
+        chunk_text = f"🔧 {pending_tc['name'] or '?'}({pending_tc['args']})\n"
+        pending_tc["name"] = ""
+        pending_tc["args"] = ""
+        return chunk_text
+
     try:
         stream = await letta_async.agents.messages.stream(
             agent_id=agent_id,
@@ -163,7 +174,7 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
                     continue
                 if not in_thinking:
                     if not text.strip():
-                        continue  # 别用空白包个新 <think>
+                        continue
                     text = "<think>" + text
                     in_thinking = True
                 yield _sse({"content": text})
@@ -171,6 +182,12 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
                 text = _assistant_delta_text(getattr(ev, "content", ""))
                 if not text:
                     continue
+                # 先 flush 任何未结束的 tool_call
+                pending = flush_tool_call()
+                if pending:
+                    prefix = "</think>\n" if in_thinking else ""
+                    in_thinking = False
+                    yield _sse({"content": prefix + pending})
                 if in_thinking:
                     text = "</think>" + text
                     in_thinking = False
@@ -179,17 +196,27 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
                 tc = getattr(ev, "tool_call", None)
                 if not tc:
                     continue
-                name = getattr(tc, "name", "") or "?"
+                name = getattr(tc, "name", "") or ""
                 args = getattr(tc, "arguments", "") or ""
-                prefix = "</think>\n" if in_thinking else "\n"
-                in_thinking = False
-                yield _sse({"content": f"{prefix}🔧 {name}({args})\n"})
+                if name:
+                    pending_tc["name"] = name
+                if args:
+                    pending_tc["args"] += args
             elif mtype == "tool_return_message":
                 ret = getattr(ev, "tool_return", "") or ""
                 prefix = "</think>\n" if in_thinking else ""
                 in_thinking = False
-                yield _sse({"content": f"{prefix}→ {ret}\n"})
+                pending = flush_tool_call()
+                combined = (prefix or "") + (pending or "") + f"→ {ret}\n"
+                yield _sse({"content": combined})
             # ping/stop_reason/usage_statistics 等忽略
+
+        # 流结束，flush 残留 tool_call
+        pending = flush_tool_call()
+        if pending:
+            prefix = "</think>\n" if in_thinking else ""
+            in_thinking = False
+            yield _sse({"content": prefix + pending})
     except Exception as e:
         logging.exception(f"letta stream failed: {e}")
         err_text = ("</think>" if in_thinking else "") + f"\n\n[流式异常：{e}]"
