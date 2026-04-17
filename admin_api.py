@@ -424,6 +424,13 @@ async def update_project_knowledge(project_id: str, request: Request):
 
 
 def _check_folder_size(folder_id: str, new_file, project_id: str = None):
+    new_file.file.seek(0, 2)
+    new_size = new_file.file.tell()
+    new_file.file.seek(0)
+    _check_folder_size_bytes(folder_id, new_size, project_id)
+
+
+def _check_folder_size_bytes(folder_id: str, new_bytes: int, project_id: str = None):
     with use_db() as db:
         if project_id:
             row = db.execute(
@@ -435,13 +442,37 @@ def _check_folder_size(folder_id: str, new_file, project_id: str = None):
 
     files = _file_items(letta.folders.files.list(folder_id=folder_id))
     total_size = sum(_file_size(f) for f in files)
-    new_file.file.seek(0, 2)
-    new_size = new_file.file.tell()
-    new_file.file.seek(0)
-    if total_size + new_size > quota:
+    if total_size + new_bytes > quota:
         used_mb = total_size // (1024 * 1024)
         quota_mb = quota // (1024 * 1024)
         raise HTTPException(413, f"文件夹已用 {used_mb}MB，超过限额 {quota_mb}MB，请先删除旧文件")
+
+
+async def _process_and_upload(file, folder_id: str, scope: str, scope_id: str = "", owner_id: str = "", display_scope: str = "", project_id_for_size: str = None):
+    """读取上传文件 → file_processor 预处理 → 逐条上传到 Letta + mirror。
+    返回 [name, ...] 实际上传到 Letta 的文件名列表。"""
+    import io as _io
+    from file_processor import process_upload
+
+    data = await file.read()
+    _check_folder_size_bytes(folder_id, len(data), project_id_for_size)
+    processed = process_upload(file.filename, data)
+
+    uploaded_names = []
+    for name, content, mime in processed:
+        try:
+            uploaded = letta.folders.files.upload(folder_id=folder_id, file=(name, _io.BytesIO(content), mime))
+        except Exception as e:
+            logging.warning(f"upload {name} failed: {e}")
+            continue
+        try:
+            fid = uploaded.id if hasattr(uploaded, "id") else None
+            if fid:
+                mirror_file(fid, folder_id, name, scope, scope_id, owner_id, display_scope)
+        except Exception as e:
+            logging.warning(f"mirror failed for {name}: {e}")
+        uploaded_names.append(name)
+    return uploaded_names
 
 
 @router.get("/project/{project_id}/files")
@@ -462,16 +493,13 @@ async def upload_project_file(project_id: str, request: Request, file: UploadFil
         row = db.execute(
             "SELECT project_folder_id, name FROM projects WHERE project_id = ?", (project_id,)
         ).fetchone()
-    _check_folder_size(row["project_folder_id"], file, project_id)
     proj_name = row["name"] if row else ""
-    uploaded = letta.folders.files.upload(folder_id=row["project_folder_id"], file=(file.filename, file.file, file.content_type))
-    try:
-        fid = uploaded.id if hasattr(uploaded, "id") else None
-        if fid:
-            mirror_file(fid, row["project_folder_id"], file.filename, "project", project_id, "", proj_name)
-    except Exception as e:
-        logging.warning(f"mirror failed for {file.filename}: {e}")
-    return {"status": "ok", "filename": file.filename}
+    names = await _process_and_upload(
+        file, row["project_folder_id"],
+        scope="project", scope_id=project_id, owner_id="",
+        display_scope=proj_name, project_id_for_size=project_id,
+    )
+    return {"status": "ok", "filename": file.filename, "uploaded": names}
 
 
 @router.delete("/project/{project_id}/files/{file_id}")
@@ -577,15 +605,10 @@ async def list_org_files(request: Request):
 async def upload_org_file(request: Request, file: UploadFile = File(...)):
     require_org_admin(request)
     resources = get_or_create_org_resources()
-    _check_folder_size(resources["folder_id"], file)
-    uploaded = letta.folders.files.upload(folder_id=resources["folder_id"], file=(file.filename, file.file, file.content_type))
-    try:
-        fid = uploaded.id if hasattr(uploaded, "id") else None
-        if fid:
-            mirror_file(fid, resources["folder_id"], file.filename, "org")
-    except Exception as e:
-        logging.warning(f"mirror failed for org file {file.filename}: {e}")
-    return {"status": "ok", "filename": file.filename}
+    names = await _process_and_upload(
+        file, resources["folder_id"], scope="org",
+    )
+    return {"status": "ok", "filename": file.filename, "uploaded": names}
 
 
 @router.delete("/org/files/{file_id}")
@@ -615,15 +638,10 @@ async def list_personal_files(request: Request):
 async def upload_personal_file(request: Request, file: UploadFile = File(...)):
     user = extract_user_from_admin(request)
     folder_id = get_or_create_personal_folder(user["id"])
-    _check_folder_size(folder_id, file)
-    uploaded = letta.folders.files.upload(folder_id=folder_id, file=(file.filename, file.file, file.content_type))
-    try:
-        fid = uploaded.id if hasattr(uploaded, "id") else None
-        if fid:
-            mirror_file(fid, folder_id, file.filename, "personal", "", user["id"])
-    except Exception as e:
-        logging.warning(f"mirror failed for personal file {file.filename}: {e}")
-    return {"status": "ok", "filename": file.filename}
+    names = await _process_and_upload(
+        file, folder_id, scope="personal", owner_id=user["id"],
+    )
+    return {"status": "ok", "filename": file.filename, "uploaded": names}
 
 
 @router.delete("/personal/files/{file_id}")

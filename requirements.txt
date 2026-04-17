@@ -4,3 +4,5 @@ letta-client
 pyjwt
 python-multipart
 httpx
+openpyxl
+python-docx
