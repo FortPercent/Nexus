@@ -122,11 +122,16 @@ async def list_my_projects(request: Request):
         rows = db.execute(
             "SELECT p.project_id, p.name, p.desc, p.folder_quota_mb, p.project_folder_id, "
             "p.created_by, pm.role, "
-            "(SELECT COUNT(*) FROM project_members pm2 WHERE pm2.project_id = p.project_id) as member_count "
+            "(SELECT COUNT(*) FROM project_members pm2 WHERE pm2.project_id = p.project_id) AS member_count, "
+            "(SELECT COUNT(*) FROM project_todos t WHERE t.project_id = p.project_id "
+            " AND t.priority='high' AND t.status IN ('open','in_progress')) AS todo_high_count, "
+            "(SELECT COUNT(*) FROM project_todos t WHERE t.project_id = p.project_id "
+            " AND ((t.status='awaiting_user' AND t.created_by = ?) "
+            "   OR (t.status='awaiting_admin' AND pm.role='admin'))) AS todo_pending_count "
             "FROM projects p "
             "JOIN project_members pm ON p.project_id = pm.project_id "
             "WHERE pm.user_id = ?",
-            (user["id"],),
+            (user["id"], user["id"]),
         ).fetchall()
     result = []
     for r in rows:
@@ -143,6 +148,8 @@ async def list_my_projects(request: Request):
             "used_mb": used_mb,
             "members": r["member_count"],
             "role": r["role"],
+            "todo_high_count": r["todo_high_count"] or 0,
+            "todo_pending_count": r["todo_pending_count"] or 0,
         })
     return result
 
