@@ -38,6 +38,8 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "AIinfra@2026")
 TEST_USER_ID = os.getenv("TEST_USER_ID", "ce1d405b-0b5c-4faf-8864-010e2611b900")
 TEST_USER_EMAIL = os.getenv("TEST_USER_EMAIL", "wuxn5@chinatelecom.cn")
 TEST_PROJECT = os.getenv("TEST_PROJECT", "ai-infra")
+# 非 org admin 身份，用于权限拒绝测试
+NON_ADMIN_USER_ID = os.getenv("NON_ADMIN_USER_ID", "07a3a6ae-ec73-44ed-aff4-00d92f526e0c")  # liuyr17
 DB_PATH = os.getenv("DB_PATH", "/data/serving/adapter/adapter.db")
 WEBUI_DB_PATH = os.getenv("WEBUI_DB_PATH", "/data/open-webui/webui.db")
 
@@ -267,10 +269,11 @@ def t_think_balanced():
 # ---------- 权限 ----------
 
 def t_non_org_admin_upload_blocked():
-    """非 org admin 上传组织文件应 403（使用 TEST_USER_ID 身份）"""
+    """非 org admin 上传组织文件应 403（使用 NON_ADMIN_USER_ID 身份）"""
+    non_admin_jwt = mint_jwt(NON_ADMIN_USER_ID)
     r = httpx.post(
         f"{ADAPTER_URL}/admin/api/org/files",
-        headers={"Authorization": f"Bearer {_user_jwt()}"},
+        headers={"Authorization": f"Bearer {non_admin_jwt}"},
         files={"file": ("x.txt", b"hello", "text/plain")},
         timeout=10,
     )
