@@ -42,6 +42,9 @@ services:
       - LETTA_PG_URI=postgresql://letta:${POSTGRES_PASSWORD}@letta-db:5432/letta
       - OLLAMA_BASE_URL=http://ollama:11434
       - LETTA_UVICORN_WORKERS=4
+    volumes:
+      # TeleAI patch：core_memory_append 加行级去重，见 letta-patches/core_tool_executor.py
+      - ./letta-patches/core_tool_executor.py:/app/letta/services/tool_executor/core_tool_executor.py:ro
     depends_on:
       - letta-db
     restart: unless-stopped
