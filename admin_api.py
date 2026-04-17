@@ -133,6 +133,19 @@ async def list_my_projects(request: Request):
             "WHERE pm.user_id = ?",
             (user["id"], user["id"]),
         ).fetchall()
+    # 预取每个项目的高优 TODO 标题（top 2）
+    with use_db() as db:
+        todo_previews = {}
+        for r in rows:
+            prev = db.execute(
+                "SELECT id, title FROM project_todos "
+                "WHERE project_id = ? AND priority='high' AND status IN ('open','in_progress') "
+                "ORDER BY CASE status WHEN 'in_progress' THEN 0 ELSE 1 END, updated_at DESC LIMIT 2",
+                (r["project_id"],),
+            ).fetchall()
+            todo_previews[r["project_id"]] = [
+                {"id": p["id"], "title": p["title"]} for p in prev
+            ]
     result = []
     for r in rows:
         try:
@@ -150,6 +163,7 @@ async def list_my_projects(request: Request):
             "role": r["role"],
             "todo_high_count": r["todo_high_count"] or 0,
             "todo_pending_count": r["todo_pending_count"] or 0,
+            "todo_preview": todo_previews.get(r["project_id"], []),
         })
     return result
 

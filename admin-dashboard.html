@@ -117,6 +117,10 @@ function Home({ go, user, projects }) {
             </div>
           </div>
           <p style={{fontSize:11,color:C.slateXL,margin:"0 0 10px",lineHeight:1.5}}>{p.desc||""}</p>
+          {(p.todo_preview||[]).length>0 && <div style={{marginBottom:10,padding:"7px 9px",background:"#FEF2F2",borderRadius:8,borderLeft:"2px solid #DC2626"}}>
+            {p.todo_preview.map(t=><div key={t.id} style={{fontSize:11,color:"#7F1D1D",lineHeight:1.5,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>⚡ {t.title}</div>)}
+            {p.todo_high_count > p.todo_preview.length && <div style={{fontSize:10,color:"#DC2626",marginTop:2,fontWeight:600}}>+{p.todo_high_count - p.todo_preview.length} 条高优</div>}
+          </div>}
           <div style={{display:"flex",gap:14,marginBottom:8,fontSize:11,color:C.sand,fontFamily:"var(--fn)"}}><span>👥 {p.members}</span><span>{p.used_mb||0}MB</span></div>
           <Progress v={p.used_mb||0} max={p.quota_mb||1024} unit="MB"/>
         </Card>)}
