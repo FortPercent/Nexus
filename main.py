@@ -185,18 +185,27 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
         return f"🔧 {name}" + (f"：{first}" if first else "")
 
     def _pretty_return(ret: str) -> str:
-        """tool_return 精简：去掉 JSON 结构、截断到 80 字"""
+        """tool_return 精简：强制单行 + 截断 + grep/open 等大返回提炼摘要"""
         ret = (ret or "").strip()
         if not ret:
             return "✓ 完成"
-        # 去掉 json 包裹
+        # JSON 包裹剥一层
         if ret.startswith("{") and ret.endswith("}"):
             try:
                 j = json.loads(ret)
                 ret = j.get("message") or j.get("status") or str(j)
             except Exception:
                 pass
-        return ret[:160]
+        # grep_files / open_files 等返回可能上千行，只取首行 + 总体提示
+        first_line = ret.split("\n", 1)[0]
+        # 如果首行带"Found N ... matches / 显示 N ..."字样，就只用这句
+        if "matches" in first_line or "找到" in first_line or "showing" in first_line.lower():
+            return first_line[:120]
+        # 其他情况：去换行、截到 120 字
+        ret = ret.replace("\n", " ").strip()
+        if len(ret) > 120:
+            ret = ret[:120] + "…"
+        return ret
 
     def flush_tool_call():
         if not pending_tc["name"] and not pending_tc["args"]:
