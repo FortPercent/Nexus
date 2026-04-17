@@ -1014,6 +1014,13 @@ async def submit_suggestion(project_id: str, request: Request):
         ).fetchone()
         if not member:
             raise HTTPException(403, "非项目成员无法提交建议")
+        # 防重：同 (project, user, content, pending) 已存在则返回已有 id（AI 超时重试不会重复）
+        dup = db.execute(
+            "SELECT id FROM knowledge_suggestions WHERE project_id=? AND user_id=? AND content=? AND status='pending'",
+            (project_id, user_id, content),
+        ).fetchone()
+        if dup:
+            return {"status": "ok", "id": dup["id"], "deduped": True}
         db.execute(
             "INSERT INTO knowledge_suggestions (project_id, user_id, content) VALUES (?, ?, ?)",
             (project_id, user_id, content),

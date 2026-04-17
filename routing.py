@@ -62,7 +62,7 @@ def _get_suggest_tool_id() -> str:
             url = f"http://teleai-adapter:8000/admin/api/project/{project_id}/suggestions"
             data = _json.dumps({"user_id": user_id, "content": content.strip()}).encode()
             req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-            resp = urllib.request.urlopen(req, timeout=5)
+            urllib.request.urlopen(req, timeout=15)
             return "已提交知识建议，等待项目管理员审核"
         except Exception as e:
             return f"提交失败：{e}"
@@ -114,7 +114,7 @@ def _get_suggest_todo_tool_id() -> str:
                 "priority": priority or "medium",
             }).encode()
             req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=5)
+            urllib.request.urlopen(req, timeout=15)
             return f"已提交 TODO「{title.strip()}」，等用户在「📋 待处理」确认后生效"
         except Exception as e:
             return f"提交失败：{e}"
