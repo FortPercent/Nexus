@@ -1239,6 +1239,14 @@ async def ai_submit_todo(project_id: str, request: Request):
         ).fetchone()
         if not member:
             raise HTTPException(403, "非项目成员")
+        # 防重：同 (project, user, title, source=ai, 还在 awaiting_user) 返回已有 id
+        dup = db.execute(
+            "SELECT id FROM project_todos WHERE project_id=? AND created_by=? AND title=? "
+            "AND source='ai' AND status='awaiting_user'",
+            (project_id, user_id, title),
+        ).fetchone()
+        if dup:
+            return {"status": "ok", "todo_id": dup["id"], "deduped": True}
         cur = db.execute(
             "INSERT INTO project_todos (project_id, title, description, status, priority, source, created_by) "
             "VALUES (?, ?, ?, 'awaiting_user', ?, 'ai', ?)",
