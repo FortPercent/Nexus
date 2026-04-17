@@ -2,6 +2,7 @@
 其他格式 (pdf / docx / txt / md) 原样透传由 Letta 自己处理。
 """
 import csv as _csv
+import datetime as _dt
 import io
 import logging
 import os
@@ -24,6 +25,30 @@ def _ext(filename: str) -> str:
     return (filename.rsplit(".", 1)[-1] or "").lower() if "." in filename else ""
 
 
+def _fmt_cell(v) -> str:
+    """markdown 表格单元格格式化：日期 / 浮点 / 管道符转义"""
+    if v is None:
+        return ""
+    if isinstance(v, _dt.datetime):
+        # 没时间部分就只留日期
+        if v.hour == 0 and v.minute == 0 and v.second == 0:
+            return v.strftime("%Y-%m-%d")
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(v, _dt.date):
+        return v.strftime("%Y-%m-%d")
+    if isinstance(v, float):
+        # 1.0 → "1"，1.5 → "1.5"
+        if v.is_integer():
+            return str(int(v))
+        return f"{v:g}"
+    s = str(v)
+    # markdown 表格里 | 会破表；\n 换成空格避免换行断表
+    return s.replace("|", "\\|").replace("\n", " ").replace("\r", "")
+
+
+MAX_ROWS_PER_SHEET = 500  # 单 sheet 行上限，超出截断并注明
+
+
 def _xlsx_to_markdown(data: bytes) -> str:
     import openpyxl
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
@@ -44,16 +69,22 @@ def _xlsx_to_markdown(data: bytes) -> str:
             out.append("_(空表)_")
             out.append("")
             continue
-        headers = [str(c if c is not None else "") for c in rows[header_idx]]
+        headers = [_fmt_cell(c) for c in rows[header_idx]]
         out.append("| " + " | ".join(headers) + " |")
         out.append("|" + "---|" * len(headers))
-        for row in rows[header_idx + 1:]:
-            cells = [str(c if c is not None else "") for c in row]
-            # 长度对齐
+        body = rows[header_idx + 1:]
+        truncated = False
+        if len(body) > MAX_ROWS_PER_SHEET:
+            body = body[:MAX_ROWS_PER_SHEET]
+            truncated = True
+        for row in body:
+            cells = [_fmt_cell(c) for c in row]
             while len(cells) < len(headers):
                 cells.append("")
             cells = cells[: len(headers)]
             out.append("| " + " | ".join(cells) + " |")
+        if truncated:
+            out.append(f"_(…另有 {len(rows) - header_idx - 1 - MAX_ROWS_PER_SHEET} 行已省略)_")
         out.append("")
     wb.close()
     return "\n".join(out)
@@ -74,12 +105,20 @@ def _csv_to_markdown(data: bytes) -> str:
     rows = list(reader)
     if not rows:
         return "_(空 CSV)_"
-    headers = rows[0]
+    headers = [_fmt_cell(c) for c in rows[0]]
     out = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
-    for row in rows[1:]:
-        while len(row) < len(headers):
-            row.append("")
-        out.append("| " + " | ".join(row[: len(headers)]) + " |")
+    body = rows[1:]
+    truncated = False
+    if len(body) > MAX_ROWS_PER_SHEET:
+        body = body[:MAX_ROWS_PER_SHEET]
+        truncated = True
+    for row in body:
+        cells = [_fmt_cell(c) for c in row]
+        while len(cells) < len(headers):
+            cells.append("")
+        out.append("| " + " | ".join(cells[: len(headers)]) + " |")
+    if truncated:
+        out.append(f"_(…另有 {len(rows) - 1 - MAX_ROWS_PER_SHEET} 行已省略)_")
     return "\n".join(out)
 
 
