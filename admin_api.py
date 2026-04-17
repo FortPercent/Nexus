@@ -37,6 +37,24 @@ def _file_items(files_page):
     return list(getattr(files_page, "items", files_page))
 
 
+def _file_to_dict(f) -> dict:
+    """统一文件列表返回结构，带 embedding 进度字段供前端"索引中"徽章用。"""
+    total = getattr(f, "total_chunks", None)
+    done = getattr(f, "chunks_embedded", None)
+    status = getattr(f, "processing_status", None)
+    status_str = getattr(status, "value", status) if status is not None else None
+    return {
+        "id": f.id,
+        "name": _file_name(f),
+        "size": _file_size(f),
+        "created_at": str(f.created_at),
+        "processing_status": status_str,
+        "total_chunks": total,
+        "chunks_embedded": done,
+        "progress": (done / total) if (total and done is not None) else None,
+    }
+
+
 # ===== 健康检查 =====
 
 
@@ -543,7 +561,7 @@ async def list_project_files(project_id: str, request: Request):
             "SELECT project_folder_id FROM projects WHERE project_id = ?", (project_id,)
         ).fetchone()
     files = _file_items(letta.folders.files.list(folder_id=row["project_folder_id"]))
-    return [{"id": f.id, "name": _file_name(f), "size": _file_size(f), "created_at": str(f.created_at)} for f in files]
+    return [_file_to_dict(f) for f in files]
 
 
 @router.post("/project/{project_id}/files")
@@ -658,7 +676,7 @@ async def list_org_files(request: Request):
     extract_user_from_admin(request)
     resources = get_or_create_org_resources()
     files = _file_items(letta.folders.files.list(folder_id=resources["folder_id"]))
-    return [{"id": f.id, "name": _file_name(f), "size": _file_size(f), "created_at": str(f.created_at)} for f in files]
+    return [_file_to_dict(f) for f in files]
 
 
 @router.post("/org/files")
@@ -691,7 +709,7 @@ async def list_personal_files(request: Request):
     user = extract_user_from_admin(request)
     folder_id = get_or_create_personal_folder(user["id"])
     files = _file_items(letta.folders.files.list(folder_id=folder_id))
-    return [{"id": f.id, "name": _file_name(f), "size": _file_size(f), "created_at": str(f.created_at)} for f in files]
+    return [_file_to_dict(f) for f in files]
 
 
 @router.post("/personal/files")
