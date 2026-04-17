@@ -12,7 +12,7 @@ from auth import (
     require_project_admin,
     require_org_admin,
 )
-from routing import letta, get_or_create_org_resources, get_or_create_personal_folder, get_or_create_personal_human_block
+from routing import letta, get_or_create_org_resources, get_or_create_personal_folder, get_or_create_personal_human_block, get_or_create_agent
 from webui_sync import grant_model_access, revoke_model_access, revoke_all_model_access, reconcile_all
 from knowledge_mirror import mirror_file, unmirror_file
 
@@ -759,9 +759,25 @@ async def list_conversations(project_id: str, request: Request, limit: int = 100
     return result
 
 
+def _rebuild_agent(user_id: str, project_id: str, old_agent_id: str):
+    """删旧 agent + 重建新 agent（共享 human block 不受影响）。
+    彻底的"忘记"——连 conversation_search 工具也搜不到了。"""
+    with use_db() as db:
+        db.execute(
+            "DELETE FROM user_agent_map WHERE user_id = ? AND project_id = ?",
+            (user_id, project_id),
+        )
+    try:
+        letta.agents.delete(agent_id=old_agent_id)
+    except Exception as e:
+        logging.warning(f"delete agent {old_agent_id} failed (continuing): {e}")
+    # 触发懒重建
+    return get_or_create_agent(user_id, project_id)
+
+
 @router.delete("/personal/conversations/{project_id}")
 async def clear_project_conversations(project_id: str, request: Request):
-    """清空指定项目的对话历史，保留 human block 与文档"""
+    """清空指定项目的对话历史。实现：删 agent + 重建（共享 human block 保留）。"""
     user = extract_user_from_admin(request)
     with use_db() as db:
         row = db.execute(
@@ -770,9 +786,10 @@ async def clear_project_conversations(project_id: str, request: Request):
         ).fetchone()
     if not row:
         raise HTTPException(404, "无此项目的对话")
-    letta.agents.messages.reset(agent_id=row["agent_id"], add_default_initial_messages=False)
-    _audit(user["id"], "clear_conversations", scope=project_id)
-    return {"status": "ok", "project_id": project_id}
+    new_agent_id = _rebuild_agent(user["id"], project_id, row["agent_id"])
+    _audit(user["id"], "clear_conversations", scope=project_id,
+           details=f"old={row['agent_id']} new={new_agent_id}")
+    return {"status": "ok", "project_id": project_id, "new_agent_id": new_agent_id}
 
 
 @router.delete("/personal/conversations")
@@ -788,10 +805,10 @@ async def clear_all_conversations(request: Request):
     failed = []
     for r in rows:
         try:
-            letta.agents.messages.reset(agent_id=r["agent_id"], add_default_initial_messages=False)
+            _rebuild_agent(user["id"], r["project_id"], r["agent_id"])
             cleared.append(r["project_id"])
         except Exception as e:
-            logging.warning(f"clear all: reset {r['agent_id']} failed: {e}")
+            logging.warning(f"clear all: rebuild {r['project_id']} failed: {e}")
             failed.append(r["project_id"])
     _audit(user["id"], "clear_all_conversations", scope=",".join(cleared),
            details=f"failed={failed}" if failed else "")
