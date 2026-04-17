@@ -88,12 +88,16 @@ def get_or_create_agent(user_id: str, project: str) -> str:
         except Exception as e:
             logging.warning(f"failed to get suggest tool: {e}")
 
-        # 只内联 persona（跨用户各自独立）；human 走跨项目共享，稍后 attach
+        # 共享 human block（跨项目一份）先准备好，随 agent 创建一起 attach，
+        # 这样 Letta 系统提示编译时能拿到 block value。
+        human_block_id = get_or_create_personal_human_block(user_id)
+
         agent = letta.agents.create(
             name=f"user-{user_id}-{project}",
             model="openai/Qwen3.5-122B-A10B",
             metadata={"owner": user_id, "project": project},
             tool_ids=[suggest_tool_id] if suggest_tool_id else [],
+            block_ids=[human_block_id],
             memory_blocks=[
                 {
                     "label": "persona",
@@ -115,13 +119,6 @@ def get_or_create_agent(user_id: str, project: str) -> str:
                 "enable_reasoner": True,
             },
         )
-
-        # 跨项目共享的 human block
-        try:
-            human_block_id = get_or_create_personal_human_block(user_id)
-            letta.agents.blocks.attach(agent_id=agent.id, block_id=human_block_id)
-        except Exception as e:
-            logging.warning(f"attach shared human block to {agent.id} failed: {e}")
 
         _attach_agent_resources(db, agent.id, user_id, project)
 
