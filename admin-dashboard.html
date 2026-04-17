@@ -107,23 +107,25 @@ function Home({ go, user, projects }) {
     <Card hover delay={80} onClick={()=>go("personal")} style={{marginBottom:10}}><div style={{display:"flex",alignItems:"center",gap:14}}><div style={{width:42,height:42,borderRadius:12,background:C.tealBg,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>👤</div><div style={{flex:1}}><span style={{fontSize:15,fontWeight:700,color:C.slate}}>我的文件</span><p style={{fontSize:12,color:C.slateL,margin:"2px 0 0"}}>只有你的 AI 助手能看到</p></div><span style={{fontSize:11,color:C.sand}}>→</span></div></Card>
     <Anim delay={100}><div style={{padding:"10px 0 6px"}}><div style={{fontSize:10,fontWeight:800,color:C.sand,letterSpacing:2,textTransform:"uppercase",marginBottom:10,paddingLeft:2,fontFamily:"var(--ft)"}}>Projects</div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(260px, 1fr))",gap:8}}>
-        {projects.map((p,i) => <Card key={p.id} hover delay={140+i*60} onClick={()=>go("project",p.id)}>
+        {projects.map((p,i) => {
+          const goTodos = (e)=>{ e.stopPropagation(); go("project",{pid:p.id,tab:"todos"}); };
+          return <Card key={p.id} hover delay={140+i*60} onClick={()=>go("project",p.id)}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6,gap:6}}>
             <span style={{fontSize:15,fontWeight:700,color:C.slate}}>{p.name}</span>
             <div style={{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
-              {p.todo_high_count>0 && <span style={{fontSize:10,fontWeight:700,padding:"2px 7px",borderRadius:5,background:"#FEE2E2",color:"#DC2626",letterSpacing:0.2,fontFamily:"var(--ft)"}}>🔴 {p.todo_high_count} 高优</span>}
-              {p.todo_pending_count>0 && <span style={{fontSize:10,fontWeight:700,padding:"2px 7px",borderRadius:5,background:"#FEF3C7",color:"#92400E",letterSpacing:0.2,fontFamily:"var(--ft)"}}>📋 {p.todo_pending_count} 待处理</span>}
+              {p.todo_high_count>0 && <span onClick={goTodos} title="查看 TODO" style={{fontSize:10,fontWeight:700,padding:"2px 7px",borderRadius:5,background:"#FEE2E2",color:"#DC2626",letterSpacing:0.2,fontFamily:"var(--ft)",cursor:"pointer"}}>🔴 {p.todo_high_count} 高优</span>}
+              {p.todo_pending_count>0 && <span onClick={goTodos} title="查看 TODO" style={{fontSize:10,fontWeight:700,padding:"2px 7px",borderRadius:5,background:"#FEF3C7",color:"#92400E",letterSpacing:0.2,fontFamily:"var(--ft)",cursor:"pointer"}}>📋 {p.todo_pending_count} 待处理</span>}
               <Tag v={p.role}>{p.role}</Tag>
             </div>
           </div>
           <p style={{fontSize:11,color:C.slateXL,margin:"0 0 10px",lineHeight:1.5}}>{p.desc||""}</p>
-          {(p.todo_preview||[]).length>0 && <div style={{marginBottom:10,padding:"7px 9px",background:"#FEF2F2",borderRadius:8,borderLeft:"2px solid #DC2626"}}>
+          {(p.todo_preview||[]).length>0 && <div onClick={goTodos} style={{marginBottom:10,padding:"7px 9px",background:"#FEF2F2",borderRadius:8,borderLeft:"2px solid #DC2626",cursor:"pointer",transition:"background 0.15s"}} onMouseEnter={e=>e.currentTarget.style.background="#FEE2E2"} onMouseLeave={e=>e.currentTarget.style.background="#FEF2F2"}>
             {p.todo_preview.map(t=><div key={t.id} style={{fontSize:11,color:"#7F1D1D",lineHeight:1.5,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>⚡ {t.title}</div>)}
             {p.todo_high_count > p.todo_preview.length && <div style={{fontSize:10,color:"#DC2626",marginTop:2,fontWeight:600}}>+{p.todo_high_count - p.todo_preview.length} 条高优</div>}
           </div>}
           <div style={{display:"flex",gap:14,marginBottom:8,fontSize:11,color:C.sand,fontFamily:"var(--fn)"}}><span>👥 {p.members}</span><span>{p.used_mb||0}MB</span></div>
           <Progress v={p.used_mb||0} max={p.quota_mb||1024} unit="MB"/>
-        </Card>)}
+        </Card>;})}
       </div>
       <Anim delay={260}><button onClick={()=>go("new-project")} style={{width:"100%",marginTop:8,padding:"11px",background:"none",border:`1.5px dashed ${C.bdr}`,borderRadius:12,cursor:"pointer",fontSize:12,color:C.sand,fontWeight:700,fontFamily:"var(--ft)"}}>+ 创建新项目</button></Anim>
     </div></Anim>
@@ -167,12 +169,12 @@ function OrgPage({ back, user }) {
 }
 
 // ===== PROJECT PAGE =====
-function ProjPage({ pid, back, user }) {
+function ProjPage({ pid, initialTab, back, user }) {
   const [proj, setProj] = useState(null); const [k, setK] = useState(""); const [kLimit, setKLimit] = useState(2000);
   const [files, setFiles] = useState([]); const [members, setMembers] = useState([]);
   const [suggestions, setSuggestions] = useState([]); const [todos, setTodos] = useState([]);
   const [todoMode, setTodoMode] = useState("ai_only");
-  const [tab, setTab] = useState("knowledge"); const [saved, setSaved] = useState(false);
+  const [tab, setTab] = useState(initialTab || "knowledge"); const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(true);
   const [isA, setIsA] = useState(false);
 
@@ -711,7 +713,7 @@ function App() {
         </div></Anim>
         {page === "home" && <Home go={go} user={user} projects={projects}/>}
         {page === "org" && <OrgPage back={()=>go("home")} user={user}/>}
-        {page === "project" && <ProjPage pid={arg} back={()=>go("home")} user={user}/>}
+        {page === "project" && <ProjPage pid={typeof arg==="string"?arg:arg?.pid} initialTab={typeof arg==="string"?null:arg?.tab} back={()=>go("home")} user={user}/>}
         {page === "memory" && <MemoryPage back={()=>go("home")}/>}
         {page === "personal" && <PersonalPage back={()=>go("home")}/>}
         {page === "new-project" && <NewProjectPage back={()=>go("home")} go={go}/>}
