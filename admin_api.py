@@ -760,8 +760,29 @@ async def list_conversations(project_id: str, request: Request, limit: int = 100
 
 
 def _rebuild_agent(user_id: str, project_id: str, old_agent_id: str):
-    """删旧 agent + 重建新 agent（共享 human block 不受影响）。
-    彻底的"忘记"——连 conversation_search 工具也搜不到了。"""
+    """删旧 agent + 重建新 agent。删之前 detach 掉所有共享 block（human/project/org），
+    防止 Letta 级联删除殃及到其他 agent 仍在用的 block。"""
+    # 先把共享 block 和 folder 都 detach，防止级联删
+    try:
+        blocks = list(letta.agents.blocks.list(agent_id=old_agent_id))
+        for b in blocks:
+            if b.label in ("human", "org_knowledge") or (b.label or "").startswith("project_knowledge_"):
+                try:
+                    letta.agents.blocks.detach(agent_id=old_agent_id, block_id=b.id)
+                except Exception as e:
+                    logging.warning(f"detach block {b.id} from {old_agent_id}: {e}")
+    except Exception as e:
+        logging.warning(f"list blocks on {old_agent_id}: {e}")
+    try:
+        folders = list(letta.agents.folders.list(agent_id=old_agent_id))
+        for f in folders:
+            try:
+                letta.agents.folders.detach(agent_id=old_agent_id, folder_id=f.id)
+            except Exception as e:
+                logging.warning(f"detach folder {f.id} from {old_agent_id}: {e}")
+    except Exception as e:
+        logging.warning(f"list folders on {old_agent_id}: {e}")
+
     with use_db() as db:
         db.execute(
             "DELETE FROM user_agent_map WHERE user_id = ? AND project_id = ?",

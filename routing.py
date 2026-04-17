@@ -147,15 +147,14 @@ def get_or_create_org_resources() -> dict:
 
 def get_or_create_personal_human_block(user_id: str) -> str:
     """获取用户的人设 block（human label），不存在则创建。per-user 共享，跨项目所有 agent attach 同一个。"""
-    db = get_db()
-    row = db.execute(
-        "SELECT personal_human_block_id FROM user_cache WHERE user_id = ? AND personal_human_block_id IS NOT NULL",
-        (user_id,),
-    ).fetchone()
+    from db import use_db
+    with use_db() as db:
+        row = db.execute(
+            "SELECT personal_human_block_id FROM user_cache WHERE user_id = ? AND personal_human_block_id IS NOT NULL",
+            (user_id,),
+        ).fetchone()
     if row:
         block_id = row["personal_human_block_id"]
-        db.close()
-        # 确认 Letta 侧还在
         try:
             letta.blocks.retrieve(block_id=block_id)
             return block_id
@@ -167,14 +166,12 @@ def get_or_create_personal_human_block(user_id: str) -> str:
         value="(新用户，信息未知)",
         limit=2000,
     )
-    db = db or get_db()
-    db.execute(
-        "INSERT INTO user_cache (user_id, personal_human_block_id) VALUES (?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET personal_human_block_id = excluded.personal_human_block_id, updated_at = CURRENT_TIMESTAMP",
-        (user_id, block.id),
-    )
-    db.commit()
-    db.close()
+    with use_db() as db:
+        db.execute(
+            "INSERT INTO user_cache (user_id, personal_human_block_id) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET personal_human_block_id = excluded.personal_human_block_id, updated_at = CURRENT_TIMESTAMP",
+            (user_id, block.id),
+        )
     return block.id
 
 
