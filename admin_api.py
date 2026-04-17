@@ -37,6 +37,49 @@ def _file_items(files_page):
     return list(getattr(files_page, "items", files_page))
 
 
+# ===== 健康检查 =====
+
+
+@router.get("/health")
+async def health():
+    """各依赖服务连通性检查。adapter 自己能响应即 adapter=ok；其他逐一 ping。"""
+    import httpx as _httpx
+    result = {"adapter": "ok"}
+    # Letta
+    try:
+        r = _httpx.get(f"{config.LETTA_BASE_URL}/v1/health/", timeout=3)
+        result["letta"] = "ok" if r.status_code == 200 else f"http {r.status_code}"
+    except Exception as e:
+        result["letta"] = f"err: {type(e).__name__}"
+    # vLLM
+    try:
+        r = _httpx.get(f"{config.VLLM_ENDPOINT}/models", timeout=3, headers={"Authorization": f"Bearer {config.VLLM_API_KEY}"})
+        result["vllm"] = "ok" if r.status_code == 200 else f"http {r.status_code}"
+    except Exception as e:
+        result["vllm"] = f"err: {type(e).__name__}"
+    # Ollama
+    try:
+        r = _httpx.get("http://ollama:11434/api/tags", timeout=3)
+        result["ollama"] = "ok" if r.status_code == 200 else f"http {r.status_code}"
+    except Exception as e:
+        result["ollama"] = f"err: {type(e).__name__}"
+    # Open WebUI
+    try:
+        r = _httpx.get(f"{config.OPENWEBUI_URL}/health", timeout=3)
+        result["webui"] = "ok" if r.status_code == 200 else f"http {r.status_code}"
+    except Exception as e:
+        result["webui"] = f"err: {type(e).__name__}"
+    # 数据库
+    try:
+        with use_db() as db:
+            db.execute("SELECT 1").fetchone()
+        result["sqlite"] = "ok"
+    except Exception as e:
+        result["sqlite"] = f"err: {type(e).__name__}"
+    result["all_ok"] = all(v == "ok" for k, v in result.items() if k != "all_ok")
+    return result
+
+
 # ===== 当前用户 =====
 
 

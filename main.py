@@ -78,23 +78,59 @@ async def start_reconcile_loop():
 
 
 def _extract_letta_response(response) -> str:
-    """从 Letta 响应中提取 reasoning + assistant_content，拼成 <think> 格式"""
-    reasoning_parts = []
+    """从 Letta 响应提取：reasoning 包 <think>，工具调用/返回人话化，最后拼 assistant_message"""
+    parts = []
+    in_think = False
     assistant_content = ""
+    pending_tool = None  # (name, args)
+
+    def close_think():
+        nonlocal in_think
+        if in_think:
+            parts.append("</think>")
+            in_think = False
+
+    def open_think():
+        nonlocal in_think
+        if not in_think:
+            parts.append("<think>")
+            in_think = True
+
     for msg in response.messages:
-        msg_type = getattr(msg, "message_type", "")
-        if msg_type == "reasoning_message":
+        mtype = getattr(msg, "message_type", "")
+        if mtype == "reasoning_message":
             text = getattr(msg, "reasoning", "") or ""
-            if text:
-                reasoning_parts.append(text)
-        elif msg_type == "assistant_message":
+            if text.strip():
+                open_think()
+                parts.append(text)
+        elif mtype == "tool_call_message":
+            tc = getattr(msg, "tool_call", None)
+            if tc:
+                name = getattr(tc, "name", "") or ""
+                args = getattr(tc, "arguments", "") or ""
+                pending_tool = (name, args)
+        elif mtype == "tool_return_message":
+            close_think()
+            if pending_tool:
+                parts.append("\n" + _pretty_tool(*pending_tool))
+                pending_tool = None
+            parts.append("   → " + _pretty_return(getattr(msg, "tool_return", "")) + "\n")
+        elif mtype == "assistant_message":
+            close_think()
+            if pending_tool:
+                parts.append("\n" + _pretty_tool(*pending_tool) + "\n")
+                pending_tool = None
             content = getattr(msg, "content", "")
+            if isinstance(content, list):
+                content = "".join([getattr(x, "text", "") or str(x) for x in content])
             if content:
                 assistant_content = str(content)
-    # 拼接：<think>reasoning</think>content
-    if reasoning_parts:
-        return f"<think>{''.join(reasoning_parts)}</think>{assistant_content}"
-    return assistant_content
+    close_think()
+    if pending_tool:
+        parts.append("\n" + _pretty_tool(*pending_tool) + "\n")
+
+    header = "".join(parts)
+    return header + assistant_content
 
 
 async def non_stream_response(agent_id: str, message: str, model: str):
@@ -116,6 +152,59 @@ async def non_stream_response(agent_id: str, message: str, model: str):
         ],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
+
+
+def _pretty_tool(name: str, args_json: str) -> str:
+    """把工具调用渲染成人话：已知工具特化展示，未知工具 fallback 名+主参数。"""
+    try:
+        args = json.loads(args_json) if args_json else {}
+    except Exception:
+        return f"🔧 {name}"
+    if name == "suggest_todo":
+        title = args.get("title", "")
+        pri = args.get("priority", "")
+        mark = {"high": " 🔴", "medium": "", "low": " 🔵"}.get(pri, "")
+        return f"📝 建议 TODO:「{title}」{mark}"
+    if name == "suggest_project_knowledge":
+        return f"📚 提交项目知识建议:{(args.get('content') or '')[:60]}"
+    if name in ("memory_insert", "core_memory_append", "memory_replace", "core_memory_replace"):
+        label = args.get("label", "") or "记忆"
+        content = args.get("content") or args.get("new_str") or ""
+        return f"🧠 写入 {label} block:{content[:60]}"
+    if name in ("archival_memory_search", "search_memory"):
+        return f"🔍 归档搜索:{(args.get('query') or '')[:40]}"
+    if name == "conversation_search":
+        return f"🔍 对话搜索:{(args.get('query') or '')[:40]}"
+    if name in ("open_files", "open_file"):
+        fn = args.get("file_name") or args.get("file_path") or args.get("name") or ""
+        return f"📄 打开文件:{fn}"
+    if name == "grep_files":
+        return f"🔎 grep:{(args.get('pattern') or '')[:40]}"
+    if name == "semantic_search_files":
+        return f"🔍 语义搜索文件:{(args.get('query') or '')[:40]}"
+    vals = [v for v in args.values() if v]
+    first = (str(vals[0])[:50]) if vals else ""
+    return f"🔧 {name}" + (f":{first}" if first else "")
+
+
+def _pretty_return(ret: str) -> str:
+    """tool_return 精简:强制单行 + 截断 + grep/open 等大返回提炼摘要"""
+    ret = (ret or "").strip()
+    if not ret:
+        return "✓ 完成"
+    if ret.startswith("{") and ret.endswith("}"):
+        try:
+            j = json.loads(ret)
+            ret = j.get("message") or j.get("status") or str(j)
+        except Exception:
+            pass
+    first_line = ret.split("\n", 1)[0]
+    if "matches" in first_line or "找到" in first_line or "showing" in first_line.lower():
+        return first_line[:120]
+    ret = ret.replace("\n", " ").strip()
+    if len(ret) > 120:
+        ret = ret[:120] + "…"
+    return ret
 
 
 def _assistant_delta_text(content) -> str:
@@ -150,62 +239,6 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
     in_thinking = False
     # tool_call 是流式 delta：name 先来一次，args 分多片。聚合后在 tool_return 或 flush 时整体输出。
     pending_tc = {"name": "", "args": ""}
-
-    def _pretty_tool(name: str, args_json: str) -> str:
-        """把工具调用渲染成人话：已知工具特化展示，未知工具 fallback 名+主参数。"""
-        try:
-            args = json.loads(args_json) if args_json else {}
-        except Exception:
-            return f"🔧 {name}"
-        if name == "suggest_todo":
-            title = args.get("title", "")
-            pri = args.get("priority", "")
-            mark = {"high": " 🔴", "medium": "", "low": " 🔵"}.get(pri, "")
-            return f"📝 建议 TODO：「{title}」{mark}"
-        if name == "suggest_project_knowledge":
-            return f"📚 提交项目知识建议：{(args.get('content') or '')[:60]}"
-        if name in ("memory_insert", "core_memory_append", "memory_replace", "core_memory_replace"):
-            label = args.get("label", "") or "记忆"
-            content = args.get("content") or args.get("new_str") or ""
-            return f"🧠 写入 {label} block：{content[:60]}"
-        if name in ("archival_memory_search", "search_memory"):
-            return f"🔍 归档搜索：{(args.get('query') or '')[:40]}"
-        if name == "conversation_search":
-            return f"🔍 对话搜索：{(args.get('query') or '')[:40]}"
-        if name in ("open_files", "open_file"):
-            fn = args.get("file_name") or args.get("file_path") or args.get("name") or ""
-            return f"📄 打开文件：{fn}"
-        if name == "grep_files":
-            return f"🔎 grep：{(args.get('pattern') or '')[:40]}"
-        if name == "semantic_search_files":
-            return f"🔍 语义搜索文件：{(args.get('query') or '')[:40]}"
-        # fallback: 取最重要的一个参数
-        vals = [v for v in args.values() if v]
-        first = (str(vals[0])[:50]) if vals else ""
-        return f"🔧 {name}" + (f"：{first}" if first else "")
-
-    def _pretty_return(ret: str) -> str:
-        """tool_return 精简：强制单行 + 截断 + grep/open 等大返回提炼摘要"""
-        ret = (ret or "").strip()
-        if not ret:
-            return "✓ 完成"
-        # JSON 包裹剥一层
-        if ret.startswith("{") and ret.endswith("}"):
-            try:
-                j = json.loads(ret)
-                ret = j.get("message") or j.get("status") or str(j)
-            except Exception:
-                pass
-        # grep_files / open_files 等返回可能上千行，只取首行 + 总体提示
-        first_line = ret.split("\n", 1)[0]
-        # 如果首行带"Found N ... matches / 显示 N ..."字样，就只用这句
-        if "matches" in first_line or "找到" in first_line or "showing" in first_line.lower():
-            return first_line[:120]
-        # 其他情况：去换行、截到 120 字
-        ret = ret.replace("\n", " ").strip()
-        if len(ret) > 120:
-            ret = ret[:120] + "…"
-        return ret
 
     def flush_tool_call():
         if not pending_tc["name"] and not pending_tc["args"]:

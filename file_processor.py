@@ -46,7 +46,7 @@ def _fmt_cell(v) -> str:
     return s.replace("|", "\\|").replace("\n", " ").replace("\r", "")
 
 
-MAX_ROWS_PER_SHEET = 500  # 单 sheet 行上限，超出截断并注明
+MAX_ROWS_PER_SHEET = 5000  # 单 sheet 行上限；50MB 上传限额已是硬防线，这里放宽避免业务表被砍半
 
 
 def _xlsx_to_markdown(data: bytes) -> str:
