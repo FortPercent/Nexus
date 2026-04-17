@@ -151,13 +151,60 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
     # tool_call 是流式 delta：name 先来一次，args 分多片。聚合后在 tool_return 或 flush 时整体输出。
     pending_tc = {"name": "", "args": ""}
 
+    def _pretty_tool(name: str, args_json: str) -> str:
+        """把工具调用渲染成人话：已知工具特化展示，未知工具 fallback 名+主参数。"""
+        try:
+            args = json.loads(args_json) if args_json else {}
+        except Exception:
+            return f"🔧 {name}"
+        if name == "suggest_todo":
+            title = args.get("title", "")
+            pri = args.get("priority", "")
+            mark = {"high": " 🔴", "medium": "", "low": " 🔵"}.get(pri, "")
+            return f"📝 建议 TODO：「{title}」{mark}"
+        if name == "suggest_project_knowledge":
+            return f"📚 提交项目知识建议：{(args.get('content') or '')[:60]}"
+        if name in ("memory_insert", "core_memory_append", "memory_replace", "core_memory_replace"):
+            label = args.get("label", "") or "记忆"
+            content = args.get("content") or args.get("new_str") or ""
+            return f"🧠 写入 {label} block：{content[:60]}"
+        if name in ("archival_memory_search", "search_memory"):
+            return f"🔍 归档搜索：{(args.get('query') or '')[:40]}"
+        if name == "conversation_search":
+            return f"🔍 对话搜索：{(args.get('query') or '')[:40]}"
+        if name in ("open_files", "open_file"):
+            fn = args.get("file_name") or args.get("file_path") or args.get("name") or ""
+            return f"📄 打开文件：{fn}"
+        if name == "grep_files":
+            return f"🔎 grep：{(args.get('pattern') or '')[:40]}"
+        if name == "semantic_search_files":
+            return f"🔍 语义搜索文件：{(args.get('query') or '')[:40]}"
+        # fallback: 取最重要的一个参数
+        vals = [v for v in args.values() if v]
+        first = (str(vals[0])[:50]) if vals else ""
+        return f"🔧 {name}" + (f"：{first}" if first else "")
+
+    def _pretty_return(ret: str) -> str:
+        """tool_return 精简：去掉 JSON 结构、截断到 80 字"""
+        ret = (ret or "").strip()
+        if not ret:
+            return "✓ 完成"
+        # 去掉 json 包裹
+        if ret.startswith("{") and ret.endswith("}"):
+            try:
+                j = json.loads(ret)
+                ret = j.get("message") or j.get("status") or str(j)
+            except Exception:
+                pass
+        return ret[:160]
+
     def flush_tool_call():
         if not pending_tc["name"] and not pending_tc["args"]:
             return None
-        chunk_text = f"🔧 {pending_tc['name'] or '?'}({pending_tc['args']})\n"
+        text = _pretty_tool(pending_tc["name"], pending_tc["args"]) + "\n"
         pending_tc["name"] = ""
         pending_tc["args"] = ""
-        return chunk_text
+        return text
 
     try:
         stream = await letta_async.agents.messages.stream(
@@ -203,11 +250,11 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
                 if args:
                     pending_tc["args"] += args
             elif mtype == "tool_return_message":
-                ret = getattr(ev, "tool_return", "") or ""
+                ret = _pretty_return(getattr(ev, "tool_return", ""))
                 prefix = "</think>\n" if in_thinking else ""
                 in_thinking = False
                 pending = flush_tool_call()
-                combined = (prefix or "") + (pending or "") + f"→ {ret}\n"
+                combined = (prefix or "") + (pending or "") + f"   → {ret}\n"
                 yield _sse({"content": combined})
             elif mtype == "error_message":
                 err_type = (getattr(ev, "error_type", "") or "").lower()
