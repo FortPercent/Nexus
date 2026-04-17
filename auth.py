@@ -90,10 +90,11 @@ def extract_user_from_chat(request: Request, body: dict) -> dict:
 
     user = {"id": user_id, "name": name, "email": email, "role": body.get("user_role", "user")}
 
+    # 只在首次见到该用户时 insert；已存在就不覆盖，防止脚本/测试传进来的假名字污染真实姓名
     if name or email:
         with use_db() as db:
             db.execute(
-                "INSERT OR REPLACE INTO user_cache (user_id, name, email) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO user_cache (user_id, name, email) VALUES (?, ?, ?)",
                 (user["id"], user["name"], user["email"]),
             )
 
