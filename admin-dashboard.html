@@ -159,7 +159,8 @@ function OrgPage({ back, user }) {
 function ProjPage({ pid, back, user }) {
   const [proj, setProj] = useState(null); const [k, setK] = useState(""); const [kLimit, setKLimit] = useState(2000);
   const [files, setFiles] = useState([]); const [members, setMembers] = useState([]);
-  const [suggestions, setSuggestions] = useState([]);
+  const [suggestions, setSuggestions] = useState([]); const [todos, setTodos] = useState([]);
+  const [todoMode, setTodoMode] = useState("ai_only");
   const [tab, setTab] = useState("knowledge"); const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(true);
   const [isA, setIsA] = useState(false);
@@ -171,13 +172,17 @@ function ProjPage({ pid, back, user }) {
       api(`/project/${pid}/files`),
       api(`/project/${pid}/members`),
       api(`/project/${pid}/suggestions`),
-    ]).then(([ps, kd, fd, md, sg])=>{
+      api(`/project/${pid}/todos`),
+      api(`/project/${pid}/settings/todo`),
+    ]).then(([ps, kd, fd, md, sg, td, ts])=>{
       const p = (ps||[]).find(x=>x.id===pid);
       if(p) { setProj(p); setIsA(p.role==="admin"); }
       if(kd) { setK(kd.content||""); setKLimit(kd.limit||2000); }
       if(fd) setFiles(fd);
       if(md) setMembers(md);
       if(sg) setSuggestions(sg);
+      if(td) setTodos(td);
+      if(ts) setTodoMode(ts.approval_mode||"ai_only");
       setLoading(false);
     }).catch(()=>setLoading(false));
   },[pid]);
@@ -199,7 +204,14 @@ function ProjPage({ pid, back, user }) {
   if(loading) return <div><Back onClick={back}/><Loading/></div>;
   if(!proj) return <div><Back onClick={back}/><div style={{textAlign:"center",padding:"40px",color:C.sand}}>项目不存在或无权访问</div></div>;
 
-  const tabs = [{id:"knowledge",label:"核心知识"},{id:"files",label:`文档 · ${files.length}`},{id:"members",label:`成员 · ${members.length}`}];
+  const pendingTodoCount = todos.filter(t=>t.status==="awaiting_user"||t.status==="awaiting_admin").length;
+  const openTodoCount = todos.filter(t=>t.status==="open"||t.status==="in_progress").length;
+  const tabs = [
+    {id:"knowledge",label:"核心知识"},
+    {id:"files",label:`文档 · ${files.length}`},
+    {id:"members",label:`成员 · ${members.length}`},
+    {id:"todos",label:`TODO · ${openTodoCount}${pendingTodoCount>0?` (${pendingTodoCount}待处理)`:""}`},
+  ];
   if(isA) tabs.push({id:"settings",label:"设置"});
 
   return <div><Back onClick={back}/>
@@ -257,11 +269,202 @@ function ProjPage({ pid, back, user }) {
       <Hint>添加成员 → Agent 自动挂载项目知识</Hint>
     </Card>}
 
+    {tab==="todos" && <TodoTab pid={pid} isA={isA} user={user} members={members} todos={todos} setTodos={setTodos} approvalMode={todoMode}/>}
+
     {tab==="settings" && isA && <Card delay={120}><SH sub="项目设置">设置</SH>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}><span style={{fontSize:13,color:C.slateL}}>存储限额: {proj.quota_mb||1024} MB · 已用: {proj.used_mb||0} MB</span></div>
       <Progress v={proj.used_mb||0} max={proj.quota_mb||1024} unit="MB"/>
+
+      <div style={{marginTop:24,paddingTop:16,borderTop:`1px solid ${C.bdrL}`}}>
+        <SH sub="AI 建议 & 手动创建的 TODO 落位规则">TODO 审批模式</SH>
+        <select value={todoMode} onChange={e=>{const m=e.target.value; api(`/project/${pid}/settings/todo`,{method:"PUT",body:{approval_mode:m}}).then(()=>setTodoMode(m)).catch(er=>alert(er.message));}} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.bdrL}`,background:"#fff",fontSize:12.5,fontFamily:"var(--ft)",cursor:"pointer",outline:"none"}}>
+          <option value="ai_only">ai_only · AI 建议需 member 确认；member 手动直接入看板（默认）</option>
+          <option value="strict">strict · AI 需 member 再 admin 审；member 手动也要 admin 审</option>
+          <option value="open">open · AI 和 member 手动都直接入看板，不审</option>
+        </select>
+      </div>
+
       <div style={{marginTop:24,paddingTop:16,borderTop:`1px solid ${C.bdrL}`}}><SH sub="删除后不可恢复">危险操作</SH><Btn v="danger" onClick={delProject}>删除此项目</Btn></div>
     </Card>}
+  </div>;
+}
+
+// ===== TODO TAB =====
+
+const TODO_STATUS_META = {
+  awaiting_user:   {bg:"#FEF3C7", fg:"#92400E", label:"待我确认"},
+  awaiting_admin:  {bg:"#EDE9FE", fg:"#6B4FA0", label:"待 admin 审"},
+  open:            {bg:"#DBEAFE", fg:"#1D4ED8", label:"待办"},
+  in_progress:     {bg:"#FEF3C7", fg:"#92400E", label:"进行中"},
+  done:            {bg:"#D1FAE5", fg:"#065F46", label:"已完成"},
+  cancelled:       {bg:"#F3F4F6", fg:"#6B7280", label:"已取消"},
+};
+const TODO_PRIORITY_META = {
+  low:{bg:"#F3F4F6",fg:"#6B7280",label:"低"},
+  medium:{bg:"#DBEAFE",fg:"#1D4ED8",label:"中"},
+  high:{bg:"#FEE2E2",fg:"#DC2626",label:"高"},
+};
+
+function TodoTab({ pid, isA, user, members, todos, setTodos, approvalMode }) {
+  const [showForm, setShowForm] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [newDesc, setNewDesc] = useState("");
+  const [newPriority, setNewPriority] = useState("medium");
+  const [newAssigned, setNewAssigned] = useState("");
+  const [expanded, setExpanded] = useState({});
+  const [rejectingId, setRejectingId] = useState(null);
+  const [rejectReason, setRejectReason] = useState("");
+
+  const reload = ()=>api(`/project/${pid}/todos`).then(t=>{if(t) setTodos(t);}).catch(()=>{});
+
+  const createTodo = ()=>{
+    if(!newTitle.trim()) return;
+    api(`/project/${pid}/todos`,{method:"POST",body:{title:newTitle.trim(),description:newDesc.trim(),priority:newPriority,assigned_to:newAssigned||null}})
+      .then(()=>{ setNewTitle(""); setNewDesc(""); setNewPriority("medium"); setNewAssigned(""); setShowForm(false); reload(); })
+      .catch(e=>alert(e.message));
+  };
+  const changeField = (id, patch)=>api(`/project/${pid}/todos/${id}`,{method:"PUT",body:patch}).then(reload).catch(e=>alert(e.message));
+  const del = (id)=>{ if(!confirm("确定删除？")) return; api(`/project/${pid}/todos/${id}`,{method:"DELETE"}).then(reload).catch(e=>alert(e.message)); };
+  const confirmTodo = (id)=>api(`/project/${pid}/todos/${id}/confirm`,{method:"POST"}).then(reload).catch(e=>alert(e.message));
+  const approveTodo = (id)=>api(`/project/${pid}/todos/${id}/approve`,{method:"POST"}).then(reload).catch(e=>alert(e.message));
+  const doReject = (id)=>{ api(`/project/${pid}/todos/${id}/reject`,{method:"POST",body:{reason:rejectReason.trim()}}).then(()=>{setRejectingId(null);setRejectReason("");reload();}).catch(e=>alert(e.message)); };
+
+  const myPending = todos.filter(t =>
+    (t.status==="awaiting_user" && t.created_by===user.id) ||
+    (t.status==="awaiting_admin" && t.created_by===user.id) ||
+    (t.status==="awaiting_admin" && isA)
+  );
+  const open = todos.filter(t=>t.status==="open");
+  const inProg = todos.filter(t=>t.status==="in_progress");
+  const done = todos.filter(t=>t.status==="done");
+
+  const renderCard = (t, showAssignee=true) => {
+    const isCreator = t.created_by===user.id;
+    const isAssignee = t.assigned_to===user.id;
+    const canMoveStatus = isA || isCreator || isAssignee;
+    const canEditFields = isA || isCreator;
+    const assignee = members.find(m=>m.id===t.assigned_to);
+    const pm = TODO_PRIORITY_META[t.priority] || TODO_PRIORITY_META.medium;
+    const isExpanded = !!expanded[t.id];
+    return <Anim key={t.id} delay={20}>
+      <div style={{padding:"10px 12px",marginBottom:6,background:"#fff",border:`1px solid ${C.bdrL}`,borderRadius:10,cursor:"pointer"}} onClick={()=>setExpanded(e=>({...e,[t.id]:!e[t.id]}))}>
+        <div style={{display:"flex",alignItems:"flex-start",gap:8}}>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:12.8,fontWeight:600,color:C.slate,lineHeight:1.5,wordBreak:"break-word"}}>{t.title}</div>
+            <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4,flexWrap:"wrap"}}>
+              <span style={{fontSize:9.5,fontWeight:700,padding:"2px 7px",borderRadius:4,background:pm.bg,color:pm.fg,letterSpacing:0.2}}>{pm.label}</span>
+              {t.source==="ai" && <span style={{fontSize:9.5,padding:"2px 7px",borderRadius:4,background:"#EDE9FE",color:"#6B4FA0",fontWeight:600}}>AI</span>}
+              {showAssignee && assignee && <span style={{fontSize:10,color:C.sand}}>👤 {assignee.name||assignee.id.slice(0,6)}</span>}
+              {t.due_date && <span style={{fontSize:10,color:C.sand}}>📅 {t.due_date}</span>}
+            </div>
+          </div>
+        </div>
+        {isExpanded && <div onClick={e=>e.stopPropagation()} style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${C.bdrL}`}}>
+          {t.description && <div style={{fontSize:11.5,color:C.slateL,marginBottom:10,whiteSpace:"pre-wrap",lineHeight:1.6}}>{t.description}</div>}
+          {t.cancel_reason && <div style={{fontSize:11,color:C.terra,marginBottom:10,padding:"6px 10px",background:"#FEF2F2",borderRadius:6}}>驳回原因：{t.cancel_reason}</div>}
+          <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+            {canMoveStatus && ["open","in_progress","done"].includes(t.status) && <select value={t.status} onChange={e=>changeField(t.id,{status:e.target.value})} style={{padding:"4px 8px",fontSize:11,borderRadius:6,border:`1px solid ${C.bdrL}`,background:"#fff",cursor:"pointer"}}>
+              <option value="open">待办</option><option value="in_progress">进行中</option><option value="done">已完成</option>
+            </select>}
+            {canEditFields && ["open","in_progress","awaiting_admin","awaiting_user"].includes(t.status) && <select value={t.priority} onChange={e=>changeField(t.id,{priority:e.target.value})} style={{padding:"4px 8px",fontSize:11,borderRadius:6,border:`1px solid ${C.bdrL}`,background:"#fff",cursor:"pointer"}}>
+              <option value="low">低</option><option value="medium">中</option><option value="high">高</option>
+            </select>}
+            {canEditFields && ["open","in_progress"].includes(t.status) && <select value={t.assigned_to||""} onChange={e=>changeField(t.id,{assigned_to:e.target.value||null})} style={{padding:"4px 8px",fontSize:11,borderRadius:6,border:`1px solid ${C.bdrL}`,background:"#fff",cursor:"pointer"}}>
+              <option value="">未指派</option>
+              {members.map(m=><option key={m.id} value={m.id}>{m.name||m.id.slice(0,6)}</option>)}
+            </select>}
+            <div style={{flex:1}}/>
+            <span style={{fontSize:10,color:C.sand}}>{t.source==="ai"?"AI 建议":"手动"} · {(t.created_at||"").slice(0,10)}</span>
+            {(isA || (isCreator && ["awaiting_user","awaiting_admin"].includes(t.status))) && <Btn v="ghost" onClick={()=>del(t.id)} style={{fontSize:10.5,color:C.terra,padding:"3px 8px"}}>删除</Btn>}
+          </div>
+        </div>}
+      </div>
+    </Anim>;
+  };
+
+  const renderPendingCard = (t) => {
+    const pm = TODO_PRIORITY_META[t.priority] || TODO_PRIORITY_META.medium;
+    const creator = members.find(m=>m.id===t.created_by);
+    const sm = TODO_STATUS_META[t.status];
+    const canConfirm = t.status==="awaiting_user" && t.created_by===user.id;
+    const canApprove = t.status==="awaiting_admin" && isA;
+    const canReject = canConfirm || canApprove;
+    return <Anim key={t.id} delay={20}>
+      <div style={{padding:"10px 12px",marginBottom:6,background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:10}}>
+        <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:12.8,fontWeight:600,color:C.slate,lineHeight:1.5}}>{t.title}</div>
+            {t.description && <div style={{fontSize:11.5,color:C.slateL,marginTop:4,whiteSpace:"pre-wrap",lineHeight:1.6}}>{t.description}</div>}
+            <div style={{display:"flex",alignItems:"center",gap:6,marginTop:6,flexWrap:"wrap"}}>
+              <span style={{fontSize:9.5,fontWeight:700,padding:"2px 7px",borderRadius:4,background:sm.bg,color:sm.fg}}>{sm.label}</span>
+              <span style={{fontSize:9.5,fontWeight:700,padding:"2px 7px",borderRadius:4,background:pm.bg,color:pm.fg}}>{pm.label}</span>
+              {t.source==="ai" && <span style={{fontSize:9.5,padding:"2px 7px",borderRadius:4,background:"#EDE9FE",color:"#6B4FA0",fontWeight:600}}>AI</span>}
+              <span style={{fontSize:10,color:C.sand}}>来自 {creator?.name||t.created_by.slice(0,6)} · {(t.created_at||"").slice(5,16)}</span>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:6,flexShrink:0}}>
+            {canConfirm && <Btn v="primary" onClick={()=>confirmTodo(t.id)} style={{fontSize:11,padding:"4px 10px"}}>✓ 确认</Btn>}
+            {canApprove && <Btn v="primary" onClick={()=>approveTodo(t.id)} style={{fontSize:11,padding:"4px 10px"}}>✓ 批准</Btn>}
+            {canReject && <Btn v="ghost" onClick={()=>setRejectingId(t.id)} style={{fontSize:11,color:C.terra,padding:"4px 10px"}}>✗ {canApprove?"驳回":"忽略"}</Btn>}
+            {t.status==="awaiting_admin" && t.created_by===user.id && !canApprove && <Btn v="ghost" onClick={()=>del(t.id)} style={{fontSize:11,color:C.sand}}>撤回</Btn>}
+          </div>
+        </div>
+        {rejectingId===t.id && <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid #FDE68A"}}>
+          <input value={rejectReason} onChange={e=>setRejectReason(e.target.value)} placeholder="（可选）填驳回原因" style={{width:"100%",padding:"6px 10px",fontSize:11,borderRadius:6,border:`1px solid ${C.bdrL}`,boxSizing:"border-box",outline:"none"}}/>
+          <div style={{display:"flex",gap:6,marginTop:8,justifyContent:"flex-end"}}>
+            <Btn v="ghost" onClick={()=>{setRejectingId(null);setRejectReason("");}} style={{fontSize:11}}>取消</Btn>
+            <Btn v="danger" onClick={()=>doReject(t.id)} style={{fontSize:11}}>确认驳回</Btn>
+          </div>
+        </div>}
+      </div>
+    </Anim>;
+  };
+
+  const renderCol = (title, items, col) => <div style={{flex:1,minWidth:0,background:"#F9FAFB",borderRadius:12,padding:"12px"}}>
+    <div style={{fontSize:11,fontWeight:700,color:C.slateL,marginBottom:10,letterSpacing:0.3,textTransform:"uppercase",fontFamily:"var(--ft)"}}>{title} · {items.length}</div>
+    {items.length === 0 && <div style={{textAlign:"center",padding:"16px 0",color:C.sand,fontSize:11}}>暂无</div>}
+    {items.map(t=>renderCard(t))}
+  </div>;
+
+  return <div>
+    {myPending.length > 0 && <Card delay={80} style={{marginBottom:14,background:"#FFFBEB",border:"1px solid #FDE68A"}}>
+      <SH sub="等你处理">📋 待处理 · {myPending.length}</SH>
+      {myPending.map(renderPendingCard)}
+    </Card>}
+
+    <Anim delay={100}><div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14,flexWrap:"wrap"}}>
+      <span style={{fontSize:11.5,color:C.slateL}}>模式：<b>{approvalMode}</b></span>
+      <div style={{flex:1}}/>
+      <Btn v="primary" onClick={()=>setShowForm(!showForm)} style={{fontSize:11}}>{showForm?"取消":"+ 添加 TODO"}</Btn>
+    </div></Anim>
+
+    {showForm && <Card delay={0} style={{marginBottom:14}}>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        <input autoFocus value={newTitle} onChange={e=>setNewTitle(e.target.value)} placeholder="标题（必填）" style={{padding:"8px 12px",fontSize:13,borderRadius:8,border:`1px solid ${C.bdrL}`,outline:"none",fontFamily:"var(--ft)"}}/>
+        <textarea value={newDesc} onChange={e=>setNewDesc(e.target.value)} placeholder="描述（可选，背景、验收标准等）" style={{padding:"8px 12px",fontSize:12,borderRadius:8,border:`1px solid ${C.bdrL}`,outline:"none",fontFamily:"var(--fn)",lineHeight:1.6,minHeight:60,resize:"vertical"}}/>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          <label style={{fontSize:11,color:C.slateL}}>优先级
+            <select value={newPriority} onChange={e=>setNewPriority(e.target.value)} style={{marginLeft:4,padding:"4px 8px",fontSize:11,borderRadius:6,border:`1px solid ${C.bdrL}`,cursor:"pointer"}}>
+              <option value="low">低</option><option value="medium">中</option><option value="high">高</option>
+            </select>
+          </label>
+          <label style={{fontSize:11,color:C.slateL}}>指派给
+            <select value={newAssigned} onChange={e=>setNewAssigned(e.target.value)} style={{marginLeft:4,padding:"4px 8px",fontSize:11,borderRadius:6,border:`1px solid ${C.bdrL}`,cursor:"pointer"}}>
+              <option value="">未指派</option>
+              {members.map(m=><option key={m.id} value={m.id}>{m.name||m.id.slice(0,6)}</option>)}
+            </select>
+          </label>
+          <div style={{flex:1}}/>
+          <Btn v="primary" onClick={createTodo} style={{fontSize:11}}>创建</Btn>
+        </div>
+      </div>
+    </Card>}
+
+    <Anim delay={120}><div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+      {renderCol("待办", open, "open")}
+      {renderCol("进行中", inProg, "in_progress")}
+      {renderCol("已完成", done, "done")}
+    </div></Anim>
   </div>;
 }
 

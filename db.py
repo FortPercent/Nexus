@@ -128,5 +128,34 @@ def init_db():
         )
     """)
 
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS project_todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            status TEXT DEFAULT 'open',
+            priority TEXT DEFAULT 'medium',
+            source TEXT DEFAULT 'manual',
+            created_by TEXT NOT NULL,
+            assigned_to TEXT,
+            due_date DATE,
+            cancel_reason TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            done_at TIMESTAMP,
+            done_by TEXT
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_todos_project ON project_todos(project_id, status)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_todos_assigned ON project_todos(assigned_to)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_todos_creator ON project_todos(created_by)")
+
+    # projects 追加 todo_approval_mode 列（幂等）
+    try:
+        db.execute("ALTER TABLE projects ADD COLUMN todo_approval_mode TEXT DEFAULT 'ai_only'")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+
     db.commit()
     db.close()

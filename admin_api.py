@@ -922,6 +922,324 @@ async def submit_suggestion(project_id: str, request: Request):
     return {"status": "ok"}
 
 
+# ===== 项目 TODO =====
+
+
+ALLOWED_STATUS = {"awaiting_user", "awaiting_admin", "open", "in_progress", "done", "cancelled"}
+ALLOWED_PRIORITY = {"low", "medium", "high"}
+ALLOWED_APPROVAL_MODES = {"ai_only", "strict", "open"}
+# 成员可流转的主看板状态
+MEMBER_WORKFLOW = {"open", "in_progress", "done"}
+
+
+def _is_project_admin(db, user_id: str, project_id: str) -> bool:
+    row = db.execute(
+        "SELECT 1 FROM project_members WHERE user_id = ? AND project_id = ? AND role = 'admin'",
+        (user_id, project_id),
+    ).fetchone()
+    return bool(row)
+
+
+def _get_approval_mode(db, project_id: str) -> str:
+    row = db.execute(
+        "SELECT todo_approval_mode FROM projects WHERE project_id = ?", (project_id,)
+    ).fetchone()
+    return (row["todo_approval_mode"] if row and row["todo_approval_mode"] else "ai_only")
+
+
+def _todo_to_dict(r) -> dict:
+    return {
+        "id": r["id"],
+        "project_id": r["project_id"],
+        "title": r["title"],
+        "description": r["description"] or "",
+        "status": r["status"],
+        "priority": r["priority"],
+        "source": r["source"],
+        "created_by": r["created_by"],
+        "assigned_to": r["assigned_to"] or "",
+        "due_date": r["due_date"] or "",
+        "cancel_reason": r["cancel_reason"] or "",
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+        "done_at": r["done_at"] or "",
+        "done_by": r["done_by"] or "",
+    }
+
+
+@router.get("/project/{project_id}/todos")
+async def list_project_todos(project_id: str, request: Request, status: str = "", assigned: str = ""):
+    require_project_member(request, project_id)
+    q = "SELECT * FROM project_todos WHERE project_id = ?"
+    params = [project_id]
+    if status:
+        q += " AND status = ?"
+        params.append(status)
+    if assigned:
+        q += " AND assigned_to = ?"
+        params.append(assigned)
+    q += " ORDER BY CASE status "
+    q += "WHEN 'awaiting_user' THEN 0 WHEN 'awaiting_admin' THEN 1 "
+    q += "WHEN 'in_progress' THEN 2 WHEN 'open' THEN 3 WHEN 'done' THEN 4 WHEN 'cancelled' THEN 5 END, "
+    q += "CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 END, created_at DESC"
+    with use_db() as db:
+        rows = db.execute(q, params).fetchall()
+    return [_todo_to_dict(r) for r in rows]
+
+
+@router.post("/project/{project_id}/todos")
+async def create_todo(project_id: str, request: Request):
+    user = require_project_member(request, project_id)
+    body = await request.json()
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(400, "title 不能为空")
+    if len(title) > 200:
+        raise HTTPException(400, "title 过长")
+    description = (body.get("description") or "").strip()
+    priority = body.get("priority") or "medium"
+    if priority not in ALLOWED_PRIORITY:
+        raise HTTPException(400, f"priority 必须是 {ALLOWED_PRIORITY}")
+    assigned_to = body.get("assigned_to") or None
+    due_date = body.get("due_date") or None
+    source = body.get("source") or "manual"
+    if source not in ("manual", "ai"):
+        raise HTTPException(400, "source 必须是 manual 或 ai")
+
+    with use_db() as db:
+        is_admin = _is_project_admin(db, user["id"], project_id)
+        mode = _get_approval_mode(db, project_id)
+        # 决定初始 status
+        if source == "ai":
+            status = "awaiting_user"
+        elif is_admin:
+            status = "open"
+        elif mode == "strict":
+            status = "awaiting_admin"
+        else:  # ai_only / open
+            status = "open"
+        cur = db.execute(
+            "INSERT INTO project_todos (project_id, title, description, status, priority, source, "
+            "created_by, assigned_to, due_date) VALUES (?,?,?,?,?,?,?,?,?)",
+            (project_id, title, description, status, priority, source, user["id"], assigned_to, due_date),
+        )
+        todo_id = cur.lastrowid
+        row = db.execute("SELECT * FROM project_todos WHERE id = ?", (todo_id,)).fetchone()
+    return _todo_to_dict(row)
+
+
+@router.put("/project/{project_id}/todos/{todo_id}")
+async def update_todo(project_id: str, todo_id: int, request: Request):
+    user = require_project_member(request, project_id)
+    body = await request.json()
+
+    with use_db() as db:
+        row = db.execute(
+            "SELECT * FROM project_todos WHERE id = ? AND project_id = ?", (todo_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "TODO 不存在")
+        is_admin = _is_project_admin(db, user["id"], project_id)
+        is_creator = row["created_by"] == user["id"]
+        is_assignee = row["assigned_to"] == user["id"]
+
+        updates = {}
+        # 状态修改：成员只能在主看板流转，且必须是自己创建或被指派
+        if "status" in body:
+            ns = body["status"]
+            if ns not in ALLOWED_STATUS:
+                raise HTTPException(400, "非法 status")
+            if not is_admin:
+                if ns not in MEMBER_WORKFLOW or row["status"] not in MEMBER_WORKFLOW:
+                    raise HTTPException(403, "无权流转该状态")
+                if not (is_creator or is_assignee):
+                    raise HTTPException(403, "非创建者或负责人")
+            updates["status"] = ns
+            if ns == "done":
+                updates["done_at"] = "CURRENT_TIMESTAMP"
+                updates["done_by"] = user["id"]
+            elif row["status"] == "done":
+                # 重新打开
+                updates["done_at"] = None
+                updates["done_by"] = None
+
+        # 其他字段：成员只能改自己创建的，admin 能改任何
+        if any(k in body for k in ("title", "description", "priority", "assigned_to", "due_date")):
+            if not (is_admin or is_creator):
+                raise HTTPException(403, "非创建者或管理员")
+            if "title" in body:
+                t = (body["title"] or "").strip()
+                if not t:
+                    raise HTTPException(400, "title 不能为空")
+                updates["title"] = t
+            if "description" in body:
+                updates["description"] = (body["description"] or "").strip()
+            if "priority" in body:
+                if body["priority"] not in ALLOWED_PRIORITY:
+                    raise HTTPException(400, "非法 priority")
+                updates["priority"] = body["priority"]
+            if "assigned_to" in body:
+                updates["assigned_to"] = body["assigned_to"] or None
+            if "due_date" in body:
+                updates["due_date"] = body["due_date"] or None
+
+        if not updates:
+            return _todo_to_dict(row)
+
+        # 构造 UPDATE
+        set_parts = []
+        params = []
+        for k, v in updates.items():
+            if v == "CURRENT_TIMESTAMP":
+                set_parts.append(f"{k} = CURRENT_TIMESTAMP")
+            else:
+                set_parts.append(f"{k} = ?")
+                params.append(v)
+        set_parts.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(todo_id)
+        db.execute(f"UPDATE project_todos SET {', '.join(set_parts)} WHERE id = ?", params)
+        new_row = db.execute("SELECT * FROM project_todos WHERE id = ?", (todo_id,)).fetchone()
+    return _todo_to_dict(new_row)
+
+
+@router.delete("/project/{project_id}/todos/{todo_id}")
+async def delete_todo(project_id: str, todo_id: int, request: Request):
+    user = require_project_member(request, project_id)
+    with use_db() as db:
+        row = db.execute(
+            "SELECT * FROM project_todos WHERE id = ? AND project_id = ?", (todo_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "TODO 不存在")
+        is_admin = _is_project_admin(db, user["id"], project_id)
+        is_creator = row["created_by"] == user["id"]
+        # 成员只能删自己未确认的 awaiting_*（相当于撤回）；admin 随意
+        if not is_admin:
+            if not is_creator:
+                raise HTTPException(403, "非创建者或管理员")
+            if row["status"] not in ("awaiting_user", "awaiting_admin"):
+                raise HTTPException(403, "已进入看板的 TODO 不能删除，请先驳回/取消")
+        db.execute("DELETE FROM project_todos WHERE id = ?", (todo_id,))
+    return {"status": "ok"}
+
+
+@router.post("/project/{project_id}/todos/{todo_id}/confirm")
+async def confirm_todo(project_id: str, todo_id: int, request: Request):
+    """member 把 awaiting_user 转正：按 approval_mode 进 awaiting_admin 或直接 open"""
+    user = require_project_member(request, project_id)
+    with use_db() as db:
+        row = db.execute(
+            "SELECT * FROM project_todos WHERE id = ? AND project_id = ?", (todo_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404)
+        if row["status"] != "awaiting_user":
+            raise HTTPException(400, "状态不是 awaiting_user")
+        if row["created_by"] != user["id"] and not _is_project_admin(db, user["id"], project_id):
+            raise HTTPException(403, "非创建者")
+        mode = _get_approval_mode(db, project_id)
+        is_admin = _is_project_admin(db, user["id"], project_id)
+        next_status = "open" if (mode != "strict" or is_admin) else "awaiting_admin"
+        db.execute(
+            "UPDATE project_todos SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (next_status, todo_id),
+        )
+        new_row = db.execute("SELECT * FROM project_todos WHERE id = ?", (todo_id,)).fetchone()
+    return _todo_to_dict(new_row)
+
+
+@router.post("/project/{project_id}/todos/{todo_id}/approve")
+async def approve_todo(project_id: str, todo_id: int, request: Request):
+    require_project_admin(request, project_id)
+    with use_db() as db:
+        row = db.execute(
+            "SELECT * FROM project_todos WHERE id = ? AND project_id = ?", (todo_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404)
+        if row["status"] != "awaiting_admin":
+            raise HTTPException(400, "状态不是 awaiting_admin")
+        db.execute(
+            "UPDATE project_todos SET status = 'open', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (todo_id,),
+        )
+        new_row = db.execute("SELECT * FROM project_todos WHERE id = ?", (todo_id,)).fetchone()
+    return _todo_to_dict(new_row)
+
+
+@router.post("/project/{project_id}/todos/{todo_id}/reject")
+async def reject_todo(project_id: str, todo_id: int, request: Request):
+    """member 拒自己的 awaiting_user；admin 驳回任何 awaiting_*"""
+    user = require_project_member(request, project_id)
+    body = await request.json() if request.headers.get("content-length") else {}
+    reason = (body.get("reason") or "").strip() if isinstance(body, dict) else ""
+    with use_db() as db:
+        row = db.execute(
+            "SELECT * FROM project_todos WHERE id = ? AND project_id = ?", (todo_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404)
+        is_admin = _is_project_admin(db, user["id"], project_id)
+        if row["status"] == "awaiting_user":
+            if row["created_by"] != user["id"] and not is_admin:
+                raise HTTPException(403)
+        elif row["status"] == "awaiting_admin":
+            if not is_admin:
+                raise HTTPException(403, "只有管理员可驳回待审核")
+        else:
+            raise HTTPException(400, "状态不是 awaiting_*")
+        db.execute(
+            "UPDATE project_todos SET status = 'cancelled', cancel_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (reason, todo_id),
+        )
+        new_row = db.execute("SELECT * FROM project_todos WHERE id = ?", (todo_id,)).fetchone()
+    return _todo_to_dict(new_row)
+
+
+@router.get("/my-todos")
+async def my_todos(request: Request):
+    """跨项目：与我相关的 TODO（我创建的 OR 分配给我的），排除 cancelled"""
+    user = extract_user_from_admin(request)
+    with use_db() as db:
+        rows = db.execute(
+            "SELECT t.*, p.name AS project_name "
+            "FROM project_todos t LEFT JOIN projects p ON p.project_id = t.project_id "
+            "WHERE (t.created_by = ? OR t.assigned_to = ?) AND t.status != 'cancelled' "
+            "ORDER BY CASE t.status WHEN 'awaiting_user' THEN 0 WHEN 'awaiting_admin' THEN 1 "
+            "WHEN 'in_progress' THEN 2 WHEN 'open' THEN 3 WHEN 'done' THEN 4 END, t.updated_at DESC",
+            (user["id"], user["id"]),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = _todo_to_dict(r)
+        d["project_name"] = r["project_name"] or r["project_id"]
+        out.append(d)
+    return out
+
+
+@router.put("/project/{project_id}/settings/todo")
+async def update_todo_setting(project_id: str, request: Request):
+    require_project_admin(request, project_id)
+    body = await request.json()
+    mode = body.get("approval_mode")
+    if mode not in ALLOWED_APPROVAL_MODES:
+        raise HTTPException(400, f"approval_mode 必须是 {ALLOWED_APPROVAL_MODES}")
+    with use_db() as db:
+        db.execute(
+            "UPDATE projects SET todo_approval_mode = ? WHERE project_id = ?",
+            (mode, project_id),
+        )
+    return {"status": "ok", "approval_mode": mode}
+
+
+@router.get("/project/{project_id}/settings/todo")
+async def get_todo_setting(project_id: str, request: Request):
+    require_project_member(request, project_id)
+    with use_db() as db:
+        mode = _get_approval_mode(db, project_id)
+    return {"approval_mode": mode}
+
+
 # ===== 用户搜索（添加成员用） =====
 
 
