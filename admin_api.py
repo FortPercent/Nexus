@@ -12,7 +12,7 @@ from auth import (
     require_project_admin,
     require_org_admin,
 )
-from routing import letta, get_or_create_org_resources, get_or_create_personal_folder, get_or_create_personal_human_block, get_or_create_agent
+from routing import letta, letta_async, get_or_create_org_resources, get_or_create_personal_folder, get_or_create_personal_human_block, get_or_create_agent
 from webui_sync import grant_model_access, revoke_model_access, revoke_all_model_access, reconcile_all
 from knowledge_mirror import mirror_file, unmirror_file
 
@@ -520,7 +520,7 @@ async def _process_and_upload(file, folder_id: str, scope: str, scope_id: str = 
     uploaded_names = []
     for letta_name, content, mime in processed:
         try:
-            uploaded = letta.folders.files.upload(folder_id=folder_id, file=(letta_name, _io.BytesIO(content), mime))
+            uploaded = await letta_async.folders.files.upload(folder_id=folder_id, file=(letta_name, _io.BytesIO(content), mime))
         except Exception as e:
             logging.warning(f"upload {letta_name} failed: {e}")
             continue

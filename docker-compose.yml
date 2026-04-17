@@ -41,6 +41,7 @@ services:
     environment:
       - LETTA_PG_URI=postgresql://letta:${POSTGRES_PASSWORD}@letta-db:5432/letta
       - OLLAMA_BASE_URL=http://ollama:11434
+      - LETTA_UVICORN_WORKERS=4
     depends_on:
       - letta-db
     restart: unless-stopped
