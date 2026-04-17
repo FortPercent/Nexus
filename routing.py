@@ -153,19 +153,22 @@ def get_or_create_personal_human_block(user_id: str) -> str:
             "SELECT personal_human_block_id FROM user_cache WHERE user_id = ? AND personal_human_block_id IS NOT NULL",
             (user_id,),
         ).fetchone()
+    logging.info(f"get_or_create_personal_human_block user={user_id[:8]} cached={row['personal_human_block_id'] if row else None}")
     if row:
         block_id = row["personal_human_block_id"]
         try:
             letta.blocks.retrieve(block_id=block_id)
+            logging.info(f"  reuse existing block {block_id[:16]}")
             return block_id
-        except Exception:
-            logging.warning(f"personal human block {block_id} missing in Letta, recreating")
+        except Exception as e:
+            logging.warning(f"  personal human block {block_id} missing in Letta ({type(e).__name__}: {e}), recreating")
 
     block = letta.blocks.create(
         label="human",
         value="(新用户，信息未知)",
         limit=2000,
     )
+    logging.info(f"  created new block {block.id[:16]}")
     with use_db() as db:
         db.execute(
             "INSERT INTO user_cache (user_id, personal_human_block_id) VALUES (?, ?) "
