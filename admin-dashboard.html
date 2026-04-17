@@ -351,6 +351,9 @@ function TodoTab({ pid, isA, user, members, todos, setTodos, approvalMode }) {
     const canMoveStatus = isA || isCreator || isAssignee;
     const canEditFields = isA || isCreator;
     const assignee = members.find(m=>m.id===t.assigned_to);
+    const creator = members.find(m=>m.id===t.created_by);
+    const creatorName = creator?.name || (t.created_by||"").slice(0,6);
+    const assigneeName = assignee?.name || (t.assigned_to||"").slice(0,6);
     const pm = TODO_PRIORITY_META[t.priority] || TODO_PRIORITY_META.medium;
     const isExpanded = !!expanded[t.id];
     return <Anim key={t.id} delay={20}>
@@ -361,7 +364,7 @@ function TodoTab({ pid, isA, user, members, todos, setTodos, approvalMode }) {
             <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4,flexWrap:"wrap"}}>
               <span style={{fontSize:9.5,fontWeight:700,padding:"2px 7px",borderRadius:4,background:pm.bg,color:pm.fg,letterSpacing:0.2}}>{pm.label}</span>
               {t.source==="ai" && <span style={{fontSize:9.5,padding:"2px 7px",borderRadius:4,background:"#EDE9FE",color:"#6B4FA0",fontWeight:600}}>AI</span>}
-              {showAssignee && assignee && <span style={{fontSize:10,color:C.sand}}>👤 {assignee.name||assignee.id.slice(0,6)}</span>}
+              <span style={{fontSize:10,color:C.sand}}>来自 {creatorName}{showAssignee && assignee ? ` → 负责 ${assigneeName}` : ""}</span>
               {t.due_date && <span style={{fontSize:10,color:C.sand}}>📅 {t.due_date}</span>}
             </div>
           </div>
