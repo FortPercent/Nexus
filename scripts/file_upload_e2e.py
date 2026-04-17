@@ -47,7 +47,7 @@ def t_xlsx():
     ws.append(['AI Infra Cache','DeepSeek-V3','测试中'])
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     r = upload('TEST_sheet.xlsx', buf.getvalue(), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    assert 'TEST_sheet.xlsx.md' in (r.get('uploaded') or []), f'expected .md in uploaded, got {r}'
+    assert 'TEST_sheet.xlsx' in (r.get('uploaded') or []), f'expected display name without .md, got {r}'
     files = list_personal()
     assert 'TEST_sheet.xlsx.md' in files, f'not in list: {files}'
     return f'→ {r["uploaded"]}'
@@ -55,7 +55,7 @@ def t_xlsx():
 def t_csv():
     content = '项目,负责人\nAI Infra,wuxn5\nCache,jinyx5'.encode('utf-8')
     r = upload('TEST_team.csv', content, 'text/csv')
-    assert 'TEST_team.csv.md' in (r.get('uploaded') or [])
+    assert 'TEST_team.csv' in (r.get('uploaded') or [])
     return f'→ {r["uploaded"]}'
 
 def t_zip():
@@ -84,7 +84,7 @@ def t_docx():
     t.cell(1,0).text='环境'; t.cell(1,1).text='生产'
     buf = io.BytesIO(); d.save(buf); buf.seek(0)
     r = upload('TEST_doc.docx', buf.getvalue(), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-    assert 'TEST_doc.docx.md' in (r.get('uploaded') or []), f'expected .md: {r}'
+    assert 'TEST_doc.docx' in (r.get('uploaded') or []), f'expected display name without .md: {r}'
     return f'→ {r["uploaded"]}'
 
 def t_pdf_passthrough():
