@@ -1217,6 +1217,37 @@ async def reject_todo(project_id: str, todo_id: int, request: Request):
     return _todo_to_dict(new_row)
 
 
+@router.post("/project/{project_id}/todos/ai-submit")
+async def ai_submit_todo(project_id: str, request: Request):
+    """Letta agent 工具内部调用：提交一个 AI 建议的 TODO（status=awaiting_user, source=ai）。
+    无 JWT；body 必须含 user_id + title；校验 (user_id, project_id) 是 project 成员。"""
+    body = await request.json()
+    user_id = (body.get("user_id") or "").strip()
+    title = (body.get("title") or "").strip()
+    description = (body.get("description") or "").strip()
+    priority = body.get("priority") or "medium"
+    if not user_id or not title:
+        raise HTTPException(400, "user_id 和 title 必填")
+    if priority not in ALLOWED_PRIORITY:
+        priority = "medium"
+    if len(title) > 200:
+        title = title[:200]
+    with use_db() as db:
+        member = db.execute(
+            "SELECT 1 FROM project_members WHERE user_id = ? AND project_id = ?",
+            (user_id, project_id),
+        ).fetchone()
+        if not member:
+            raise HTTPException(403, "非项目成员")
+        cur = db.execute(
+            "INSERT INTO project_todos (project_id, title, description, status, priority, source, created_by) "
+            "VALUES (?, ?, ?, 'awaiting_user', ?, 'ai', ?)",
+            (project_id, title, description, priority, user_id),
+        )
+        todo_id = cur.lastrowid
+    return {"status": "ok", "todo_id": todo_id}
+
+
 @router.get("/my-todos")
 async def my_todos(request: Request):
     """跨项目：与我相关的 TODO（我创建的 OR 分配给我的），排除 cancelled"""

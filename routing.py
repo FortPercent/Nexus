@@ -9,8 +9,24 @@ from db import get_db
 letta = Letta(base_url=LETTA_BASE_URL)
 letta_async = AsyncLetta(base_url=LETTA_BASE_URL)
 
-# 知识建议工具缓存
+# 自定义工具缓存
 _suggest_tool_id = None
+_suggest_todo_tool_id = None
+
+
+PERSONA_TEXT = (
+    "你是 TeleAI Nexus 智能助手。\n\n"
+    "【用户说什么调哪个工具 — 严格遵守】\n"
+    "1. 时间/动作/提醒/承诺类 → 调 suggest_todo\n"
+    "   例：「五点半写周报」「下周前跑 baseline」「提醒我 X」「回头要做 Y」「我要做 Z」\n"
+    "2. 项目决策/架构/版本/里程碑 → 调 suggest_project_knowledge\n"
+    "   例：「项目用 vLLM」「v1.2 已发布」「架构改成 X」\n"
+    "3. 个人身份/偏好 → 调 memory_insert 到 human block\n"
+    "   例：「我是 AI Infra 的吴煊佴」「我喜欢用 Python」\n\n"
+    "同一条内容只调一次对应工具。不要声称「已记忆」而不真实调用。"
+    "不要把「今天要做 X」之类写进 human block，那是 TODO。\n"
+    "绝不要在回复中暴露内部 ID（agent_id/folder_id/file_id/block_id）。"
+)
 
 
 def _get_suggest_tool_id() -> str:
@@ -51,6 +67,58 @@ def _get_suggest_tool_id() -> str:
     return _suggest_tool_id
 
 
+def _get_suggest_todo_tool_id() -> str:
+    """获取或创建 suggest_todo 工具，返回 tool_id。AI 建议时写入 project_todos awaiting_user 状态。"""
+    global _suggest_todo_tool_id
+    if _suggest_todo_tool_id:
+        return _suggest_todo_tool_id
+
+    def suggest_todo(title: str, agent_state: "AgentState", description: str = "", priority: str = "medium") -> str:
+        """当用户提到"需要做的事"时调用此工具创建待办建议（会进入项目 TODO 面板的"待处理"区，等用户确认后才生效）。
+
+        触发场景（必须用）:
+        - 时间+动作: "五点半写周报"、"下周前跑 baseline"
+        - 提醒语: "提醒我 X"、"别忘了 Y"、"回头要做 Z"
+        - 承诺/计划: "我要做 X"、"准备做 Y"
+
+        不要用此工具的场景:
+        - 个人身份/偏好（"我喜欢 Python"）→ 用 memory_insert 到 human block
+        - 项目知识/架构决策（"项目用 vLLM"）→ 用 suggest_project_knowledge
+
+        Args:
+            title: 任务标题，简洁清晰（≤50 字，动词开头）
+            description: 背景细节（可选，≤300 字）
+            priority: low / medium / high，默认 medium
+
+        Returns:
+            提交结果
+        """
+        import urllib.request
+        import json as _json
+        project_id = agent_state.metadata.get("project", "")
+        user_id = agent_state.metadata.get("owner", "")
+        if not project_id or not title.strip():
+            return "提交失败：缺少项目或标题"
+        try:
+            url = f"http://teleai-adapter:8000/admin/api/project/{project_id}/todos/ai-submit"
+            data = _json.dumps({
+                "user_id": user_id,
+                "title": title.strip(),
+                "description": description.strip() if description else "",
+                "priority": priority or "medium",
+            }).encode()
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5)
+            return f"已提交 TODO「{title.strip()}」，等用户在「📋 待处理」确认后生效"
+        except Exception as e:
+            return f"提交失败：{e}"
+
+    tool = letta.tools.upsert_from_function(func=suggest_todo)
+    _suggest_todo_tool_id = tool.id
+    logging.info(f"suggest_todo tool: {tool.id}")
+    return _suggest_todo_tool_id
+
+
 def get_or_create_agent(user_id: str, project: str) -> str:
     """获取用户对应的 Agent，不存在则自动创建并挂载分级知识。"""
     db = get_db()
@@ -81,12 +149,16 @@ def get_or_create_agent(user_id: str, project: str) -> str:
                 )
             return agent_id
 
-        # 获取知识建议工具
-        suggest_tool_id = None
+        # 获取自定义工具（两个：suggest_project_knowledge + suggest_todo）
+        custom_tool_ids = []
         try:
-            suggest_tool_id = _get_suggest_tool_id()
+            custom_tool_ids.append(_get_suggest_tool_id())
         except Exception as e:
             logging.warning(f"failed to get suggest tool: {e}")
+        try:
+            custom_tool_ids.append(_get_suggest_todo_tool_id())
+        except Exception as e:
+            logging.warning(f"failed to get suggest_todo tool: {e}")
 
         # 共享 human block（跨项目一份）先准备好，随 agent 创建一起 attach，
         # 这样 Letta 系统提示编译时能拿到 block value。
@@ -96,19 +168,12 @@ def get_or_create_agent(user_id: str, project: str) -> str:
             name=f"user-{user_id}-{project}",
             model="openai/Qwen3.5-122B-A10B",
             metadata={"owner": user_id, "project": project},
-            tool_ids=[suggest_tool_id] if suggest_tool_id else [],
+            tool_ids=custom_tool_ids,
             block_ids=[human_block_id],
             memory_blocks=[
                 {
                     "label": "persona",
-                    "value": (
-                        "你是 TeleAI Nexus 智能助手。\n"
-                        "- 记住用户告诉你的个人信息（存到 human block）\n"
-                        "- 当用户提到对整个项目团队有价值的信息时（如技术栈变更、里程碑完成、架构决策），"
-                        "用 suggest_project_knowledge 工具提交为项目知识建议\n"
-                        "- 个人偏好存 human block，项目信息提交建议，不要搞混\n"
-                        "- 绝对不要在回复中暴露内部 ID（如 agent_id、folder_id、file_id、block_id），用户不需要知道这些"
-                    ),
+                    "value": PERSONA_TEXT,
                 },
             ],
             llm_config={

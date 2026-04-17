@@ -175,7 +175,21 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
                     text = "</think>" + text
                     in_thinking = False
                 yield _sse({"content": text})
-            # ping/stop_reason/usage_statistics/tool_call_message 等忽略
+            elif mtype == "tool_call_message":
+                tc = getattr(ev, "tool_call", None)
+                if not tc:
+                    continue
+                name = getattr(tc, "name", "") or "?"
+                args = getattr(tc, "arguments", "") or ""
+                prefix = "</think>\n" if in_thinking else "\n"
+                in_thinking = False
+                yield _sse({"content": f"{prefix}🔧 {name}({args})\n"})
+            elif mtype == "tool_return_message":
+                ret = getattr(ev, "tool_return", "") or ""
+                prefix = "</think>\n" if in_thinking else ""
+                in_thinking = False
+                yield _sse({"content": f"{prefix}→ {ret}\n"})
+            # ping/stop_reason/usage_statistics 等忽略
     except Exception as e:
         logging.exception(f"letta stream failed: {e}")
         err_text = ("</think>" if in_thinking else "") + f"\n\n[流式异常：{e}]"
