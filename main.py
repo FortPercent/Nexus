@@ -162,6 +162,8 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
                 if not text:
                     continue
                 if not in_thinking:
+                    if not text.strip():
+                        continue  # 别用空白包个新 <think>
                     text = "<think>" + text
                     in_thinking = True
                 yield _sse({"content": text})
