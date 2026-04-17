@@ -448,9 +448,18 @@ def _check_folder_size_bytes(folder_id: str, new_bytes: int, project_id: str = N
         raise HTTPException(413, f"文件夹已用 {used_mb}MB，超过限额 {quota_mb}MB，请先删除旧文件")
 
 
+def _display_name(letta_name: str) -> str:
+    """Letta 内部存 `.xlsx.md`/`.csv.md`/`.docx.md`（Letta 只认 md/pdf/txt），
+    但 UI 镜像给用户看的应是原名 `.xlsx`/`.csv`/`.docx`。"""
+    for suffix in (".xlsx.md", ".xls.md", ".csv.md", ".docx.md"):
+        if letta_name.endswith(suffix):
+            return letta_name[: -3]  # 去掉末尾的 ".md"
+    return letta_name
+
+
 async def _process_and_upload(file, folder_id: str, scope: str, scope_id: str = "", owner_id: str = "", display_scope: str = "", project_id_for_size: str = None):
     """读取上传文件 → file_processor 预处理 → 逐条上传到 Letta + mirror。
-    返回 [name, ...] 实际上传到 Letta 的文件名列表。"""
+    返回 [display_name, ...]（用户看到的名字，不带 .md 后缀）。"""
     import io as _io
     from file_processor import process_upload
 
@@ -459,19 +468,20 @@ async def _process_and_upload(file, folder_id: str, scope: str, scope_id: str = 
     processed = process_upload(file.filename, data)
 
     uploaded_names = []
-    for name, content, mime in processed:
+    for letta_name, content, mime in processed:
         try:
-            uploaded = letta.folders.files.upload(folder_id=folder_id, file=(name, _io.BytesIO(content), mime))
+            uploaded = letta.folders.files.upload(folder_id=folder_id, file=(letta_name, _io.BytesIO(content), mime))
         except Exception as e:
-            logging.warning(f"upload {name} failed: {e}")
+            logging.warning(f"upload {letta_name} failed: {e}")
             continue
+        disp = _display_name(letta_name)
         try:
             fid = uploaded.id if hasattr(uploaded, "id") else None
             if fid:
-                mirror_file(fid, folder_id, name, scope, scope_id, owner_id, display_scope)
+                mirror_file(fid, folder_id, disp, scope, scope_id, owner_id, display_scope)
         except Exception as e:
-            logging.warning(f"mirror failed for {name}: {e}")
-        uploaded_names.append(name)
+            logging.warning(f"mirror failed for {disp}: {e}")
+        uploaded_names.append(disp)
     return uploaded_names
 
 
