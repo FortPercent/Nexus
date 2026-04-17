@@ -209,6 +209,18 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
                 pending = flush_tool_call()
                 combined = (prefix or "") + (pending or "") + f"→ {ret}\n"
                 yield _sse({"content": combined})
+            elif mtype == "error_message":
+                err_type = (getattr(ev, "error_type", "") or "").lower()
+                msg = getattr(ev, "message", "") or ""
+                if "rate_limit" in err_type or "429" in msg:
+                    friendly = "⚠️ AI 模型限流，请稍等几秒重试"
+                elif "timeout" in err_type:
+                    friendly = "⚠️ AI 响应超时，请重试"
+                else:
+                    friendly = f"⚠️ {msg[:150] or err_type or '未知错误'}"
+                prefix = "</think>\n" if in_thinking else "\n"
+                in_thinking = False
+                yield _sse({"content": prefix + friendly + "\n"})
             # ping/stop_reason/usage_statistics 等忽略
 
         # 流结束，flush 残留 tool_call
