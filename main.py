@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse
 from config import ADAPTER_API_KEY, VLLM_ENDPOINT, VLLM_API_KEY
 from db import init_db
 from auth import get_current_user
-from routing import get_or_create_agent, get_or_create_org_resources, sync_org_resources_to_all_agents, letta
+from routing import get_or_create_agent, get_or_create_org_resources, sync_org_resources_to_all_agents, letta, letta_async
 from webui_sync import reconcile_all
 from knowledge_mirror import reconcile_mirrors
 
@@ -118,32 +118,71 @@ async def non_stream_response(agent_id: str, message: str, model: str):
     }
 
 
-async def fake_stream_from_letta(agent_id: str, message: str, model: str):
-    """调 Letta 非流式，把结果转成 SSE chunk 格式返回（模拟流式）"""
-    response = letta.agents.messages.create(
-        agent_id=agent_id, messages=[{"role": "user", "content": message}]
-    )
-    assistant_content = _extract_letta_response(response)
+def _assistant_delta_text(content) -> str:
+    """assistant_message.content 可能是 str 或 [{text,...}] 列表，统一取字符串"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            t = getattr(p, "text", None)
+            if t is None and isinstance(p, dict):
+                t = p.get("text")
+            if t:
+                parts.append(t)
+        return "".join(parts)
+    return ""
 
-    # 把完整回复按字符切成 chunk 发送（模拟打字效果）
-    chunk_size = 4
-    for i in range(0, len(assistant_content), chunk_size):
-        text = assistant_content[i:i + chunk_size]
-        chunk = {
-            "id": f"chatcmpl-{agent_id[:8]}",
+
+async def stream_from_letta(agent_id: str, message: str, model: str):
+    """真流式：边调 Letta 边转发 token。reasoning 片段用 <think></think> 包裹。"""
+    chunk_id = f"chatcmpl-{agent_id[:8]}"
+
+    def _sse(delta: dict, finish_reason=None) -> str:
+        payload = {
+            "id": chunk_id,
             "object": "chat.completion.chunk",
             "model": model,
-            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         }
-        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-    final = {
-        "id": f"chatcmpl-{agent_id[:8]}",
-        "object": "chat.completion.chunk",
-        "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    }
-    yield f"data: {json.dumps(final)}\n\n"
+    in_thinking = False
+    try:
+        stream = await letta_async.agents.messages.stream(
+            agent_id=agent_id,
+            messages=[{"role": "user", "content": message}],
+            stream_tokens=True,
+            include_pings=False,
+        )
+        async for ev in stream:
+            mtype = getattr(ev, "message_type", None)
+            if mtype == "reasoning_message":
+                text = getattr(ev, "reasoning", "") or ""
+                if not text:
+                    continue
+                if not in_thinking:
+                    text = "<think>" + text
+                    in_thinking = True
+                yield _sse({"content": text})
+            elif mtype == "assistant_message":
+                text = _assistant_delta_text(getattr(ev, "content", ""))
+                if not text:
+                    continue
+                if in_thinking:
+                    text = "</think>" + text
+                    in_thinking = False
+                yield _sse({"content": text})
+            # ping/stop_reason/usage_statistics/tool_call_message 等忽略
+    except Exception as e:
+        logging.exception(f"letta stream failed: {e}")
+        err_text = ("</think>" if in_thinking else "") + f"\n\n[流式异常：{e}]"
+        in_thinking = False
+        yield _sse({"content": err_text})
+
+    if in_thinking:
+        yield _sse({"content": "</think>"})
+    yield _sse({}, finish_reason="stop")
     yield "data: [DONE]\n\n"
 
 
@@ -301,10 +340,10 @@ async def chat_completions(request: Request):
     if not user_message:
         return {"error": "No user message found"}
 
-    # Letta 目前用非流式调用，结果转成 SSE 格式返回（兼容 Open WebUI 的流式请求）
+    # 流式：调 Letta 的 streaming API 边收边转发
     if body.get("stream", False):
         return StreamingResponse(
-            fake_stream_from_letta(agent_id, user_message, model),
+            stream_from_letta(agent_id, user_message, model),
             media_type="text/event-stream",
         )
     else:

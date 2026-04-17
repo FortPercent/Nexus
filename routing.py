@@ -2,11 +2,12 @@
 import logging
 import sqlite3
 from fastapi import HTTPException
-from letta_client import Letta, ConflictError
+from letta_client import Letta, AsyncLetta, ConflictError
 from config import LETTA_BASE_URL, VLLM_ENDPOINT, DB_PATH
 from db import get_db
 
 letta = Letta(base_url=LETTA_BASE_URL)
+letta_async = AsyncLetta(base_url=LETTA_BASE_URL)
 
 # 知识建议工具缓存
 _suggest_tool_id = None
