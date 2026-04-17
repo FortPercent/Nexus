@@ -88,13 +88,13 @@ def get_or_create_agent(user_id: str, project: str) -> str:
         except Exception as e:
             logging.warning(f"failed to get suggest tool: {e}")
 
+        # 只内联 persona（跨用户各自独立）；human 走跨项目共享，稍后 attach
         agent = letta.agents.create(
             name=f"user-{user_id}-{project}",
             model="openai/Qwen3.5-122B-A10B",
             metadata={"owner": user_id, "project": project},
             tool_ids=[suggest_tool_id] if suggest_tool_id else [],
             memory_blocks=[
-                {"label": "human", "value": "(新用户，信息未知)"},
                 {
                     "label": "persona",
                     "value": (
@@ -116,6 +116,13 @@ def get_or_create_agent(user_id: str, project: str) -> str:
             },
         )
 
+        # 跨项目共享的 human block
+        try:
+            human_block_id = get_or_create_personal_human_block(user_id)
+            letta.agents.blocks.attach(agent_id=agent.id, block_id=human_block_id)
+        except Exception as e:
+            logging.warning(f"attach shared human block to {agent.id} failed: {e}")
+
         _attach_agent_resources(db, agent.id, user_id, project)
 
         db.execute(
@@ -136,6 +143,39 @@ def get_or_create_org_resources() -> dict:
         return _get_org_resources(db)
     finally:
         db.close()
+
+
+def get_or_create_personal_human_block(user_id: str) -> str:
+    """获取用户的人设 block（human label），不存在则创建。per-user 共享，跨项目所有 agent attach 同一个。"""
+    db = get_db()
+    row = db.execute(
+        "SELECT personal_human_block_id FROM user_cache WHERE user_id = ? AND personal_human_block_id IS NOT NULL",
+        (user_id,),
+    ).fetchone()
+    if row:
+        block_id = row["personal_human_block_id"]
+        db.close()
+        # 确认 Letta 侧还在
+        try:
+            letta.blocks.retrieve(block_id=block_id)
+            return block_id
+        except Exception:
+            logging.warning(f"personal human block {block_id} missing in Letta, recreating")
+
+    block = letta.blocks.create(
+        label="human",
+        value="(新用户，信息未知)",
+        limit=2000,
+    )
+    db = db or get_db()
+    db.execute(
+        "INSERT INTO user_cache (user_id, personal_human_block_id) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET personal_human_block_id = excluded.personal_human_block_id, updated_at = CURRENT_TIMESTAMP",
+        (user_id, block.id),
+    )
+    db.commit()
+    db.close()
+    return block.id
 
 
 def get_or_create_personal_folder(user_id: str) -> str:

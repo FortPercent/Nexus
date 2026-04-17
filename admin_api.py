@@ -12,7 +12,7 @@ from auth import (
     require_project_admin,
     require_org_admin,
 )
-from routing import letta, get_or_create_org_resources, get_or_create_personal_folder
+from routing import letta, get_or_create_org_resources, get_or_create_personal_folder, get_or_create_personal_human_block
 from webui_sync import grant_model_access, revoke_model_access, revoke_all_model_access, reconcile_all
 from knowledge_mirror import mirror_file, unmirror_file
 
@@ -617,55 +617,185 @@ async def delete_personal_file(file_id: str, request: Request):
     return {"status": "ok"}
 
 
-# ===== 个人记忆（human block） =====
+# ===== 个人记忆（human block）—— 跨项目共享一份 =====
 
 
 @router.get("/personal/memory")
 async def get_personal_memory(request: Request):
+    """返回用户的 human block（跨所有项目共享一份）"""
+    user = extract_user_from_admin(request)
+    try:
+        block_id = get_or_create_personal_human_block(user["id"])
+        block = letta.blocks.retrieve(block_id=block_id)
+    except Exception as e:
+        logging.warning(f"get_personal_memory failed: {e}")
+        raise HTTPException(500, "读取记忆失败")
+    return {
+        "block_id": block.id,
+        "content": block.value or "",
+        "limit": block.limit,
+    }
+
+
+@router.put("/personal/memory")
+async def update_personal_memory(request: Request):
+    """更新用户的 human block；跨项目自动同步（因为是同一个 block_id）"""
+    user = extract_user_from_admin(request)
+    body = await request.json()
+    content = body.get("content", "")
+    block_id = get_or_create_personal_human_block(user["id"])
+    letta.blocks.update(block_id=block_id, value=content)
+    return {"status": "ok"}
+
+
+# ===== 对话记忆（message history）=====
+
+
+def _audit(user_id: str, action: str, scope: str = "", details: str = ""):
+    try:
+        with use_db() as db:
+            db.execute(
+                "INSERT INTO audit_log (user_id, action, scope, details) VALUES (?, ?, ?, ?)",
+                (user_id, action, scope, details),
+            )
+    except Exception as e:
+        logging.warning(f"audit log failed: {e}")
+
+
+def _message_text(msg) -> str:
+    """从 Letta message 里提取可读文本"""
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            t = getattr(p, "text", None)
+            if not t and isinstance(p, dict):
+                t = p.get("text")
+            if t:
+                parts.append(t)
+        if parts:
+            return "".join(parts)
+    reasoning = getattr(msg, "reasoning", "")
+    if reasoning:
+        return reasoning
+    return ""
+
+
+def _message_role(msg) -> str:
+    """规约成 user / assistant / reasoning / tool / system"""
+    mt = getattr(msg, "message_type", "") or ""
+    if mt == "reasoning_message":
+        return "reasoning"
+    if mt == "assistant_message":
+        return "assistant"
+    if mt == "user_message":
+        return "user"
+    if mt in ("tool_call_message", "tool_return_message"):
+        return "tool"
+    if mt == "system_message":
+        return "system"
+    return getattr(msg, "role", "") or mt or "unknown"
+
+
+@router.get("/personal/conversations")
+async def list_conversations_overview(request: Request):
+    """列当前用户每个项目的 agent + 消息数概览"""
     user = extract_user_from_admin(request)
     with use_db() as db:
         rows = db.execute(
-            "SELECT agent_id, project_id FROM user_agent_map WHERE user_id = ?",
+            "SELECT uam.project_id, uam.agent_id, p.name "
+            "FROM user_agent_map uam "
+            "LEFT JOIN projects p ON p.project_id = uam.project_id "
+            "WHERE uam.user_id = ?",
             (user["id"],),
         ).fetchall()
-    memories = []
-    for row in rows:
+    overview = []
+    for r in rows:
+        count = 0
+        last_at = None
         try:
-            blocks = list(getattr(letta.agents.blocks.list(agent_id=row["agent_id"]), "items",
-                                  letta.agents.blocks.list(agent_id=row["agent_id"])))
-            for block in blocks:
-                if block.label == "human":
-                    memories.append({
-                        "project_id": row["project_id"],
-                        "agent_id": row["agent_id"],
-                        "block_id": block.id,
-                        "content": block.value,
-                        "limit": block.limit,
-                    })
+            msgs = letta.agents.messages.list(agent_id=r["agent_id"], limit=200)
+            items = list(getattr(msgs, "items", msgs))
+            count = len(items)
+            if items:
+                last_at = str(items[-1].date) if getattr(items[-1], "date", None) else None
         except Exception as e:
-            logging.warning(f"failed to get memory for agent {row['agent_id']}: {e}")
-    return memories
+            logging.warning(f"list conversations overview failed for {r['agent_id']}: {e}")
+        overview.append({
+            "project_id": r["project_id"],
+            "project_name": r["name"] or r["project_id"],
+            "message_count": count,
+            "last_message_at": last_at,
+        })
+    return overview
 
 
-@router.put("/personal/memory/{block_id}")
-async def update_personal_memory(block_id: str, request: Request):
+@router.get("/personal/conversations/{project_id}")
+async def list_conversations(project_id: str, request: Request, limit: int = 100):
+    """列指定项目的消息，按时间倒序"""
     user = extract_user_from_admin(request)
     with use_db() as db:
-        agent_ids = [r["agent_id"] for r in db.execute(
-            "SELECT agent_id FROM user_agent_map WHERE user_id = ?", (user["id"],)
-        ).fetchall()]
-    body = await request.json()
-    for aid in agent_ids:
+        row = db.execute(
+            "SELECT agent_id FROM user_agent_map WHERE user_id = ? AND project_id = ?",
+            (user["id"], project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "无此项目的对话")
+    msgs = letta.agents.messages.list(agent_id=row["agent_id"], limit=limit)
+    items = list(getattr(msgs, "items", msgs))
+    result = []
+    for m in items:
+        result.append({
+            "id": getattr(m, "id", ""),
+            "role": _message_role(m),
+            "text": _message_text(m),
+            "date": str(getattr(m, "date", "")) if getattr(m, "date", None) else "",
+            "message_type": getattr(m, "message_type", ""),
+        })
+    # 倒序展示（最新在前）
+    result.reverse()
+    return result
+
+
+@router.delete("/personal/conversations/{project_id}")
+async def clear_project_conversations(project_id: str, request: Request):
+    """清空指定项目的对话历史，保留 human block 与文档"""
+    user = extract_user_from_admin(request)
+    with use_db() as db:
+        row = db.execute(
+            "SELECT agent_id FROM user_agent_map WHERE user_id = ? AND project_id = ?",
+            (user["id"], project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "无此项目的对话")
+    letta.agents.messages.reset(agent_id=row["agent_id"], add_default_initial_messages=False)
+    _audit(user["id"], "clear_conversations", scope=project_id)
+    return {"status": "ok", "project_id": project_id}
+
+
+@router.delete("/personal/conversations")
+async def clear_all_conversations(request: Request):
+    """清空当前用户所有项目的对话历史"""
+    user = extract_user_from_admin(request)
+    with use_db() as db:
+        rows = db.execute(
+            "SELECT project_id, agent_id FROM user_agent_map WHERE user_id = ?",
+            (user["id"],),
+        ).fetchall()
+    cleared = []
+    failed = []
+    for r in rows:
         try:
-            blocks = list(getattr(letta.agents.blocks.list(agent_id=aid), "items",
-                                  letta.agents.blocks.list(agent_id=aid)))
-            for block in blocks:
-                if block.id == block_id and block.label == "human":
-                    letta.blocks.update(block_id=block_id, value=body["content"])
-                    return {"status": "ok"}
+            letta.agents.messages.reset(agent_id=r["agent_id"], add_default_initial_messages=False)
+            cleared.append(r["project_id"])
         except Exception as e:
-            logging.warning(f"failed to check block ownership for agent {aid}: {e}")
-    raise HTTPException(403, "无权编辑此记忆块")
+            logging.warning(f"clear all: reset {r['agent_id']} failed: {e}")
+            failed.append(r["project_id"])
+    _audit(user["id"], "clear_all_conversations", scope=",".join(cleared),
+           details=f"failed={failed}" if failed else "")
+    return {"status": "ok", "cleared": cleared, "failed": failed}
 
 
 # ===== 知识建议 =====

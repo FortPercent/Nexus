@@ -266,45 +266,146 @@ function ProjPage({ pid, back, user }) {
 }
 
 // ===== MEMORY PAGE =====
+// 两个 tab：核心身份（跨项目共享）+ 对话记忆（按项目）
 function MemoryPage({ back }) {
-  const [memories, setMemories] = useState([]); const [loading, setLoading] = useState(true);
-  const [editing, setEditing] = useState(null); const [editVal, setEditVal] = useState("");
-  const [saved, setSaved] = useState({});
-  useEffect(()=>{ api("/personal/memory").then(m=>{if(m)setMemories(m);setLoading(false)}).catch(()=>setLoading(false)); },[]);
-  const startEdit = (m)=>{ setEditing(m.block_id); setEditVal(m.content); };
-  const saveEdit = (blockId)=>{
-    api(`/personal/memory/${blockId}`,{method:"PUT",body:{content:editVal}})
-      .then(()=>{ setMemories(ms=>ms.map(m=>m.block_id===blockId?{...m,content:editVal}:m)); setEditing(null); setSaved(s=>({...s,[blockId]:true})); setTimeout(()=>setSaved(s=>({...s,[blockId]:false})),2000); })
+  const [tab, setTab] = useState("identity");
+  return <div><Back onClick={back}/>
+    <Anim delay={40}><div style={{marginBottom:6}}><h2 style={{fontSize:24,fontWeight:300,margin:0,color:C.slate}}>我的记忆</h2></div>
+    <p style={{fontSize:12,color:C.slateL,margin:"0 0 20px",lineHeight:1.6}}>AI 助手对你的认知来源分两层：核心身份（每次对话必看）和对话记忆（近期消息作背景）。文档另外管理，参见"我的文件"。</p></Anim>
+    <Anim delay={60}><div style={{display:"flex",gap:6,marginBottom:18,borderBottom:`1px solid ${C.bdrL}`,paddingBottom:0}}>
+      <TabBtn active={tab==="identity"} onClick={()=>setTab("identity")}>核心身份</TabBtn>
+      <TabBtn active={tab==="conversations"} onClick={()=>setTab("conversations")}>对话记忆</TabBtn>
+    </div></Anim>
+    {tab==="identity" && <IdentityTab/>}
+    {tab==="conversations" && <ConversationsTab/>}
+  </div>;
+}
+
+function TabBtn({ active, onClick, children }) {
+  return <button onClick={onClick} style={{background:"none",border:"none",cursor:"pointer",padding:"8px 14px",fontSize:12.5,fontWeight:active?700:500,color:active?C.slate:C.sand,borderBottom:`2px solid ${active?C.slate:"transparent"}`,marginBottom:-1,fontFamily:"var(--ft)",transition:"all 0.15s"}}>{children}</button>;
+}
+
+function IdentityTab() {
+  const [data, setData] = useState(null); const [loading, setLoading] = useState(true);
+  const [editVal, setEditVal] = useState(""); const [editing, setEditing] = useState(false);
+  const [saved, setSaved] = useState(false);
+  useEffect(()=>{ api("/personal/memory").then(m=>{if(m){setData(m);setEditVal(m.content||"")}setLoading(false)}).catch(()=>setLoading(false)); },[]);
+  const save = ()=>{
+    api("/personal/memory",{method:"PUT",body:{content:editVal}})
+      .then(()=>{ setData(d=>({...d,content:editVal})); setEditing(false); setSaved(true); setTimeout(()=>setSaved(false),2000); })
       .catch(e=>alert(e.message));
   };
-  if(loading) return <div><Back onClick={back}/><Loading/></div>;
-  return <div><Back onClick={back}/>
-    <Anim delay={40}><div style={{display:"flex",alignItems:"center",gap:12,marginBottom:6}}><h2 style={{fontSize:24,fontWeight:300,margin:0,color:C.slate}}>我的记忆</h2></div>
-    <p style={{fontSize:12,color:C.slateL,margin:"0 0 28px",lineHeight:1.6}}>AI 助手从对话中学到的关于你的信息。每个项目的助手有独立的记忆。</p></Anim>
-    {memories.length === 0 && <Card delay={80}><div style={{textAlign:"center",padding:"32px 0",color:C.sand,fontSize:13}}>还没有记忆，和 AI 助手多聊聊吧</div></Card>}
-    {memories.map((m,i)=><Card key={m.block_id} delay={80+i*60}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
-        <div style={{display:"flex",alignItems:"center",gap:8}}>
-          <div style={{width:28,height:28,borderRadius:8,background:"#EDE9FE",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>🧠</div>
-          <div><div style={{fontSize:13,fontWeight:700,color:C.slate}}>AI 助手 ({m.project_id})</div></div>
-        </div>
-        {editing!==m.block_id && <Btn v="ghost" onClick={()=>startEdit(m)} style={{fontSize:11}}>编辑</Btn>}
+  if(loading) return <Loading/>;
+  if(!data) return <Card><div style={{padding:"20px 0",color:C.sand,fontSize:13,textAlign:"center"}}>读取失败</div></Card>;
+  return <Card delay={80}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        <div style={{width:28,height:28,borderRadius:8,background:"#EDE9FE",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>🧠</div>
+        <div><div style={{fontSize:13,fontWeight:700,color:C.slate}}>核心身份</div><div style={{fontSize:11,color:C.sand,marginTop:1}}>跨所有项目共享一份，AI 每次对话必看</div></div>
       </div>
-      {editing===m.block_id
-        ? <div>
-            <textarea value={editVal} onChange={e=>setEditVal(e.target.value)} style={{width:"100%",minHeight:120,resize:"vertical",fontFamily:"var(--fn)",fontSize:12.5,lineHeight:1.8,padding:"14px 16px",boxSizing:"border-box",borderRadius:12,border:`1px solid ${C.terra}`,background:"#FAF6F1",color:C.slate,outline:"none"}}/>
-            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:10}}>
-              <Progress v={editVal.length} max={m.limit}/>
-              <div style={{display:"flex",gap:6}}>
-                <Btn v="ghost" onClick={()=>setEditing(null)} style={{fontSize:11}}>取消</Btn>
-                <Btn v="primary" onClick={()=>saveEdit(m.block_id)} style={{fontSize:11}}>保存</Btn>
-              </div>
+      {!editing && <Btn v="ghost" onClick={()=>setEditing(true)} style={{fontSize:11}}>编辑</Btn>}
+    </div>
+    {editing
+      ? <div>
+          <textarea value={editVal} onChange={e=>setEditVal(e.target.value)} style={{width:"100%",minHeight:140,resize:"vertical",fontFamily:"var(--fn)",fontSize:12.5,lineHeight:1.8,padding:"14px 16px",boxSizing:"border-box",borderRadius:12,border:`1px solid ${C.terra}`,background:"#FAF6F1",color:C.slate,outline:"none"}}/>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:10}}>
+            <Progress v={editVal.length} max={data.limit}/>
+            <div style={{display:"flex",gap:6}}>
+              <Btn v="ghost" onClick={()=>{setEditing(false);setEditVal(data.content||"")}} style={{fontSize:11}}>取消</Btn>
+              <Btn v="primary" onClick={save} style={{fontSize:11}}>保存</Btn>
             </div>
           </div>
-        : <div style={{background:"#FAF6F1",borderRadius:12,padding:"14px 16px",fontSize:12.5,lineHeight:1.8,color:C.slate,fontFamily:"var(--fn)",whiteSpace:"pre-wrap"}}>{m.content || <span style={{color:C.sand,fontStyle:"italic"}}>(暂无记忆)</span>}</div>
-      }
-      {saved[m.block_id] && <div style={{marginTop:8,fontSize:11,color:C.teal,fontWeight:600}}>已保存 ✓</div>}
-    </Card>)}
+        </div>
+      : <div style={{background:"#FAF6F1",borderRadius:12,padding:"14px 16px",fontSize:12.5,lineHeight:1.8,color:C.slate,fontFamily:"var(--fn)",whiteSpace:"pre-wrap"}}>{data.content || <span style={{color:C.sand,fontStyle:"italic"}}>(暂无记忆，点"编辑"写入身份信息)</span>}</div>
+    }
+    {saved && <div style={{marginTop:8,fontSize:11,color:C.teal,fontWeight:600}}>已保存 ✓</div>}
+    <Hint>这里写的内容会成为 system prompt 的一部分，压在每一条消息前送给 AI。建议简洁：姓名、团队、关注方向。长文档请上传到"我的文件"。</Hint>
+  </Card>;
+}
+
+function ConversationsTab() {
+  const [overview, setOverview] = useState([]); const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState("");
+  const [messages, setMessages] = useState([]); const [msgLoading, setMsgLoading] = useState(false);
+  const [confirming, setConfirming] = useState(null); // 'project' | 'all' | null
+  const [countdown, setCountdown] = useState(0);
+  const reloadOverview = ()=>{
+    setLoading(true);
+    api("/personal/conversations").then(d=>{
+      if(d){ setOverview(d); if(d.length && !selected) setSelected(d[0].project_id); }
+      setLoading(false);
+    }).catch(()=>setLoading(false));
+  };
+  useEffect(()=>{ reloadOverview(); },[]);
+  useEffect(()=>{
+    if(!selected) return;
+    setMsgLoading(true);
+    api(`/personal/conversations/${selected}?limit=200`).then(m=>{
+      if(m) setMessages(m);
+      setMsgLoading(false);
+    }).catch(e=>{ setMsgLoading(false); setMessages([]); });
+  },[selected]);
+  useEffect(()=>{
+    if(confirming!=='all') return;
+    setCountdown(3);
+    const iv = setInterval(()=>setCountdown(c=>{ if(c<=1){clearInterval(iv);return 0;} return c-1; }), 1000);
+    return ()=>clearInterval(iv);
+  },[confirming]);
+  const clearProject = ()=>{
+    api(`/personal/conversations/${selected}`,{method:"DELETE"})
+      .then(()=>{ setMessages([]); setConfirming(null); reloadOverview(); })
+      .catch(e=>alert(e.message));
+  };
+  const clearAll = ()=>{
+    api(`/personal/conversations`,{method:"DELETE"})
+      .then((r)=>{ setMessages([]); setConfirming(null); reloadOverview(); alert(`已清空 ${(r?.cleared||[]).length} 个项目的对话记忆`); })
+      .catch(e=>alert(e.message));
+  };
+  if(loading) return <Loading/>;
+  if(!overview.length) return <Card delay={80}><div style={{textAlign:"center",padding:"32px 0",color:C.sand,fontSize:13}}>你还没参与任何项目的对话</div></Card>;
+  const sel = overview.find(o=>o.project_id===selected);
+  const roleStyle = {user:{bg:"#FEF3C7",fg:"#92400E",label:"你"},assistant:{bg:"#DBEAFE",fg:"#1D4ED8",label:"AI"},reasoning:{bg:"#EDE9FE",fg:"#6B4FA0",label:"思考"},tool:{bg:"#F3F4F6",fg:"#6B7280",label:"工具"},system:{bg:"#F3F4F6",fg:"#6B7280",label:"系统"}};
+  return <div>
+    <Anim delay={40}><div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14,flexWrap:"wrap"}}>
+      <span style={{fontSize:11,color:C.slateL,fontWeight:600}}>项目：</span>
+      <select value={selected} onChange={e=>setSelected(e.target.value)} style={{padding:"7px 12px",borderRadius:8,border:`1px solid ${C.bdrL}`,background:"#fff",color:C.slate,fontSize:12.5,fontFamily:"var(--ft)",cursor:"pointer",outline:"none"}}>
+        {overview.map(o=><option key={o.project_id} value={o.project_id}>{o.project_name}（{o.message_count} 条）</option>)}
+      </select>
+      <div style={{flex:1}}/>
+      <Btn v="danger" onClick={()=>setConfirming("project")} style={{fontSize:11}}>清空本项目</Btn>
+      <Btn v="ghost" onClick={()=>setConfirming("all")} style={{fontSize:11,color:C.terra}}>清空全部项目</Btn>
+    </div></Anim>
+    <Anim delay={60}><div style={{fontSize:11,color:C.sand,marginBottom:14,padding:"9px 12px",background:"#F9FAFB",borderRadius:8,lineHeight:1.6}}>📍 AI 每次回复会参考最近 ~50 条消息作为背景。更旧的仅存档，不影响回复。清空后 AI 会像新对话一样对待你（但身份和文档都保留）。</div></Anim>
+    {confirming==="project" && <Card delay={0} style={{background:"#FEF2F2",border:`1px solid ${C.terra}`,marginBottom:14}}>
+      <div style={{fontSize:13,color:C.slate,fontWeight:600,marginBottom:8}}>确定清空「{sel?.project_name}」的全部对话记忆？</div>
+      <div style={{fontSize:11.5,color:C.slateL,marginBottom:12}}>共 {sel?.message_count} 条消息。核心身份和文档不受影响。</div>
+      <div style={{display:"flex",gap:8}}><Btn v="danger" onClick={clearProject} style={{fontSize:11}}>确认清空</Btn><Btn v="ghost" onClick={()=>setConfirming(null)} style={{fontSize:11}}>取消</Btn></div>
+    </Card>}
+    {confirming==="all" && <Card delay={0} style={{background:"#FEF2F2",border:`2px solid ${C.terra}`,marginBottom:14}}>
+      <div style={{fontSize:13,color:C.terra,fontWeight:700,marginBottom:8}}>⚠ 确定清空全部项目的对话记忆？</div>
+      <div style={{fontSize:11.5,color:C.slateL,marginBottom:12}}>你有 {overview.length} 个项目、共 {overview.reduce((s,o)=>s+o.message_count,0)} 条消息将被清空。操作不可撤销。</div>
+      <div style={{display:"flex",gap:8,alignItems:"center"}}>
+        <Btn v="danger" onClick={clearAll} style={{fontSize:11,opacity:countdown>0?0.4:1,pointerEvents:countdown>0?"none":"auto"}}>{countdown>0?`再等 ${countdown}s`:"确认清空全部"}</Btn>
+        <Btn v="ghost" onClick={()=>setConfirming(null)} style={{fontSize:11}}>取消</Btn>
+      </div>
+    </Card>}
+    <Card delay={100}>
+      {msgLoading && <div style={{textAlign:"center",padding:"20px 0",color:C.sand,fontSize:12}}>加载消息...</div>}
+      {!msgLoading && messages.length===0 && <div style={{textAlign:"center",padding:"20px 0",color:C.sand,fontSize:13}}>暂无消息</div>}
+      {!msgLoading && messages.map((m,i)=>{
+        const rs = roleStyle[m.role] || {bg:"#F3F4F6",fg:"#6B7280",label:m.role};
+        const text = (m.text||"").length>240 ? (m.text||"").slice(0,240)+"…" : (m.text||"");
+        return <Anim key={m.id||i} delay={i*20}>
+          <div style={{display:"flex",gap:10,padding:"10px 0",borderBottom:i<messages.length-1?`1px solid ${C.bdrL}`:"none"}}>
+            <span style={{fontSize:10,fontWeight:700,padding:"3px 8px",borderRadius:5,background:rs.bg,color:rs.fg,letterSpacing:0.3,flexShrink:0,height:"fit-content",marginTop:2}}>{rs.label}</span>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:12.5,color:C.slate,lineHeight:1.7,whiteSpace:"pre-wrap",wordBreak:"break-word"}}>{text || <span style={{color:C.sand,fontStyle:"italic"}}>(空)</span>}</div>
+              <div style={{fontSize:10,color:C.sand,marginTop:3,fontFamily:"var(--fn)"}}>{(m.date||"").replace("T"," ").slice(0,19)}</div>
+            </div>
+          </div>
+        </Anim>;
+      })}
+    </Card>
   </div>;
 }
 

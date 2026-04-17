@@ -67,9 +67,15 @@ def init_db():
             name TEXT DEFAULT '',
             email TEXT DEFAULT '',
             personal_folder_id TEXT,
+            personal_human_block_id TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # 已有库追加列（幂等）
+    try:
+        db.execute("ALTER TABLE user_cache ADD COLUMN personal_human_block_id TEXT")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
 
     db.execute("""
         CREATE TABLE IF NOT EXISTS org_resources (
@@ -108,6 +114,17 @@ def init_db():
             reviewed_by TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             reviewed_at TIMESTAMP
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            scope TEXT DEFAULT '',
+            details TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
