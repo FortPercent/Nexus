@@ -6,7 +6,7 @@
 - 合法 JWT → 期望 200
 对每种打 10 次测 p50/p95 延迟。
 """
-import json, time, urllib.request, statistics
+import json, os, time, urllib.request, statistics
 import jwt  # PyJWT
 import uuid
 

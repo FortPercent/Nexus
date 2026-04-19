@@ -9,7 +9,7 @@
 5. 报 wall time / 成功数 / 每个的 agent 新旧 id
 6. 清理：从项目移除 + 从 Open WebUI 删用户
 """
-import asyncio, json, time, urllib.request, uuid
+import asyncio, json, os, time, urllib.request, uuid
 import httpx
 
 WEBUI = "http://172.17.0.1:3000"
