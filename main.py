@@ -465,7 +465,7 @@ async def chat_completions(request: Request):
                 return data
 
     # letta-* 模型: 走 Letta 记忆链路
-    user = get_current_user(request, body)
+    user = await get_current_user(request, body)
     project = model.replace("letta-", "") if model.startswith("letta-") else "default"
     agent_id = get_or_create_agent(user["id"], project)
 

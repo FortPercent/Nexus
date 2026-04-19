@@ -5,7 +5,7 @@ from fastapi import APIRouter, Request, UploadFile, HTTPException, File
 
 import config
 from config import ORG_ADMIN_EMAILS
-from db import get_db, use_db
+from db import get_db, use_db, use_db_async
 from auth import (
     extract_user_from_admin,
     require_project_member,
@@ -110,14 +110,15 @@ async def health():
 
 @router.get("/me")
 async def get_me(request: Request):
-    user = extract_user_from_admin(request)
-    with use_db() as db:
-        projects = db.execute(
+    user = await extract_user_from_admin(request)
+    async with use_db_async() as db:
+        async with db.execute(
             "SELECT p.project_id, p.name, pm.role FROM projects p "
             "JOIN project_members pm ON p.project_id = pm.project_id "
             "WHERE pm.user_id = ?",
             (user["id"],),
-        ).fetchall()
+        ) as cur:
+            projects = await cur.fetchall()
     return {
         "id": user["id"],
         "name": user.get("name", ""),
@@ -132,7 +133,7 @@ async def get_me(request: Request):
 
 @router.post("/projects")
 async def create_project(request: Request):
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     body = await request.json()
     project_id = body["id"]
     name = body["name"]
@@ -185,7 +186,7 @@ async def create_project(request: Request):
 
 @router.get("/projects")
 async def list_my_projects(request: Request):
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     with use_db() as db:
         rows = db.execute(
             "SELECT p.project_id, p.name, p.desc, p.folder_quota_mb, p.project_folder_id, "
@@ -238,7 +239,7 @@ async def list_my_projects(request: Request):
 
 @router.delete("/projects/{project_id}")
 async def delete_project(project_id: str, request: Request):
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     is_org = user.get("email") in ORG_ADMIN_EMAILS
     with use_db() as db:
         is_proj_admin = db.execute(
@@ -291,7 +292,7 @@ async def delete_project(project_id: str, request: Request):
 
 @router.get("/project/{project_id}/members")
 async def list_project_members(project_id: str, request: Request):
-    require_project_member(request, project_id)
+    await require_project_member(request, project_id)
     with use_db() as db:
         creator_id = db.execute(
             "SELECT created_by FROM projects WHERE project_id = ?", (project_id,)
@@ -317,7 +318,7 @@ async def list_project_members(project_id: str, request: Request):
 
 @router.post("/project/{project_id}/members")
 async def add_member(project_id: str, request: Request):
-    user = require_project_admin(request, project_id)
+    user = await require_project_admin(request, project_id)
     body = await request.json()
     new_user_id = body["user_id"]
     role = body.get("role", "member")
@@ -369,7 +370,7 @@ async def add_member(project_id: str, request: Request):
 
 @router.put("/project/{project_id}/members/{member_id}/role")
 async def set_member_role(project_id: str, member_id: str, request: Request):
-    require_project_admin(request, project_id)
+    await require_project_admin(request, project_id)
     body = await request.json()
     with use_db() as db:
         db.execute(
@@ -381,7 +382,7 @@ async def set_member_role(project_id: str, member_id: str, request: Request):
 
 @router.delete("/project/{project_id}/members/{member_id}")
 async def remove_member(project_id: str, member_id: str, request: Request):
-    require_project_admin(request, project_id)
+    await require_project_admin(request, project_id)
     with use_db() as db:
         agent_row = db.execute(
             "SELECT agent_id FROM user_agent_map WHERE user_id = ? AND project_id = ?",
@@ -435,7 +436,7 @@ async def remove_member(project_id: str, member_id: str, request: Request):
 
 @router.get("/project/{project_id}/quota")
 async def get_project_quota(project_id: str, request: Request):
-    require_project_member(request, project_id)
+    await require_project_member(request, project_id)
     with use_db() as db:
         row = db.execute(
             "SELECT folder_quota_mb, project_folder_id FROM projects WHERE project_id = ?",
@@ -452,7 +453,7 @@ async def get_project_quota(project_id: str, request: Request):
 
 @router.put("/project/{project_id}/quota")
 async def update_project_quota(project_id: str, request: Request):
-    require_org_admin(request)
+    await require_org_admin(request)
     body = await request.json()
     with use_db() as db:
         db.execute(
@@ -467,7 +468,7 @@ async def update_project_quota(project_id: str, request: Request):
 
 @router.get("/project/{project_id}/knowledge")
 async def get_project_knowledge(project_id: str, request: Request):
-    require_project_member(request, project_id)
+    await require_project_member(request, project_id)
     with use_db() as db:
         row = db.execute(
             "SELECT project_block_id FROM projects WHERE project_id = ?", (project_id,)
@@ -478,7 +479,7 @@ async def get_project_knowledge(project_id: str, request: Request):
 
 @router.put("/project/{project_id}/knowledge")
 async def update_project_knowledge(project_id: str, request: Request):
-    require_project_admin(request, project_id)
+    await require_project_admin(request, project_id)
     body = await request.json()
     with use_db() as db:
         row = db.execute(
@@ -555,7 +556,7 @@ async def _process_and_upload(file, folder_id: str, scope: str, scope_id: str = 
 
 @router.get("/project/{project_id}/files")
 async def list_project_files(project_id: str, request: Request):
-    require_project_member(request, project_id)
+    await require_project_member(request, project_id)
     with use_db() as db:
         row = db.execute(
             "SELECT project_folder_id FROM projects WHERE project_id = ?", (project_id,)
@@ -566,7 +567,7 @@ async def list_project_files(project_id: str, request: Request):
 
 @router.post("/project/{project_id}/files")
 async def upload_project_file(project_id: str, request: Request, file: UploadFile = File(...)):
-    require_project_member(request, project_id)
+    await require_project_member(request, project_id)
     with use_db() as db:
         row = db.execute(
             "SELECT project_folder_id, name FROM projects WHERE project_id = ?", (project_id,)
@@ -582,7 +583,7 @@ async def upload_project_file(project_id: str, request: Request, file: UploadFil
 
 @router.delete("/project/{project_id}/files/{file_id}")
 async def delete_project_file(project_id: str, file_id: str, request: Request):
-    require_project_admin(request, project_id)
+    await require_project_admin(request, project_id)
     with use_db() as db:
         row = db.execute(
             "SELECT project_folder_id FROM projects WHERE project_id = ?", (project_id,)
@@ -600,7 +601,7 @@ async def delete_project_file(project_id: str, file_id: str, request: Request):
 
 @router.get("/org/projects")
 async def list_all_projects(request: Request):
-    require_org_admin(request)
+    await require_org_admin(request)
     with use_db() as db:
         rows = db.execute(
             "SELECT p.project_id, p.name, p.created_by, p.folder_quota_mb, p.project_folder_id, "
@@ -631,13 +632,13 @@ async def list_all_projects(request: Request):
 
 @router.get("/org/settings")
 async def get_org_settings(request: Request):
-    require_org_admin(request)
+    await require_org_admin(request)
     return {"default_folder_quota_mb": config.DEFAULT_FOLDER_QUOTA_MB}
 
 
 @router.put("/org/settings")
 async def update_org_settings(request: Request):
-    require_org_admin(request)
+    await require_org_admin(request)
     body = await request.json()
     config.DEFAULT_FOLDER_QUOTA_MB = body["default_folder_quota_mb"]
     return {"status": "ok", "default_folder_quota_mb": config.DEFAULT_FOLDER_QUOTA_MB}
@@ -645,7 +646,7 @@ async def update_org_settings(request: Request):
 
 @router.post("/reconcile")
 async def manual_reconcile(request: Request):
-    require_org_admin(request)
+    await require_org_admin(request)
     reconcile_all()
     from knowledge_mirror import reconcile_mirrors
     reconcile_mirrors()
@@ -656,7 +657,7 @@ async def manual_reconcile(request: Request):
 
 @router.get("/org/knowledge")
 async def get_org_knowledge(request: Request):
-    extract_user_from_admin(request)
+    await extract_user_from_admin(request)
     resources = get_or_create_org_resources()
     block = letta.blocks.retrieve(block_id=resources["block_id"])
     return {"content": block.value, "limit": block.limit}
@@ -664,7 +665,7 @@ async def get_org_knowledge(request: Request):
 
 @router.put("/org/knowledge")
 async def update_org_knowledge(request: Request):
-    require_org_admin(request)
+    await require_org_admin(request)
     body = await request.json()
     resources = get_or_create_org_resources()
     block = letta.blocks.update(block_id=resources["block_id"], value=body["content"])
@@ -673,7 +674,7 @@ async def update_org_knowledge(request: Request):
 
 @router.get("/org/files")
 async def list_org_files(request: Request):
-    extract_user_from_admin(request)
+    await extract_user_from_admin(request)
     resources = get_or_create_org_resources()
     files = _file_items(letta.folders.files.list(folder_id=resources["folder_id"]))
     return [_file_to_dict(f) for f in files]
@@ -681,7 +682,7 @@ async def list_org_files(request: Request):
 
 @router.post("/org/files")
 async def upload_org_file(request: Request, file: UploadFile = File(...)):
-    require_org_admin(request)
+    await require_org_admin(request)
     resources = get_or_create_org_resources()
     names = await _process_and_upload(
         file, resources["folder_id"], scope="org",
@@ -691,7 +692,7 @@ async def upload_org_file(request: Request, file: UploadFile = File(...)):
 
 @router.delete("/org/files/{file_id}")
 async def delete_org_file(file_id: str, request: Request):
-    require_org_admin(request)
+    await require_org_admin(request)
     resources = get_or_create_org_resources()
     letta.folders.files.delete(folder_id=resources["folder_id"], file_id=file_id)
     try:
@@ -706,7 +707,7 @@ async def delete_org_file(file_id: str, request: Request):
 
 @router.get("/personal/files")
 async def list_personal_files(request: Request):
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     folder_id = get_or_create_personal_folder(user["id"])
     files = _file_items(letta.folders.files.list(folder_id=folder_id))
     return [_file_to_dict(f) for f in files]
@@ -714,7 +715,7 @@ async def list_personal_files(request: Request):
 
 @router.post("/personal/files")
 async def upload_personal_file(request: Request, file: UploadFile = File(...)):
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     folder_id = get_or_create_personal_folder(user["id"])
     names = await _process_and_upload(
         file, folder_id, scope="personal", owner_id=user["id"],
@@ -724,7 +725,7 @@ async def upload_personal_file(request: Request, file: UploadFile = File(...)):
 
 @router.delete("/personal/files/{file_id}")
 async def delete_personal_file(file_id: str, request: Request):
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     folder_id = get_or_create_personal_folder(user["id"])
     letta.folders.files.delete(folder_id=folder_id, file_id=file_id)
     try:
@@ -744,7 +745,7 @@ async def file_statuses(request: Request):
     前端在 Knowledge 列表页调用这个端点，按 letta_file_id 建 map，
     然后给每个 letta-mirror KB 行打"索引中 N/M"徽章。
     """
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     out = {}
 
     def _collect(folder_id):
@@ -790,7 +791,7 @@ async def file_statuses(request: Request):
 @router.get("/personal/memory")
 async def get_personal_memory(request: Request):
     """返回用户的 human block（跨所有项目共享一份）"""
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     try:
         block_id = get_or_create_personal_human_block(user["id"])
         block = letta.blocks.retrieve(block_id=block_id)
@@ -807,7 +808,7 @@ async def get_personal_memory(request: Request):
 @router.put("/personal/memory")
 async def update_personal_memory(request: Request):
     """更新用户的 human block；跨项目自动同步（因为是同一个 block_id）"""
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     body = await request.json()
     content = body.get("content", "")
     block_id = get_or_create_personal_human_block(user["id"])
@@ -869,7 +870,7 @@ def _message_role(msg) -> str:
 @router.get("/personal/conversations")
 async def list_conversations_overview(request: Request):
     """列当前用户每个项目的 agent + 消息数概览"""
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     with use_db() as db:
         rows = db.execute(
             "SELECT uam.project_id, uam.agent_id, p.name "
@@ -902,7 +903,7 @@ async def list_conversations_overview(request: Request):
 @router.get("/personal/conversations/{project_id}")
 async def list_conversations(project_id: str, request: Request, limit: int = 100):
     """列指定项目的消息，按时间倒序"""
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     with use_db() as db:
         row = db.execute(
             "SELECT agent_id FROM user_agent_map WHERE user_id = ? AND project_id = ?",
@@ -993,7 +994,7 @@ def _rebuild_agent(user_id: str, project_id: str, old_agent_id: str):
 @router.delete("/personal/conversations/{project_id}")
 async def clear_project_conversations(project_id: str, request: Request):
     """清空指定项目的对话历史。实现：删 agent + 重建（共享 human block 保留）。"""
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     with use_db() as db:
         row = db.execute(
             "SELECT agent_id FROM user_agent_map WHERE user_id = ? AND project_id = ?",
@@ -1011,7 +1012,7 @@ async def clear_project_conversations(project_id: str, request: Request):
 async def clear_all_conversations(request: Request):
     """清空当前用户所有项目的对话历史。多项目并行清空。"""
     import asyncio as _asyncio
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     with use_db() as db:
         rows = db.execute(
             "SELECT project_id, agent_id FROM user_agent_map WHERE user_id = ?",
@@ -1040,7 +1041,7 @@ async def clear_all_conversations(request: Request):
 
 @router.get("/project/{project_id}/suggestions")
 async def list_suggestions(project_id: str, request: Request):
-    require_project_member(request, project_id)
+    await require_project_member(request, project_id)
     with use_db() as db:
         rows = db.execute(
             "SELECT s.id, s.content, s.user_id, s.status, s.created_at, uc.name "
@@ -1063,7 +1064,7 @@ async def list_suggestions(project_id: str, request: Request):
 
 @router.post("/project/{project_id}/suggestions/{suggestion_id}/approve")
 async def approve_suggestion(project_id: str, suggestion_id: int, request: Request):
-    user = require_project_admin(request, project_id)
+    user = await require_project_admin(request, project_id)
     with use_db() as db:
         row = db.execute(
             "SELECT content FROM knowledge_suggestions WHERE id = ? AND project_id = ? AND status = 'pending'",
@@ -1088,7 +1089,7 @@ async def approve_suggestion(project_id: str, suggestion_id: int, request: Reque
 
 @router.post("/project/{project_id}/suggestions/{suggestion_id}/reject")
 async def reject_suggestion(project_id: str, suggestion_id: int, request: Request):
-    user = require_project_admin(request, project_id)
+    user = await require_project_admin(request, project_id)
     with use_db() as db:
         db.execute(
             "UPDATE knowledge_suggestions SET status = 'rejected', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1175,7 +1176,7 @@ def _todo_to_dict(r) -> dict:
 
 @router.get("/project/{project_id}/todos")
 async def list_project_todos(project_id: str, request: Request, status: str = "", assigned: str = ""):
-    require_project_member(request, project_id)
+    await require_project_member(request, project_id)
     q = "SELECT * FROM project_todos WHERE project_id = ?"
     params = [project_id]
     if status:
@@ -1195,7 +1196,7 @@ async def list_project_todos(project_id: str, request: Request, status: str = ""
 
 @router.post("/project/{project_id}/todos")
 async def create_todo(project_id: str, request: Request):
-    user = require_project_member(request, project_id)
+    user = await require_project_member(request, project_id)
     body = await request.json()
     title = (body.get("title") or "").strip()
     if not title:
@@ -1236,7 +1237,7 @@ async def create_todo(project_id: str, request: Request):
 
 @router.put("/project/{project_id}/todos/{todo_id}")
 async def update_todo(project_id: str, todo_id: int, request: Request):
-    user = require_project_member(request, project_id)
+    user = await require_project_member(request, project_id)
     body = await request.json()
 
     with use_db() as db:
@@ -1310,7 +1311,7 @@ async def update_todo(project_id: str, todo_id: int, request: Request):
 
 @router.delete("/project/{project_id}/todos/{todo_id}")
 async def delete_todo(project_id: str, todo_id: int, request: Request):
-    user = require_project_member(request, project_id)
+    user = await require_project_member(request, project_id)
     with use_db() as db:
         row = db.execute(
             "SELECT * FROM project_todos WHERE id = ? AND project_id = ?", (todo_id, project_id),
@@ -1332,7 +1333,7 @@ async def delete_todo(project_id: str, todo_id: int, request: Request):
 @router.post("/project/{project_id}/todos/{todo_id}/confirm")
 async def confirm_todo(project_id: str, todo_id: int, request: Request):
     """member 把 awaiting_user 转正：按 approval_mode 进 awaiting_admin 或直接 open"""
-    user = require_project_member(request, project_id)
+    user = await require_project_member(request, project_id)
     with use_db() as db:
         row = db.execute(
             "SELECT * FROM project_todos WHERE id = ? AND project_id = ?", (todo_id, project_id),
@@ -1356,7 +1357,7 @@ async def confirm_todo(project_id: str, todo_id: int, request: Request):
 
 @router.post("/project/{project_id}/todos/{todo_id}/approve")
 async def approve_todo(project_id: str, todo_id: int, request: Request):
-    require_project_admin(request, project_id)
+    await require_project_admin(request, project_id)
     with use_db() as db:
         row = db.execute(
             "SELECT * FROM project_todos WHERE id = ? AND project_id = ?", (todo_id, project_id),
@@ -1376,7 +1377,7 @@ async def approve_todo(project_id: str, todo_id: int, request: Request):
 @router.post("/project/{project_id}/todos/{todo_id}/reject")
 async def reject_todo(project_id: str, todo_id: int, request: Request):
     """member 拒自己的 awaiting_user；admin 驳回任何 awaiting_*"""
-    user = require_project_member(request, project_id)
+    user = await require_project_member(request, project_id)
     body = await request.json() if request.headers.get("content-length") else {}
     reason = (body.get("reason") or "").strip() if isinstance(body, dict) else ""
     with use_db() as db:
@@ -1444,7 +1445,7 @@ async def ai_submit_todo(project_id: str, request: Request):
 @router.get("/my-todos")
 async def my_todos(request: Request):
     """跨项目：与我相关的 TODO（我创建的 OR 分配给我的），排除 cancelled"""
-    user = extract_user_from_admin(request)
+    user = await extract_user_from_admin(request)
     with use_db() as db:
         rows = db.execute(
             "SELECT t.*, p.name AS project_name "
@@ -1464,7 +1465,7 @@ async def my_todos(request: Request):
 
 @router.put("/project/{project_id}/settings/todo")
 async def update_todo_setting(project_id: str, request: Request):
-    require_project_admin(request, project_id)
+    await require_project_admin(request, project_id)
     body = await request.json()
     mode = body.get("approval_mode")
     if mode not in ALLOWED_APPROVAL_MODES:
@@ -1479,7 +1480,7 @@ async def update_todo_setting(project_id: str, request: Request):
 
 @router.get("/project/{project_id}/settings/todo")
 async def get_todo_setting(project_id: str, request: Request):
-    require_project_member(request, project_id)
+    await require_project_member(request, project_id)
     with use_db() as db:
         mode = _get_approval_mode(db, project_id)
     return {"approval_mode": mode}
@@ -1490,7 +1491,7 @@ async def get_todo_setting(project_id: str, request: Request):
 
 @router.get("/users/search")
 async def search_users(request: Request, q: str = ""):
-    extract_user_from_admin(request)
+    await extract_user_from_admin(request)
     from auth import _admin_api_get
     data = _admin_api_get("/api/v1/users/")
     if not data:
