@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+gunicorn
 letta-client
 pyjwt
 python-multipart

@@ -2,7 +2,7 @@ import httpx, jwt, io, os
 from datetime import datetime, timedelta, timezone
 import openpyxl, zipfile
 
-SECRET='6WYGSa8e7EBsSeG3'
+SECRET=os.getenv('OPENWEBUI_JWT_SECRET','6WYGSa8e7EBsSeG3')
 USER='ce1d405b-0b5c-4faf-8864-010e2611b900'
 tok = jwt.encode({'id':USER,'exp':datetime.now(timezone.utc)+timedelta(hours=1)},SECRET,algorithm='HS256')
 H = {'Authorization':f'Bearer {tok}'}

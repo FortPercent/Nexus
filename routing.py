@@ -193,6 +193,14 @@ def get_or_create_agent(user_id: str, project: str) -> str:
 
         _attach_agent_resources(db, agent.id, user_id, project)
 
+        # Letta bug workaround：agents.create 里 tool_ids=[...] 不会让工具进 system prompt，
+        # 必须显式 attach 一遍（见 scripts/migrate_ai_tools.py 同样做法）
+        for tid in custom_tool_ids:
+            try:
+                letta.agents.tools.attach(agent_id=agent.id, tool_id=tid)
+            except Exception as e:
+                logging.warning(f"attach tool {tid} to {agent.id}: {e}")
+
         db.execute(
             "INSERT INTO user_agent_map (user_id, project_id, agent_id) VALUES (?, ?, ?)",
             (user_id, project, agent.id),

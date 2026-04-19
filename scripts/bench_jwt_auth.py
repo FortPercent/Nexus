@@ -11,7 +11,7 @@ import jwt  # PyJWT
 import uuid
 
 ADAPTER = "http://localhost:8000/admin/api/me"
-SECRET = "6WYGSa8e7EBsSeG3"
+SECRET = os.getenv("OPENWEBUI_JWT_SECRET", "6WYGSa8e7EBsSeG3")
 VALID_UID = "ce1d405b-0b5c-4faf-8864-010e2611b900"  # wuxn5
 
 def mint(exp_delta_seconds, secret=SECRET, uid=VALID_UID):

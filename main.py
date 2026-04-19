@@ -1,7 +1,9 @@
 """适配层主入口 —— 聊天 API（/v1/*）"""
+import fcntl
 import json
 import asyncio
 import logging
+import os
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
@@ -36,9 +38,33 @@ app.add_middleware(
 )
 
 
+# 多 worker 下的 singleton leader 选举 —— 只让一个 worker 跑对账/资源初始化
+# fcntl.flock 是进程级锁，进程退出自动释放；首个 worker 拿到锁成为 leader
+_SINGLETON_LOCK_PATH = "/tmp/adapter_singleton.lock"
+_singleton_lock_fd = None
+
+
+def _try_become_singleton_leader() -> bool:
+    global _singleton_lock_fd
+    try:
+        fd = os.open(_SINGLETON_LOCK_PATH, os.O_CREAT | os.O_WRONLY, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _singleton_lock_fd = fd  # 持有到进程退出
+        os.write(fd, f"{os.getpid()}\n".encode())
+        return True
+    except (OSError, BlockingIOError):
+        return False
+
+
 @app.on_event("startup")
 def startup():
-    init_db()
+    init_db()  # 幂等，每个 worker 都跑
+
+    if not _try_become_singleton_leader():
+        logging.info(f"worker pid={os.getpid()} NOT singleton leader, skipping reconcile")
+        return
+
+    logging.info(f"worker pid={os.getpid()} IS singleton leader, running startup singletons")
     try:
         get_or_create_org_resources()
         sync_org_resources_to_all_agents()
@@ -71,6 +97,9 @@ async def _reconcile_loop():
 
 @app.on_event("startup")
 async def start_reconcile_loop():
+    # 非 leader 不启动循环任务
+    if _singleton_lock_fd is None:
+        return
     asyncio.create_task(_reconcile_loop())
 
 

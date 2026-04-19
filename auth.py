@@ -131,7 +131,9 @@ def extract_user_from_admin(request: Request) -> dict:
             )
         return {"id": user_id, "name": name, "email": email, "role": u.get("role", "user")}
 
-    return {"id": user_id, "name": "", "email": "", "role": "user"}
+    # 2026-04-19: JWT 签名合法但 user_id 在 Open WebUI 里查不到 → 401
+    # 防止有 secret 的人伪造任意 user_id 访问管理 API
+    raise HTTPException(401, "用户不存在或已被删除，请重新登录 Open WebUI")
 
 
 def get_current_user(request: Request, body: dict = None) -> dict:

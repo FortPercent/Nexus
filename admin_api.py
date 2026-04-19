@@ -926,29 +926,45 @@ async def list_conversations(project_id: str, request: Request, limit: int = 100
     return result
 
 
-def _rebuild_agent(user_id: str, project_id: str, old_agent_id: str):
-    """删旧 agent + 重建新 agent。删之前 detach 掉所有共享 block（human/project/org），
-    防止 Letta 级联删除殃及到其他 agent 仍在用的 block。"""
+async def _rebuild_agent_async(user_id: str, project_id: str, old_agent_id: str):
+    """删旧 agent + 重建新 agent。detach 操作用 asyncio.gather 并行化。
+
+    2026-04-19 改造：sync letta_client → letta_async + 并行 detach。
+    之前 sync 调用累计 ~1.5s；并行化后 block/folder detach 同时做，总时间看单次 HTTP 延迟。"""
+    import asyncio as _asyncio
     # 先把共享 block 和 folder 都 detach，防止级联删
-    try:
-        blocks = list(letta.agents.blocks.list(agent_id=old_agent_id))
-        for b in blocks:
-            if b.label in ("human", "org_knowledge") or (b.label or "").startswith("project_knowledge_"):
-                try:
-                    letta.agents.blocks.detach(agent_id=old_agent_id, block_id=b.id)
-                except Exception as e:
-                    logging.warning(f"detach block {b.id} from {old_agent_id}: {e}")
-    except Exception as e:
-        logging.warning(f"list blocks on {old_agent_id}: {e}")
-    try:
-        folders = list(letta.agents.folders.list(agent_id=old_agent_id))
-        for f in folders:
+    async def _detach_shared_blocks():
+        try:
+            page = await letta_async.agents.blocks.list(agent_id=old_agent_id)
+            blocks = list(getattr(page, "items", page))
+        except Exception as e:
+            logging.warning(f"list blocks on {old_agent_id}: {e}")
+            return
+        shared = [b for b in blocks
+                  if b.label in ("human", "org_knowledge") or (b.label or "").startswith("project_knowledge_")]
+        async def _one(b):
             try:
-                letta.agents.folders.detach(agent_id=old_agent_id, folder_id=f.id)
+                await letta_async.agents.blocks.detach(agent_id=old_agent_id, block_id=b.id)
+            except Exception as e:
+                logging.warning(f"detach block {b.id} from {old_agent_id}: {e}")
+        await _asyncio.gather(*(_one(b) for b in shared), return_exceptions=True)
+
+    async def _detach_all_folders():
+        try:
+            page = await letta_async.agents.folders.list(agent_id=old_agent_id)
+            folders = list(getattr(page, "items", page))
+        except Exception as e:
+            logging.warning(f"list folders on {old_agent_id}: {e}")
+            return
+        async def _one(f):
+            try:
+                await letta_async.agents.folders.detach(agent_id=old_agent_id, folder_id=f.id)
             except Exception as e:
                 logging.warning(f"detach folder {f.id} from {old_agent_id}: {e}")
-    except Exception as e:
-        logging.warning(f"list folders on {old_agent_id}: {e}")
+        await _asyncio.gather(*(_one(f) for f in folders), return_exceptions=True)
+
+    # blocks detach 和 folders detach 本身也可以并行
+    await _asyncio.gather(_detach_shared_blocks(), _detach_all_folders(), return_exceptions=True)
 
     with use_db() as db:
         db.execute(
@@ -956,11 +972,22 @@ def _rebuild_agent(user_id: str, project_id: str, old_agent_id: str):
             (user_id, project_id),
         )
     try:
-        letta.agents.delete(agent_id=old_agent_id)
+        await letta_async.agents.delete(agent_id=old_agent_id)
     except Exception as e:
         logging.warning(f"delete agent {old_agent_id} failed (continuing): {e}")
-    # 触发懒重建
-    return get_or_create_agent(user_id, project_id)
+    # get_or_create_agent 仍是 sync，用 to_thread 避免阻塞 event loop
+    return await _asyncio.to_thread(get_or_create_agent, user_id, project_id)
+
+
+def _rebuild_agent(user_id: str, project_id: str, old_agent_id: str):
+    """同步版本，保留给内部脚本（test regression 等）调用。生产路径用 _rebuild_agent_async。"""
+    import asyncio as _asyncio
+    try:
+        loop = _asyncio.get_running_loop()
+        # 在 event loop 里不能直接 asyncio.run
+        raise RuntimeError("_rebuild_agent should not be called from async context; use _rebuild_agent_async")
+    except RuntimeError:
+        return _asyncio.run(_rebuild_agent_async(user_id, project_id, old_agent_id))
 
 
 @router.delete("/personal/conversations/{project_id}")
@@ -974,7 +1001,7 @@ async def clear_project_conversations(project_id: str, request: Request):
         ).fetchone()
     if not row:
         raise HTTPException(404, "无此项目的对话")
-    new_agent_id = _rebuild_agent(user["id"], project_id, row["agent_id"])
+    new_agent_id = await _rebuild_agent_async(user["id"], project_id, row["agent_id"])
     _audit(user["id"], "clear_conversations", scope=project_id,
            details=f"old={row['agent_id']} new={new_agent_id}")
     return {"status": "ok", "project_id": project_id, "new_agent_id": new_agent_id}
@@ -982,22 +1009,27 @@ async def clear_project_conversations(project_id: str, request: Request):
 
 @router.delete("/personal/conversations")
 async def clear_all_conversations(request: Request):
-    """清空当前用户所有项目的对话历史"""
+    """清空当前用户所有项目的对话历史。多项目并行清空。"""
+    import asyncio as _asyncio
     user = extract_user_from_admin(request)
     with use_db() as db:
         rows = db.execute(
             "SELECT project_id, agent_id FROM user_agent_map WHERE user_id = ?",
             (user["id"],),
         ).fetchall()
-    cleared = []
-    failed = []
-    for r in rows:
+
+    async def _clear_one(project_id, agent_id):
         try:
-            _rebuild_agent(user["id"], r["project_id"], r["agent_id"])
-            cleared.append(r["project_id"])
+            await _rebuild_agent_async(user["id"], project_id, agent_id)
+            return (project_id, True)
         except Exception as e:
-            logging.warning(f"clear all: rebuild {r['project_id']} failed: {e}")
-            failed.append(r["project_id"])
+            logging.warning(f"clear all: rebuild {project_id} failed: {e}")
+            return (project_id, False)
+
+    results = await _asyncio.gather(*(_clear_one(r["project_id"], r["agent_id"]) for r in rows))
+    cleared = [p for p, ok in results if ok]
+    failed = [p for p, ok in results if not ok]
+
     _audit(user["id"], "clear_all_conversations", scope=",".join(cleared),
            details=f"failed={failed}" if failed else "")
     return {"status": "ok", "cleared": cleared, "failed": failed}

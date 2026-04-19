@@ -15,7 +15,7 @@ import httpx
 WEBUI = "http://172.17.0.1:3000"
 ADAPTER = "http://localhost:8000"
 LETTA = "http://letta-server:8283"
-JWT_SECRET = "6WYGSa8e7EBsSeG3"
+JWT_SECRET = os.getenv("OPENWEBUI_JWT_SECRET", "6WYGSa8e7EBsSeG3")
 N = 5  # 测试用户数
 
 def admin_signin():
