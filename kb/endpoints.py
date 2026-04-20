@@ -6,8 +6,9 @@
 PoC v0 约束（硬限）:
   - scope 只接受 "project" (personal / org 留 Phase 1)
   - read 只处理 .md / .txt / 无后缀 (on-the-fly 转换留 Phase 2)
-  - list 合并主目录 + .legacy/ 两层, 带 source 和 quality 标
-  - 显示名复用 admin_api._display_name 的规则 (foo.docx.md → foo.docx)
+  - PoC 读 <slug>/.poc/.legacy/*  (namespace 隔离, 避免踩 Phase 1 生产路径)
+  - Phase 1+ 会改成读 <slug>/.legacy/ + <slug>/ 主目录, 本文件届时更新
+  - 显示名 = _display_name 规则 (foo.docx.md → foo.docx), 直接内联实现, 不 import admin_api
   - PoC v0 不查 project_members 严格鉴权 (只靠 API key)
 """
 from __future__ import annotations
@@ -99,9 +100,10 @@ def _scan_dir(dirpath: str, source: str, cid_dirty: set[str]) -> list[dict]:
 async def list_files(project_id: str, req: ListFilesReq):
     base = _resolve_base(project_id, req.scope, req.user_id)
 
-    # 读 cid_dirty 清单（legacy 文件质量标记）
+    # PoC v0: 只读 <slug>/.poc/.legacy/, Phase 1 会扩到 <slug>/ 主目录 + <slug>/.legacy/
+    legacy_dir = os.path.join(base, ".poc", ".legacy")
+    quality_file = os.path.join(legacy_dir, ".quality", "cid_dirty.list")
     cid_dirty: set[str] = set()
-    quality_file = os.path.join(base, ".legacy", ".quality", "cid_dirty.list")
     if os.path.exists(quality_file):
         try:
             with open(quality_file, encoding="utf-8") as f:
@@ -109,8 +111,7 @@ async def list_files(project_id: str, req: ListFilesReq):
         except Exception as e:
             logging.warning(f"kb.list_files: read quality failed: {e}")
 
-    items = _scan_dir(base, "current", cid_dirty)
-    items += _scan_dir(os.path.join(base, ".legacy"), "legacy", cid_dirty)
+    items = _scan_dir(legacy_dir, "legacy", cid_dirty)
 
     if not items:
         return {"text": f"当前 project「{project_id}」暂无文件。请让用户上传。", "items": items}
@@ -128,25 +129,25 @@ async def list_files(project_id: str, req: ListFilesReq):
 
 
 def _find_file(base: str, name: str) -> Optional[tuple[str, str, str]]:
-    """找文件: 返回 (path, source, raw_name) 或 None
-    先查主目录, 后查 .legacy/; 支持 display_name 和 raw_name 两种传法。
+    """找文件: 返回 (path, source, raw_name) 或 None.
+
+    PoC v0: 只在 <base>/.poc/.legacy/ 查. Phase 1 扩到 <base>/ 主目录 + <base>/.legacy/.
+    支持两种传法:
+      - raw 名（foo.docx.md）→ 直接命中
+      - display 名（foo.docx）→ 尝试加 .md 后缀命中
     """
-    for subdir, source in (("", "current"), (".legacy", "legacy")):
-        d = os.path.join(base, subdir) if subdir else base
-        if not os.path.isdir(d):
-            continue
-        # 原名直接命中
-        p = os.path.join(d, name)
-        if os.path.isfile(p):
-            return (p, source, name)
-        # display name → 尝试加 .md 后缀（foo.docx → foo.docx.md）
-        if not name.endswith(".md"):
-            for ext in _OFFICE_EXTS:
-                if name.endswith(ext):
-                    p_md = os.path.join(d, name + ".md")
-                    if os.path.isfile(p_md):
-                        return (p_md, source, name + ".md")
-                    break
+    d = os.path.join(base, ".poc", ".legacy")
+    if not os.path.isdir(d):
+        return None
+    # 原名直接命中
+    p = os.path.join(d, name)
+    if os.path.isfile(p):
+        return (p, "legacy", name)
+    # display name → 尝试加 .md 后缀
+    if not name.endswith(".md"):
+        p_md = os.path.join(d, name + ".md")
+        if os.path.isfile(p_md):
+            return (p_md, "legacy", name + ".md")
     return None
 
 

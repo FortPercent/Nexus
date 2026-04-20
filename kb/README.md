@@ -1,9 +1,17 @@
-# 知识层重构 PoC（v0.6）
+# 知识层重构 PoC（v0.6.1）
 
 > **分支**: `feat/kb-poc`（base: `51d9551` 服务器 snapshot，不 merge main 直到 PoC 结论）
-> **范围**: 只做 list + read 两个工具 + 一个隔离 test agent，**不碰任何生产 agent / 生产文件 / 现有工具链**。
-> **成败**: 用 3 条 security 规范类问题验收是否命中条款 + agent 主动调用。
-> **失败处置**: `letta.agents.delete(test_agent_id)` + `rm -rf /data/serving/adapter/projects/security-management/` + 本分支整体删除。
+> **范围**: 只做 list + read 两个工具 + 一个隔离 test agent。
+> **边界**（准确版本）:
+> - **不碰**生产 agent、不碰用户可见功能路径（chat / 上传 UI / # 引用 / 其他工具）
+> - **会碰**: 生产 adapter 进程（`docker compose restart` / `docker cp`）、共享数据卷（写 PoC 专属 namespace 目录）、Letta PG（**只读** `file_contents.text` 导出文本）
+> - 所有改动 commit 在 `feat/kb-poc`，随时可 revert
+> **PoC 数据 namespace**: 落 `<out_root>/<slug>/.poc/.legacy/`，**不踩**生产 slug 目录（防 Phase 1 冲突）
+> **失败处置**:
+> - `letta.agents.delete(test_agent_id)` (不影响 user_agent_map)
+> - `rm -rf /data/serving/adapter/projects/security-management/.poc/`（只删 PoC namespace，生产 slug 目录不动）
+> - 分支整体 `git branch -D feat/kb-poc`
+> **验收标准**（PoC 内部用；已在 2026-04-20 全过）见 §5
 
 ---
 
@@ -38,16 +46,25 @@
 
 代价：跨 volume 不能 hardlink，新上传 binary 需要 copy（磁盘 2×）。配额 5GB/project，总量可控。
 
-### 3.2 存量 vs 新上传 物理隔离
+### 3.2 存量 vs 新上传 物理隔离 + PoC namespace 隔离
 ```
+# PoC 阶段（当前）
 /data/serving/adapter/projects/security-management/
-  新规范.docx                    ← 新上传 binary（Phase 2 后）
-  新规范.docx.md                 ← on-the-fly 转换或 cache
+  .poc/                              ← PoC 专属, 清理只需 rm -rf .poc/
+    .legacy/                         ← 存量 backfill 全进这儿
+      旧规范.docx.md                 ← 从 Letta file_contents.text 导出
+      《规定》.pdf.md                ← 原 pdf 也统一 .md 后缀 (修 *.md.md 陷阱)
+      .quality/cid_dirty.list        ← 质量标记
+
+# Phase 1 之后（退掉 .poc/ 这层）
+/data/serving/adapter/projects/security-management/
+  新规范.docx                        ← 新上传 binary (Phase 2 后)
+  新规范.docx.md                     ← 派生 (cache 或半持久)
   新xlsx.xlsx
-  .legacy/                       ← 存量 backfill 全进这儿
-    旧规范.docx.md               ← 从 Letta file_contents.text 导
-    旧pdf.pdf.md                 ← 可能有 (cid:XXX) 乱码
-    .quality/cid_dirty.list      ← 质量标记
+  .legacy/                           ← backfill 从 .poc/.legacy 升格到此
+    旧规范.docx.md
+    《规定》.pdf.md                  ← 统一 .md 后缀
+    .quality/cid_dirty.list
 ```
 **好处**: 清理 legacy 一行命令 `rm -rf <slug>/.legacy/`；主目录永远是新的、干净的。
 
@@ -81,27 +98,33 @@ teleai-adapter/                            ← repo 根
 
 ### 做
 1. `kb/endpoints.py`：2 个 endpoint
-   - `POST /internal/project/{slug}/kb/list-files` → `os.listdir` 扫目录 + `.legacy/` 合并显示 + `_display_name` 复用
-   - `POST /internal/project/{slug}/kb/read` → 按 path 读文件（PoC 仅处理 .md，不做 on-the-fly 转换）
+   - `POST /internal/project/{slug}/kb/list-files` → 扫 `<slug>/.poc/.legacy/`，返回 markdown 表 + items
+   - `POST /internal/project/{slug}/kb/read` → 从 `<slug>/.poc/.legacy/` 读（raw 或 display 名两种都接受）
+   - `_display_name` **已内联实现**（`kb/endpoints.py:22-29`），**不 import** `admin_api`，避免 PoC 为一个 helper 拉整坨 admin_api 依赖
 2. `kb/letta_tools.py`：照 `letta_sql_tools.py` 结构，2 个 `urllib` 薄壳工具
 3. `kb/backfill.py`：一次性脚本，只跑 security-management
-   - 查 Letta pg `file_contents.text` + `original_file_name`
-   - 写到 `/data/serving/adapter/projects/security-management/.legacy/<name>.md`
+   - **数据源**: 直连 Letta PostgreSQL（`psycopg2`，`host=letta-db`，`user=letta`，password 从 env `POSTGRES_PASSWORD`，adapter 容器已自动注入）
+   - **只读**: 全程 SELECT，不改 Letta 任何数据
+   - **命名规则**: original 已是 `.md` → 原样；否则追加 `.md` 后缀（修 `*.md.md` 和 `.pdf` 被 415 两种陷阱）
+   - 写到 `<slug>/.poc/.legacy/<name>.md`
 4. `scripts/create_test_agent.py`：
    - owner=biany, project=security-management
    - **不写 user_agent_map**（生产入口看不到）
    - `tool_ids=[list_id, read_id]` + **显式 `agents.tools.attach()` 循环**（Letta bug 修正，见 `routing.py:233`）
-   - persona 里硬加 "文档类问题必须先 list → read"
+   - persona 推荐 "文档类问题**先** list → read"（推荐行为，不是硬首轮检查，见下）
 5. 发 3 条测试问题验收：
    - Q1: "DLP 安装卸载有什么要求？"
    - Q2: "对外交付时现场设备要注意什么？"
    - Q3: "安全开发规范里密码应用章节说了什么？"
 
-### 验收标准（4 条）
-1. agent 首轮主动调 `list_project_files`
-2. 随后调 `read_project_file` 且选对文件
-3. 答案命中标准条款
-4. 未跨 scope（没试图查 personal / org）
+### 验收标准（v0.6.1 放宽版 — 防假阴性）
+1. 在**一轮或多轮**里，agent 最终走了 list→read 路线（不强制首轮）
+2. 选对了文件
+3. 答案命中条款
+4. 未跨 scope（不搜 personal/org）
+
+### 2026-04-20 执行结果
+**3/3 全过**。Q1-Q3 所有问题都：① 首轮即调 list_project_files；② 选对文件；③ 命中条款；④ 全 project 范围。Q3 agent 还自主 pagination 读了 26K 字文档（4 次 read，offset 0/8000/16000/24000 自动推进）。
 
 ### 不做（显式禁止）
 - 不碰任何生产 agent
@@ -171,38 +194,56 @@ Phase 4 — 清理                               一周 later
 ## 10. 如何跑 PoC（代码写完后）
 
 ```bash
-# 0. 部署新分支
+# 0. 部署 feat/kb-poc 分支
 cd /home/infra46/teleai-adapter
-git checkout feat/kb-poc
-docker compose build adapter && docker compose up -d adapter
+git fetch origin && git checkout feat/kb-poc && git pull
 
-# 1. 跑 backfill（只 security-management）
+# 1. 热 copy kb 代码到容器 + 重启 (router 需要, 不用 rebuild 镜像)
+docker cp kb/endpoints.py      teleai-adapter:/app/kb/endpoints.py
+docker cp kb/letta_tools.py    teleai-adapter:/app/kb/letta_tools.py
+docker cp kb/__init__.py       teleai-adapter:/app/kb/__init__.py
+docker cp main.py              teleai-adapter:/app/main.py
+docker cp scripts/create_test_agent.py teleai-adapter:/app/scripts/create_test_agent.py
+docker cp scripts/poc_ask.py   teleai-adapter:/app/scripts/poc_ask.py
+docker cp kb/backfill.py       teleai-adapter:/app/kb/backfill.py
+docker compose restart adapter
+
+# 2. 跑 backfill (只 security-management, 落 .poc/.legacy/ namespace)
 docker exec teleai-adapter python3 /app/kb/backfill.py --project security-management --dry-run
 docker exec teleai-adapter python3 /app/kb/backfill.py --project security-management
 
-# 2. 确认目录内容
-docker exec teleai-adapter ls /data/serving/adapter/projects/security-management/.legacy/
+# 3. 确认目录内容
+docker exec teleai-adapter ls /data/serving/adapter/projects/security-management/.poc/.legacy/
 
-# 3. 创建 test agent
-docker exec teleai-adapter python3 /app/scripts/create_test_agent.py --owner biany --project security-management
+# 4. 创建 test agent (biany uuid 见 adapter.db.user_agent_map)
+docker exec teleai-adapter python3 /app/scripts/create_test_agent.py \
+    --owner f1dfb0ed-0c2b-4337-922a-cbc86859dfde \
+    --project security-management
+# 输出会给出 agent id, 例: agent-d6e89e64-d285-4ab3-a014-d3d1595f5308
 
-# 4. 手工聊 3 个问题（Letta web UI 或 curl）
+# 5. 发 3 个问题 + 打印工具调用 + 回答
+docker exec teleai-adapter python3 /app/scripts/poc_ask.py --agent-id <agent-id>
 
-# 5. 打分 + 决定进 Phase 1 还是推倒
+# 6. 打分 (4 条见 §5), 决定进 Phase 1 / 推倒重来
 ```
 
 ## 11. 如何彻底清理 PoC（失败时）
 
 ```bash
-# 服务器上
+# 1. 删 test agent (不影响生产 user_agent_map, 也不影响 biany 真正的 agent)
 docker exec teleai-adapter python3 -c "
-from letta_client import Letta
-import os
-l = Letta(base_url=os.environ['LETTA_BASE_URL'])
-for a in l.agents.list(query_text='test-kb'):
-    l.agents.delete(agent_id=a.id)
+from routing import letta
+for a in letta.agents.list(limit=200):
+    md = getattr(a, 'metadata', {}) or {}
+    if md.get('_test') == 'kb-poc-v0':
+        print(f'delete {a.id}  {a.name}')
+        letta.agents.delete(agent_id=a.id)
 "
-rm -rf /data/serving/adapter/projects/security-management/
+
+# 2. 删 PoC namespace 目录 (只删 .poc/, 生产 slug 目录不受影响)
+docker exec teleai-adapter rm -rf /data/serving/adapter/projects/security-management/.poc/
+
+# 3. 分支清理
 cd /home/infra46/teleai-adapter
 git checkout main
 git branch -D feat/kb-poc

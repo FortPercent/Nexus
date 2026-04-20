@@ -1,15 +1,21 @@
-"""一次性 backfill 脚本：Letta file_contents.text → /data/serving/adapter/projects/<slug>/.legacy/
+"""一次性 backfill：Letta file_contents.text → <out_root>/<slug>/.poc/.legacy/<name>.md
+
+数据来源 (显式, 避免 "跑完发现依赖缺失"):
+  - 直连 Letta PostgreSQL; 不走 Letta API (SDK 不暴露 file_contents.text)
+  - psycopg2, host=letta-db, dbname=letta, user=letta
+  - password 从 env POSTGRES_PASSWORD 读, adapter 容器通过 docker-compose env_file: .env 注入
+  - 只读: 全程 SELECT, 不触碰 Letta 任何写操作
+
+Namespace 隔离:
+  - 默认落 <out_root>/<slug>/.poc/.legacy/<name>, 不污染 Phase 1 的生产 slug 目录
+  - 清理: rm -rf <out_root>/<slug>/.poc/
+
+命名规则 (修 *.md.md 陷阱 + endpoint ext 校验):
+  - original_file_name 已以 '.md' 结尾 → 原样落盘
+  - 否则追加 '.md' 后缀 (让 endpoint 文本 ext 校验通过, _display_name 自然折叠回原扩展名)
 
 用法:
-    python3 kb/backfill.py --project security-management [--dry-run]
-    python3 kb/backfill.py --project security-management --out-root /data/serving/adapter/projects
-
-契约：
-  - 从 Letta pg 查 (files, file_contents) JOIN sources (name='proj-<slug>')
-  - 对每份有文本的文件，写 .legacy/<original_file_name>（不加 .md 后缀，照搬 Letta 存的名字）
-  - 检测 pdf 里的 (cid:XXX) 乱码，写入 .legacy/.quality/cid_dirty.list
-  - 幂等：同名 skip（带 --force 时覆盖）
-  - 只读 Letta，不改任何 Letta 数据
+    docker exec teleai-adapter python3 /app/kb/backfill.py --project security-management [--dry-run]
 """
 from __future__ import annotations
 
@@ -44,9 +50,24 @@ def _count_cid(text: str) -> int:
     return len(CID_PATTERN.findall(text))
 
 
+def _namespaced_target(out_root: str, project_slug: str, scope: str) -> str:
+    """生产 slug 的子 namespace: <out_root>/<slug>/.poc/ (隔离 PoC, 不踩 Phase 1 生产目录)"""
+    if scope == "project":
+        return os.path.join(out_root, project_slug, ".poc")
+    return os.path.join(out_root, f".{scope}", project_slug, ".poc")
+
+
+def _legacy_dst_name(original_file_name: str) -> str:
+    """统一落盘名: 已是 .md 原样, 否则追加 .md (修 *.md.md 陷阱)"""
+    safe = os.path.basename(original_file_name or "") or "unnamed"
+    if safe.endswith(".md"):
+        return safe
+    return safe + ".md"
+
+
 def backfill(project_slug: str, out_root: str, scope: str, pg_password: str, dry_run: bool, force: bool):
     source_name = _source_name_for_project(project_slug, scope)
-    target_dir = os.path.join(out_root, project_slug if scope == "project" else f".{scope}/{project_slug}")
+    target_dir = _namespaced_target(out_root, project_slug, scope)
     legacy_dir = os.path.join(target_dir, ".legacy")
     quality_dir = os.path.join(legacy_dir, ".quality")
 
@@ -76,16 +97,17 @@ def backfill(project_slug: str, out_root: str, scope: str, pg_password: str, dry
     cid_dirty_names: list[str] = []
 
     for name, ftype, tlen, text in rows:
-        safe = _safe_filename(name or "")
-        if not safe:
+        if not (name or "").strip():
             print(f"  [skip empty name]")
             continue
+        dst_name = _legacy_dst_name(name)  # 保证以 .md 结尾
         if tlen == 0 or not text:
-            print(f"  [skip empty text] {safe} ({ftype})")
+            print(f"  [skip empty text] {dst_name} ({ftype})")
             stats["skipped_empty"] += 1
             continue
 
-        dst = os.path.join(legacy_dir, safe)
+        dst = os.path.join(legacy_dir, dst_name)
+        safe = dst_name  # 保留 safe 变量名兼容下方 cid_dirty 记录
         if os.path.exists(dst) and not force:
             print(f"  [skip exists]     {safe}")
             stats["skipped_exists"] += 1
