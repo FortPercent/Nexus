@@ -128,7 +128,8 @@ async def list_files(project_id: str, req: ListFilesReq):
     if req.scope == "project":
         _check_project_member(project_id, req.user_id)
 
-    # Phase 1: <slug>/.legacy/ (存量 backfill). Phase 2 再加 <slug>/ 主目录 (新上传)
+    # Phase 1: <slug>/.legacy/ (存量 backfill)
+    # Phase 2: <slug>/ 主目录 (新上传 binary + 派生 .md)
     legacy_dir = os.path.join(base, ".legacy")
     quality_file = os.path.join(legacy_dir, ".quality", "cid_dirty.list")
     cid_dirty: set[str] = set()
@@ -139,7 +140,16 @@ async def list_files(project_id: str, req: ListFilesReq):
         except Exception as e:
             logging.warning(f"kb.list_files: read quality failed: {e}")
 
-    items = _scan_dir(legacy_dir, "legacy", cid_dirty)
+    # 主目录 (Phase 2 的新上传): 如果有 foo.docx + foo.docx.md, 只显示 .md 那个 (agent 读的是 md)
+    current_items = _scan_dir(base, "current", cid_dirty)
+    # 去重: 若已有 foo.docx.md, 隐藏同基 foo.docx (保留可下载原件但 agent list 不显示)
+    md_bases = {it["raw"][:-3] for it in current_items if it["raw"].endswith(".md")}
+    current_items = [
+        it for it in current_items
+        if not (not it["raw"].endswith(".md") and it["raw"] in md_bases)
+    ]
+
+    items = current_items + _scan_dir(legacy_dir, "legacy", cid_dirty)
 
     if not items:
         return {"text": f"当前 project「{project_id}」暂无文件。请让用户上传。", "items": items}
@@ -159,23 +169,25 @@ async def list_files(project_id: str, req: ListFilesReq):
 def _find_file(base: str, name: str) -> Optional[tuple[str, str, str]]:
     """找文件: 返回 (path, source, raw_name) 或 None.
 
-    Phase 1: 在 <base>/.legacy/ 查. Phase 2 扩到 <base>/ 主目录.
-    支持两种传法:
-      - raw 名（foo.docx.md）→ 直接命中
-      - display 名（foo.docx）→ 尝试加 .md 后缀命中
+    查找顺序 (current 优先, 再 legacy):
+      1. <base>/<name> (raw)
+      2. <base>/<name>.md (display name → 加 .md)
+      3. <base>/.legacy/<name>
+      4. <base>/.legacy/<name>.md
     """
-    d = os.path.join(base, ".legacy")
-    if not os.path.isdir(d):
-        return None
-    # 原名直接命中
-    p = os.path.join(d, name)
-    if os.path.isfile(p):
-        return (p, "legacy", name)
-    # display name → 尝试加 .md 后缀
-    if not name.endswith(".md"):
-        p_md = os.path.join(d, name + ".md")
-        if os.path.isfile(p_md):
-            return (p_md, "legacy", name + ".md")
+    for subdir, source in (("", "current"), (".legacy", "legacy")):
+        d = os.path.join(base, subdir) if subdir else base
+        if not os.path.isdir(d):
+            continue
+        # 原名直接命中
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return (p, source, name)
+        # display name → 尝试加 .md 后缀
+        if not name.endswith(".md"):
+            p_md = os.path.join(d, name + ".md")
+            if os.path.isfile(p_md):
+                return (p_md, source, name + ".md")
     return None
 
 
@@ -193,41 +205,52 @@ async def grep_files(project_id: str, req: GrepReq):
     if req.scope == "project":
         _check_project_member(project_id, req.user_id)
 
-    legacy_dir = os.path.join(base, ".legacy")
-    if not os.path.isdir(legacy_dir):
-        return {"text": f"project {project_id} 暂无文件可 grep", "items": []}
-
     try:
         pattern = _re.compile(req.pattern, _re.IGNORECASE if req.ignore_case else 0)
     except _re.error as e:
         raise HTTPException(400, f"invalid regex pattern: {e}")
 
+    # 扫主目录 (current) + .legacy/; 跳过 hidden 子目录和二进制
+    scan_dirs = [base, os.path.join(base, ".legacy")]
     items: list[dict] = []
     files_scanned = 0
-    for name in sorted(os.listdir(legacy_dir)):
-        if name.startswith("."):
+    scanned_bases: set[str] = set()  # 防 current 和 legacy 同名文件重复扫
+
+    for d in scan_dirs:
+        if not os.path.isdir(d):
             continue
-        if len(items) >= req.max_hits:
-            break
-        full = os.path.join(legacy_dir, name)
-        if not os.path.isfile(full):
-            continue
-        files_scanned += 1
-        try:
-            with open(full, encoding="utf-8", errors="replace") as f:
-                for lineno, line in enumerate(f, 1):
-                    if pattern.search(line):
-                        snippet = line.rstrip("\n")[:180]
-                        items.append({
-                            "file": _display_name(name),
-                            "raw": name,
-                            "line": lineno,
-                            "snippet": snippet,
-                        })
-                        if len(items) >= req.max_hits:
-                            break
-        except Exception as e:
-            logging.warning(f"kb.grep: read {name} failed: {e}")
+        for name in sorted(os.listdir(d)):
+            if name.startswith("."):
+                continue
+            if len(items) >= req.max_hits:
+                break
+            full = os.path.join(d, name)
+            if not os.path.isfile(full):
+                continue
+            # 只扫 .md/.txt (避免 grep binary)
+            if not (name.endswith(".md") or name.endswith(".txt")):
+                continue
+            dn = _display_name(name)
+            # 已在 current 扫过的 display name, legacy 同名不重扫 (current 优先)
+            if dn in scanned_bases:
+                continue
+            scanned_bases.add(dn)
+            files_scanned += 1
+            try:
+                with open(full, encoding="utf-8", errors="replace") as f:
+                    for lineno, line in enumerate(f, 1):
+                        if pattern.search(line):
+                            snippet = line.rstrip("\n")[:180]
+                            items.append({
+                                "file": dn,
+                                "raw": name,
+                                "line": lineno,
+                                "snippet": snippet,
+                            })
+                            if len(items) >= req.max_hits:
+                                break
+            except Exception as e:
+                logging.warning(f"kb.grep: read {name} failed: {e}")
 
     if not items:
         return {
