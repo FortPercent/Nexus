@@ -4,11 +4,12 @@
 镜像创建在对应用户名下，确保 # 下拉可见。
 正文在聊天时由 Adapter 从 Letta 实时检索。
 """
+import json
 import logging
 import httpx
 import jwt
 
-from config import OPENWEBUI_URL, OPENWEBUI_ADMIN_EMAIL, OPENWEBUI_ADMIN_PASSWORD, OPENWEBUI_JWT_SECRET
+from config import OPENWEBUI_URL, OPENWEBUI_ADMIN_EMAIL, OPENWEBUI_ADMIN_PASSWORD, OPENWEBUI_JWT_SECRET, WEBUI_DB_PATH
 from db import get_db
 
 logger = logging.getLogger(__name__)
@@ -87,11 +88,18 @@ def mirror_file_for_user(letta_file_id, letta_folder_id, filename, scope, scope_
 
     knowledge_id = result.get("id", "")
 
-    # 直接改 Open WebUI SQLite，把 user_id 改成目标用户
+    # 直接改 Open WebUI SQLite:
+    #  1) user_id → 目标用户 (让 # 下拉按归属过滤能看到)
+    #  2) meta → {"scope", "project_slug"} (让 # 下拉按当前 chat 的 project 收敛)
+    # meta 字段是 # 下拉跨项目隔离的唯一权威, 缺它 biany 在 cpm 聊天里会看到 security 的 docx.
+    meta_json = json.dumps({"scope": scope, "project_slug": scope_id or ""})
     try:
         import sqlite3
-        conn = sqlite3.connect("/data/open-webui/webui.db", timeout=5)
-        conn.execute("UPDATE knowledge SET user_id = ? WHERE id = ?", (user_id, knowledge_id))
+        conn = sqlite3.connect(WEBUI_DB_PATH, timeout=5)
+        conn.execute(
+            "UPDATE knowledge SET user_id = ?, meta = ? WHERE id = ?",
+            (user_id, meta_json, knowledge_id),
+        )
         conn.commit()
         conn.close()
     except Exception as e:
@@ -133,7 +141,7 @@ def mirror_file(letta_file_id, letta_folder_id, filename, scope, scope_id="", ow
         elif scope == "org":
             # 组织文件：给所有用户
             import sqlite3
-            webui_conn = sqlite3.connect("/data/open-webui/webui.db", timeout=5)
+            webui_conn = sqlite3.connect(WEBUI_DB_PATH, timeout=5)
             webui_conn.row_factory = sqlite3.Row
             users = webui_conn.execute("SELECT id FROM user").fetchall()
             webui_conn.close()
@@ -255,7 +263,7 @@ def reconcile_mirrors():
         org = db.execute("SELECT org_folder_id FROM org_resources WHERE singleton = 1").fetchone()
         if org and org["org_folder_id"]:
             import sqlite3
-            webui_conn = sqlite3.connect("/data/open-webui/webui.db", timeout=5)
+            webui_conn = sqlite3.connect(WEBUI_DB_PATH, timeout=5)
             webui_conn.row_factory = sqlite3.Row
             all_users = [r["id"] for r in webui_conn.execute("SELECT id FROM user").fetchall()]
             webui_conn.close()

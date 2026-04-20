@@ -118,7 +118,7 @@ function Home({ go, user, projects }) {
               <Tag v={p.role}>{p.role}</Tag>
             </div>
           </div>
-          <p style={{fontSize:11,color:C.slateXL,margin:"0 0 10px",lineHeight:1.5}}>{p.desc||""}</p>
+          <p style={{fontSize:11,color:C.slateXL,margin:"0 0 10px",lineHeight:1.5,minHeight:"1.5em"}}>{p.desc || "\u00a0"}</p>
           {(p.todo_preview||[]).length>0 && <div onClick={goTodos} style={{marginBottom:10,padding:"7px 9px",background:"#FEF2F2",borderRadius:8,borderLeft:"2px solid #DC2626",cursor:"pointer",transition:"background 0.15s"}} onMouseEnter={e=>e.currentTarget.style.background="#FEE2E2"} onMouseLeave={e=>e.currentTarget.style.background="#FEF2F2"}>
             {p.todo_preview.map(t=><div key={t.id} style={{fontSize:11,color:"#7F1D1D",lineHeight:1.5,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>⚡ {t.title}</div>)}
             {p.todo_high_count > p.todo_preview.length && <div style={{fontSize:10,color:"#DC2626",marginTop:2,fontWeight:600}}>+{p.todo_high_count - p.todo_preview.length} 条高优</div>}
@@ -672,12 +672,119 @@ function NewProjectPage({ back, go }) {
 }
 
 // ===== APP =====
+// "我的 API 访问" 面板 (04-20 新增): 用户点 header 的 "API" 按钮弹出
+// 解决 "怎么拿 user_id 调 API" 的反复问题, 一键复制 + 现成 curl 示例
+// 敏感信息 (API key) 默认脱敏, 用户显式点"显示"才 reveal。
+// curl 示例用 $NEXUS_API_KEY 占位, 复制走就不会把真 key 留在聊天记录/截图里。
+function ApiPanel({ user, onClose }) {
+  const [copied, setCopied] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [showUid, setShowUid] = useState(false);
+  const copy = (text, label) => {
+    navigator.clipboard.writeText(text);
+    setCopied(label);
+    setTimeout(() => setCopied(""), 1500);
+  };
+  const firstProj = (user.projects && user.projects[0] && user.projects[0].id) || "ai-infra";
+  const apiKey = "teleai-adapter-key-2026";
+  const apiKeyMasked = apiKey.slice(0, 6) + "•".repeat(apiKey.length - 10) + apiKey.slice(-4);
+  // user_id 默认也脱敏 (UUID 格式: 8-4-4-4-12, 只留前 8 位, 后面打码)
+  const uidStr = (user.id || "");
+  const uidMasked = uidStr.length > 8 ? uidStr.slice(0, 8) + "-••••-••••-••••-••••••••••••" : uidStr;
+  const baseUrl = window.location.origin;
+  // curl 示例用环境变量占位, 不把真 key 写进可复制文本, 复制给别人也没泄露
+  const curlLetta = `# 先 export API key (仅一次, 不要发给别人):
+#   export NEXUS_API_KEY='你从本面板复制的 API key'
+
+curl -X POST ${baseUrl}/v1/chat/completions \\
+  -H "Authorization: Bearer $NEXUS_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "letta-${firstProj}",
+    "messages": [{"role":"user","content":"你好"}],
+    "user": "${user.id}",
+    "stream": false
+  }'`;
+  const curlQwen = `# 先 export API key:
+#   export NEXUS_API_KEY='你从本面板复制的 API key'
+
+curl -X POST ${baseUrl}/v1/chat/completions \\
+  -H "Authorization: Bearer $NEXUS_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "qwen-no-mem",
+    "messages": [{"role":"user","content":"你好"}],
+    "stream": false
+  }'`;
+  const row = (label, value, key) => (
+    <div style={{marginBottom:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5,height:18}}>
+        <div style={{fontSize:10,color:C.sand,fontWeight:700,letterSpacing:1,fontFamily:"var(--fn)"}}>{label}</div>
+        <span style={{fontSize:10,padding:"2px 6px",fontWeight:600,opacity:0}}>&nbsp;</span>
+      </div>
+      <div style={{display:"flex",gap:8,alignItems:"stretch"}}>
+        <code style={{flex:1,padding:"9px 12px",background:"#f3f4f6",borderRadius:8,fontSize:12,fontFamily:"var(--fn)",userSelect:"all",wordBreak:"break-all",lineHeight:1.5}}>{value}</code>
+        <Btn onClick={()=>copy(value,key)} v="primary" style={{whiteSpace:"nowrap"}}>{copied===key?"已复制 ✓":"复制"}</Btn>
+      </div>
+    </div>
+  );
+  // 敏感行工厂: 默认脱敏, 点"显示"才 reveal; 复制始终复制真值
+  const secretRow = (label, realValue, maskedValue, shown, toggle, copyKey, tag) => (
+    <div style={{marginBottom:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5,height:18}}>
+        <div style={{fontSize:10,color:C.sand,fontWeight:700,letterSpacing:1,fontFamily:"var(--fn)"}}>{label} {tag && <span style={{color:C.terra,fontWeight:600,marginLeft:4}}>{tag}</span>}</div>
+        <button onClick={toggle} style={{border:"none",background:"transparent",cursor:"pointer",fontSize:10,color:C.slateL,padding:"2px 6px",fontWeight:600}}>{shown?"隐藏":"显示"}</button>
+      </div>
+      <div style={{display:"flex",gap:8,alignItems:"stretch"}}>
+        <code style={{flex:1,padding:"9px 12px",background:"#f3f4f6",borderRadius:8,fontSize:12,fontFamily:"var(--fn)",userSelect:shown?"all":"none",wordBreak:"break-all",lineHeight:1.5,color:shown?C.slate:C.sand}}>
+          {shown ? realValue : maskedValue}
+        </code>
+        <Btn onClick={()=>copy(realValue,copyKey)} v="primary" style={{whiteSpace:"nowrap"}}>{copied===copyKey?"已复制 ✓":"复制"}</Btn>
+      </div>
+    </div>
+  );
+  const keyRow = secretRow("API KEY", apiKey, apiKeyMasked, showKey, ()=>setShowKey(!showKey), "key", "(敏感, 勿外传)");
+  const uidRow = secretRow("MY USER ID", uidStr, uidMasked, showUid, ()=>setShowUid(!showUid), "id", "(个人标识, 不建议截屏分享)");
+  const codeBlock = (label, code, key) => (
+    <div style={{marginBottom:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5}}>
+        <div style={{fontSize:10,color:C.sand,fontWeight:700,letterSpacing:1,fontFamily:"var(--fn)"}}>{label}</div>
+        <Btn onClick={()=>copy(code,key)} v="default" style={{fontSize:10,padding:"3px 10px"}}>{copied===key?"已复制 ✓":"复制"}</Btn>
+      </div>
+      <pre style={{padding:"10px 12px",background:"#f3f4f6",borderRadius:8,fontSize:11,fontFamily:"var(--fn)",overflowX:"auto",margin:0,whiteSpace:"pre",userSelect:"all",lineHeight:1.5,color:C.slate}}>{code}</pre>
+    </div>
+  );
+  return (
+    <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(17,24,39,0.45)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#fff",borderRadius:16,padding:"22px 26px",maxWidth:760,width:"100%",maxHeight:"88vh",overflow:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.3)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18,borderBottom:`1px solid ${C.bdrL}`,paddingBottom:12}}>
+          <div>
+            <div style={{fontSize:16,fontWeight:700,color:C.slate}}>🔑 我的 API 访问</div>
+            <div style={{fontSize:11,color:C.sand,marginTop:2}}>直接 copy 使用, 无需登录拿 JWT</div>
+          </div>
+          <button onClick={onClose} style={{border:"none",background:"none",cursor:"pointer",color:C.sand,fontSize:22,padding:0,width:28,height:28}}>×</button>
+        </div>
+        {uidRow}
+        {keyRow}
+        {row("BASE URL", baseUrl, "url")}
+        <div style={{height:1,background:C.bdrL,margin:"18px 0 14px"}}/>
+        {codeBlock(`CURL 示例 · letta-${firstProj} (有记忆, 需 user_id)`, curlLetta, "curl-letta")}
+        {codeBlock("CURL 示例 · qwen-no-mem (无记忆, 无需 user_id)", curlQwen, "curl-qwen")}
+        <div style={{marginTop:14,padding:"10px 12px",background:"#fef2f2",borderRadius:8,fontSize:11,color:"#991b1b",lineHeight:1.7,border:"1px solid #fecaca"}}>
+          <b>⚠️ 安全提示</b>：API key 是组织共享密钥，任何拿到它的人都能以"adapter 身份"调接口。<b>不要发聊天/截图/文档/Git 仓库</b>。curl 示例里已用 <code>$NEXUS_API_KEY</code> 占位，你 export 一次即可，分享命令时不会带上真 key。
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [page, setPage] = useState("home");
   const [arg, setArg] = useState(null);
   const [user, setUser] = useState(null);
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [showApi, setShowApi] = useState(false);
 
   const go = (p, a = null) => { setPage(p); setArg(a); if(p==="home") loadData(); };
 
@@ -706,11 +813,13 @@ function App() {
           <div style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer"}} onClick={()=>go("home")}><div style={{width:28,height:28,borderRadius:7,background:"#111827",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:12,fontWeight:700}}>T</div><div><div style={{fontSize:14,fontWeight:700,color:"#111827"}}>TeleAI Nexus</div><div style={{fontSize:10,color:"#9ca3af",fontWeight:500}}>知识管理</div></div></div>
           <div style={{display:"flex",alignItems:"center",gap:10}}>
             {user.is_org_admin ? <Btn onClick={()=>go("org")} style={{fontSize:11,padding:"5px 12px"}}>中国电信人工智能研究院</Btn> : <span style={{fontSize:11,padding:"5px 12px",background:C.warmBg,borderRadius:8,color:C.slateL}}>中国电信人工智能研究院</span>}
+            <Btn onClick={()=>setShowApi(true)} style={{fontSize:11,padding:"5px 12px"}}>🔑 API</Btn>
             <Av name={user.name||"?"} size={26}/>
             <span style={{fontSize:12,color:"#4b5563",fontWeight:500}}>{user.name||user.email}</span>
             <a href="/" style={{fontSize:11,color:"#059669",textDecoration:"none",fontWeight:600}}>← 返回聊天</a>
           </div>
         </div></Anim>
+        {showApi && <ApiPanel user={user} onClose={()=>setShowApi(false)}/>}
         {page === "home" && <Home go={go} user={user} projects={projects}/>}
         {page === "org" && <OrgPage back={()=>go("home")} user={user}/>}
         {page === "project" && <ProjPage pid={typeof arg==="string"?arg:arg?.pid} initialTab={typeof arg==="string"?null:arg?.tab} back={()=>go("home")} user={user}/>}

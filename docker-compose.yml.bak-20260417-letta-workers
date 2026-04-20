@@ -41,14 +41,6 @@ services:
     environment:
       - LETTA_PG_URI=postgresql://letta:${POSTGRES_PASSWORD}@letta-db:5432/letta
       - OLLAMA_BASE_URL=http://ollama:11434
-      - LETTA_UVICORN_WORKERS=4
-      # 让 Letta 进程内自定义工具能读到, 用于调 adapter /internal/* (L2 SQL tools)
-      - ADAPTER_API_KEY=${ADAPTER_API_KEY}
-    volumes:
-      # TeleAI patch：core_memory_append 加行级去重，见 letta-patches/core_tool_executor.py
-      - ./letta-patches/core_tool_executor.py:/app/letta/services/tool_executor/core_tool_executor.py:ro
-      # TeleAI patch 2026-04-20: grep_files 在 file.content=None 时 skip (原 .encode() 直接 NoneType crash)
-      - ./letta-patches/files_tool_executor.py:/app/letta/services/tool_executor/files_tool_executor.py:ro
     depends_on:
       - letta-db
     restart: unless-stopped

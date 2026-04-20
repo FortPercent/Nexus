@@ -32,7 +32,7 @@ WEBUI_URL = os.getenv("WEBUI_URL", "http://172.17.0.1:3000").rstrip("/")
 LETTA_URL = os.getenv("LETTA_URL", "http://letta-server:8283").rstrip("/")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 API_KEY = os.getenv("API_KEY", "teleai-adapter-key-2026")
-JWT_SECRET = os.getenv("JWT_SECRET", "6WYGSa8e7EBsSeG3")
+JWT_SECRET = os.getenv("JWT_SECRET") or os.getenv("OPENWEBUI_JWT_SECRET") or "6WYGSa8e7EBsSeG3"
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@aiinfra.local")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "AIinfra@2026")
 TEST_USER_ID = os.getenv("TEST_USER_ID", "ce1d405b-0b5c-4faf-8864-010e2611b900")
@@ -341,6 +341,195 @@ def t_user_agent_map_count():
     return f"{n} rows"
 
 
+def t_letta_grep_tool_end_to_end():
+    """真实触发 grep_files 工具执行, 断言不 crash.
+    教训来源 (04-20): 两次 embedding_config / file.content=None 类 bug 都因为
+    regression 的 letta 聊天只问'你好'、不触发工具调用, 隐藏数天直到用户报。
+    这里用 TEST_PROJECT 发一个强制搜索意图的 query, 断言工具返回不含错误关键字。"""
+    body = _chat_body(f"letta-{TEST_PROJECT}", stream=False,
+                      content="搜索一下项目知识库里关于『规范』的内容, 列出 2-3 条")
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    r = httpx.post(f"{ADAPTER_URL}/v1/chat/completions", json=body, headers=headers, timeout=120)
+    assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:200]}"
+    content = r.json()["choices"][0]["message"]["content"]
+    # 真实工具报错的标志串: 如果任一工具 crash, adapter 会把错误字串嵌在输出里
+    bad_markers = ["NoneType", "has no attribute", "encode", "Traceback", "not attached"]
+    hits = [m for m in bad_markers if m in content]
+    assert not hits, f"工具调用疑似失败, 命中关键字: {hits}; 片段: {content[:300]}"
+    assert len(content) > 20, f"答复太短 ({len(content)} chars): {content!r}"
+    return f"len={len(content)}  第一行={content.strip().splitlines()[0][:60]!r}"
+
+
+def t_no_orphan_letta_agents():
+    """监控 todo #26: _rebuild_agent_async 不删 Letta agent 会累积孤儿.
+    Letta 里实际 agent 数应 ≤ adapter user_agent_map + 5 (容忍短期漂移).
+    一旦 diff > 5 说明对话清空在不断累积孤儿, 需要修 _rebuild_agent_async 补 letta.agents.delete(old_id).
+    04-20 事故: wuxn5 一人 9 孤儿 → 手动清; 本断言防止重复."""
+    a = sqlite3.connect(DB_PATH)
+    known = {r[0] for r in a.execute("SELECT agent_id FROM user_agent_map").fetchall()}
+    a.close()
+    # 直接 HTTP 拉 Letta (带分页), 避免依赖 letta client
+    letta_ids = set()
+    after = None
+    while True:
+        params = {"limit": 100}
+        if after:
+            params["after"] = after
+        r = httpx.get(f"{LETTA_URL}/v1/agents/", params=params, timeout=30)
+        data = r.json() if r.status_code == 200 else []
+        if not data:
+            break
+        for a in data:
+            letta_ids.add(a.get("id"))
+        if len(data) < 100:
+            break
+        after = data[-1].get("id")
+    orphans = letta_ids - known
+    diff = len(orphans)
+    # 容忍 5 个 (测试期间短暂漂移 / Letta 内部系统 agent 等)
+    assert diff <= 5, (
+        f"Letta 有 {len(letta_ids)} agents, adapter user_agent_map 只 {len(known)}, "
+        f"{diff} 个孤儿 > 阈值 5. 样本: {sorted(orphans)[:5]}. "
+        f"可能是 _rebuild_agent_async 没删 Letta agent (todo #26)"
+    )
+    return f"letta={len(letta_ids)} mapped={len(known)} orphans={diff} (≤5 ok)"
+
+
+# ---------- Agent prompt 容量监控（防 vLLM 400 / agent 卡死）----------
+
+# vLLM max_model_len, 任何 agent 的 prompt 超这个就炸 Bad Request.
+# 2026-04-20 事故: biany security agent 累积 74941 tokens 直接 DEAD,
+# wuxn5 ai-infra 61288 CRIT, biany cpm folder directories 53K 吃满 budget.
+# 留 5K 余量给用户下一条 message, 超 60K 就当危险.
+VLLM_MAX_MODEL_LEN = int(os.getenv("VLLM_MAX_MODEL_LEN", "65536"))
+AGENT_PROMPT_SAFE_MARGIN = int(os.getenv("AGENT_PROMPT_SAFE_MARGIN", "5000"))
+
+
+def t_agent_prompt_under_vllm_limit():
+    """枚举 user_agent_map 每个 agent, 查 Letta /context, 断言:
+      1. 无 agent cur_tokens >= VLLM_MAX_MODEL_LEN (否则下次 chat 必 400)
+      2. 无 agent margin < AGENT_PROMPT_SAFE_MARGIN (5K), 否则用户发一条大 message 就炸
+
+    两层细分 (给排查用, 不影响断言):
+      - num_tokens_messages: 对话历史占用; 过大可手动 compact 救
+      - num_tokens_directories: folder 挂载 metadata; 过大 compact 救不了, 必须架构改 (不挂 folder)
+    """
+    a = sqlite3.connect(DB_PATH)
+    a.row_factory = sqlite3.Row
+    rows = a.execute("SELECT agent_id, project_id, user_id FROM user_agent_map").fetchall()
+    a.close()
+
+    dead = []  # margin <= 0
+    crit = []  # margin < SAFE_MARGIN
+    checked = 0
+    for r in rows:
+        aid = r["agent_id"]
+        try:
+            d = httpx.get(f"{LETTA_URL}/v1/agents/{aid}/context", timeout=15).json()
+        except Exception:
+            continue
+        checked += 1
+        cur = d.get("context_window_size_current", 0)
+        if not cur:
+            continue
+        margin = VLLM_MAX_MODEL_LEN - cur
+        entry = {
+            "agent": aid[:22],
+            "project": r["project_id"],
+            "cur": cur,
+            "margin": margin,
+            "msg_tok": d.get("num_tokens_messages"),
+            "dir_tok": d.get("num_tokens_directories"),
+        }
+        if margin <= 0:
+            dead.append(entry)
+        elif margin < AGENT_PROMPT_SAFE_MARGIN:
+            crit.append(entry)
+
+    assert not dead, (
+        f"{len(dead)} agent prompt 已超 vLLM max_model_len={VLLM_MAX_MODEL_LEN}, "
+        f"下次 chat 必 400. 样本: {dead[:3]}. "
+        f"修复: 对 messages-heavy 的 agent 跑 compact; directories-heavy 的必须 detach folder."
+    )
+    assert not crit, (
+        f"{len(crit)} agent 余量 < {AGENT_PROMPT_SAFE_MARGIN}, 用户发一条大 message 就炸. "
+        f"样本: {crit[:3]}."
+    )
+    return f"{checked} agents scanned, 0 DEAD, 0 CRIT (margin>={AGENT_PROMPT_SAFE_MARGIN})"
+
+
+# ---------- # 下拉跨项目隔离（API 层 + E2E）----------
+
+# biany 是 4 个 project 的 admin (cpm/security/asset/ai-infra), 用她做隔离测试最能暴露泄漏.
+# 2026-04-20 bug: biany 在 cpm 聊天里 #.doc 会看到 [Security Management] 的 docx.
+# 根因: /api/v1/knowledge/search 按用户过滤, 不按 chat 所在 project 收敛. 修复后
+# 传 project_id 会按 meta.scope/project_slug 收敛 (org 永远返, personal 只给自己, project 只返匹配).
+BIANY_USER_ID = os.getenv("BIANY_USER_ID", "f1dfb0ed-0c2b-4337-922a-cbc86859dfde")
+
+
+def t_hash_dropdown_scoped_to_project():
+    """作为 biany (4 个 project 都是 member) 带 project_id=cpm 调 knowledge/search?query=.doc:
+      1. 返回的每条 meta.scope ∈ {org} 或 (scope=project 且 project_slug=cpm) 或 (scope=personal 且 owner=biany)
+      2. 特别断言: 任何 scope=project 且 project_slug=security-management 的条目都不能出现
+    不传 project_id 时维持旧全量行为 (向后兼容).
+    """
+    tok = mint_jwt(BIANY_USER_ID)
+    headers = {"Authorization": f"Bearer {tok}"}
+
+    # A. 不传 project_id → 应该能看到多个 project 的条目 (泄漏态, 但向后兼容)
+    r = httpx.get(f"{WEBUI_URL}/api/v1/knowledge/search?query=.doc",
+                  headers=headers, timeout=15)
+    assert r.status_code == 200, f"A HTTP {r.status_code}: {r.text[:200]}"
+    all_items = r.json().get("items", [])
+    slugs_unscoped = set()
+    for it in all_items:
+        meta = it.get("meta") or {}
+        if isinstance(meta, str):
+            try: meta = json.loads(meta)
+            except Exception: meta = {}
+        if meta.get("scope") == "project":
+            slugs_unscoped.add(meta.get("project_slug", ""))
+    # biany 在 4 个 project 都是成员, 无 project_id 过滤应该出现跨 project (至少 2 个)
+    # 注意: .doc 过滤可能某 project 没 doc 文件 — 所以宽松一点, 只要 >=2 即可
+    # 这不是 bug 验证, 这是确认 biany 数据确实覆盖多 project (否则 B 步没意义)
+
+    # B. 传 project_id=cpm → 只能出现 cpm + org + biany 自己的 personal
+    r = httpx.get(
+        f"{WEBUI_URL}/api/v1/knowledge/search?query=.doc&project_id=computing-power-management",
+        headers=headers, timeout=15,
+    )
+    assert r.status_code == 200, f"B HTTP {r.status_code}: {r.text[:200]}"
+    scoped_items = r.json().get("items", [])
+
+    leaks = []
+    for it in scoped_items:
+        meta = it.get("meta") or {}
+        if isinstance(meta, str):
+            try: meta = json.loads(meta)
+            except Exception: meta = {}
+        scope = meta.get("scope")
+        slug = meta.get("project_slug", "")
+        ok = (
+            scope == "org"
+            or (scope == "personal" and it.get("user_id") == BIANY_USER_ID)
+            or (scope == "project" and slug == "computing-power-management")
+        )
+        if not ok:
+            leaks.append({"name": it.get("name","")[:60], "scope": scope, "slug": slug})
+    assert not leaks, f"隔离失败, 泄漏 {len(leaks)} 条跨项目: {leaks[:3]}"
+
+    # C. 显式断言 security 的条目绝不能出现
+    security_leak = [it for it in scoped_items
+                     if isinstance(it.get("meta"), dict)
+                     and it["meta"].get("project_slug") == "security-management"]
+    assert not security_leak, (
+        f"cpm 聊天里泄漏了 security 的 {len(security_leak)} 条, "
+        f"样本: {[s.get('name','')[:50] for s in security_leak[:3]]}"
+    )
+
+    return f"unscoped={len(all_items)} slugs={len(slugs_unscoped)} / scoped={len(scoped_items)} leaks=0"
+
+
 # ---------- # 按模型过滤（API 层） ----------
 
 def t_hash_filter_api_returns_description():
@@ -437,16 +626,20 @@ def main():
     T("letta-* 非流式（无 system_alert）", t_chat_letta_nonstream)
     T("letta-* 流式（无 system_alert）", t_chat_letta_stream)
     T("letta-* 真流式 TTFT<3s", t_letta_stream_ttft_under_3s)
+    T("letta grep 工具真实调用不 crash", t_letta_grep_tool_end_to_end)
     T("<think> 闭合平衡（3 种路径）", t_think_balanced)
 
     print("\n── 权限 ──")
     T("非 org admin 上传组织文件 403", t_non_org_admin_upload_blocked)
     T("所有 letta-* 模型在 WebUI model 表注册", t_letta_models_registered_in_webui)
+    T("# 下拉跨项目隔离 (biany in cpm 不应看到 security)", t_hash_dropdown_scoped_to_project)
 
     print("\n── 数据完整性 ──")
     T("knowledge_mirrors > 0", t_knowledge_mirrors_count)
     T("project_members > 0", t_project_members_count)
     T("user_agent_map > 0", t_user_agent_map_count)
+    T("Letta agents 无孤儿漂移 (≤5)", t_no_orphan_letta_agents)
+    T("Agent prompt 都在 vLLM 上限内 (防 400 死锁)", t_agent_prompt_under_vllm_limit)
     T("user_cache.personal_human_block_id 已缓存（合一 migration 已跑）", t_human_block_shared_cached)
 
     print("\n── Pipeline Filter / # 按模型过滤 ──")

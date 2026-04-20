@@ -18,7 +18,16 @@ ZIP_MAX_DEPTH = 3
 ZIP_MAX_FILES = 50
 ZIP_MAX_UNCOMPRESSED = 200 * 1024 * 1024  # 200 MB
 
-PASSTHROUGH_EXTS = {"pdf", "txt", "md"}  # Letta 原生支持的；docx 需转 markdown（Letta 415）
+PASSTHROUGH_EXTS = {"pdf", "txt", "md", "png", "jpg", "jpeg"}  # Letta 原生接受的 blob
+
+_MIME_BY_EXT = {
+    "pdf": "application/pdf",
+    "txt": "text/plain",
+    "md": "text/markdown",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+}
 
 
 def _ext(filename: str) -> str:
@@ -157,6 +166,142 @@ def _docx_to_markdown(data: bytes) -> str:
     return "\n".join(out)
 
 
+def _pptx_to_markdown(data: bytes) -> str:
+    """pptx 用 python-pptx 抽文本: 每张 slide 的标题 + 文本 + 表格 + notes. 图片/SmartArt 忽略."""
+    try:
+        from pptx import Presentation
+    except ImportError:
+        raise HTTPException(500, "服务端未装 python-pptx")
+    prs = Presentation(io.BytesIO(data))
+    out = []
+    for idx, slide in enumerate(prs.slides, start=1):
+        out.append(f"## 📑 Slide {idx}")
+        # 先出标题 (如果 layout 有 title placeholder)
+        title_text = ""
+        try:
+            if slide.shapes.title and slide.shapes.title.has_text_frame:
+                title_text = slide.shapes.title.text_frame.text.strip()
+        except Exception:
+            pass
+        if title_text:
+            out.append(f"### {title_text}")
+        # 所有非 title 的文本框 + 表格
+        for shape in slide.shapes:
+            # skip title shape 已处理
+            if shape == getattr(slide.shapes, "title", None):
+                continue
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    text = (para.text or "").strip()
+                    if text:
+                        out.append(text)
+            elif shape.has_table:
+                tbl = shape.table
+                rows = list(tbl.rows)
+                if not rows:
+                    continue
+                header = [_fmt_cell(c.text) for c in rows[0].cells]
+                out.append("")
+                out.append("| " + " | ".join(header) + " |")
+                out.append("|" + "---|" * len(header))
+                for row in rows[1:]:
+                    cells = [_fmt_cell(c.text) for c in row.cells]
+                    while len(cells) < len(header):
+                        cells.append("")
+                    out.append("| " + " | ".join(cells[: len(header)]) + " |")
+                out.append("")
+        # 演讲者备注
+        try:
+            if slide.has_notes_slide:
+                notes = (slide.notes_slide.notes_text_frame.text or "").strip()
+                if notes:
+                    out.append(f"_演讲者备注: {notes}_")
+        except Exception:
+            pass
+        out.append("")
+    if not out or all(not line.strip() for line in out):
+        out.append("_(无可提取文本; 可能全是图片/SmartArt)_")
+    return "\n".join(out)
+
+
+# 全局 semaphore: 防并发 4 worker 同时跑 libreoffice 爆内存 (150MB × 4 = 600MB)
+# threading.Semaphore 是同步的, 用 threading.BoundedSemaphore 更稳 (release 过多会报错)
+import threading as _threading
+_LIBREOFFICE_SEM = _threading.BoundedSemaphore(2)  # 同一个 adapter 容器最多 2 并发
+
+
+def _cleanup_stale_lo_tempdirs():
+    """adapter 启动时清理 /tmp 下残留的 lo_* 目录 (上次转换崩溃 / kill -9 留的).
+    和 kill 任何残留 soffice 进程."""
+    import glob, shutil, subprocess as _sp
+    for d in glob.glob("/tmp/lo_*"):
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+    try:
+        _sp.run(["pkill", "-9", "-f", "soffice"], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def _convert_via_libreoffice(data: bytes, src_ext: str, to_ext: str) -> bytes:
+    """用 libreoffice headless 转老 Office 格式 → 新格式 bytes.
+    保护层:
+      1. BoundedSemaphore 限并发 2 (防 4 worker 全跑 libreoffice 打爆内存)
+      2. TemporaryDirectory 自动清临时文件
+      3. 60s 硬超时 + TimeoutExpired 时 kill 子进程组 (防 zombie)
+      4. 非 0 返回码 → 明确 400 而非 500
+    """
+    import subprocess
+    import tempfile
+    import signal
+
+    if not _LIBREOFFICE_SEM.acquire(timeout=30):
+        # 30s 排队超时: 当前并发满且排队超限, 明确拒绝不要堆积
+        raise HTTPException(503, "libreoffice 转换队列繁忙，请稍后重试")
+    try:
+        with tempfile.TemporaryDirectory(prefix="lo_") as tmpdir:
+            in_path = os.path.join(tmpdir, f"input.{src_ext}")
+            with open(in_path, "wb") as f:
+                f.write(data)
+            profile = f"file://{tmpdir}/profile"
+            cmd = [
+                "libreoffice",
+                f"-env:UserInstallation={profile}",
+                "--headless", "--nologo", "--nofirststartwizard",
+                "--convert-to", to_ext,
+                "--outdir", tmpdir,
+                in_path,
+            ]
+            # start_new_session=True 让子进程独立进程组, timeout kill 时可整组 killpg
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                # 整个 soffice 进程组一起 kill, 防 zombie
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+                logging.warning(f"libreoffice convert timeout src={src_ext}")
+                raise HTTPException(400, f"libreoffice 转换超时 (60s), 文件可能过大或损坏")
+            if proc.returncode != 0:
+                logging.warning(f"libreoffice convert failed rc={proc.returncode} stderr={stderr[:300]!r}")
+                raise HTTPException(400, f"libreoffice 转换失败 (rc={proc.returncode})")
+            out_path = os.path.join(tmpdir, f"input.{to_ext}")
+            if not os.path.exists(out_path):
+                raise HTTPException(400, "libreoffice 未生成输出文件")
+            with open(out_path, "rb") as f:
+                return f.read()
+    finally:
+        _LIBREOFFICE_SEM.release()
+
+
 def _csv_to_markdown(data: bytes) -> str:
     # 试多种编码
     text = None
@@ -222,9 +367,19 @@ def _process(filename: str, data: bytes, depth: int = 0, counter=None) -> List[P
     ext = _ext(filename)
 
     if ext in PASSTHROUGH_EXTS:
-        return [(filename, data, "application/octet-stream")]
+        return [(filename, data, _MIME_BY_EXT.get(ext, "application/octet-stream"))]
 
-    if ext == "xlsx" or ext == "xls":
+    if ext == "xls":
+        logging.info(f"LEGACY_OFFICE_CONVERT ext=.xls filename={filename}")
+        try:
+            xlsx_bytes = _convert_via_libreoffice(data, "xls", "xlsx")
+            md = _xlsx_to_markdown(xlsx_bytes)
+            return [(filename + ".md", md.encode("utf-8"), "text/markdown")]
+        except HTTPException as e:
+            logging.warning(f".xls convert fail: {filename}: {e.detail}")
+            raise
+
+    if ext == "xlsx":
         try:
             md = _xlsx_to_markdown(data)
         except Exception as e:
@@ -250,12 +405,39 @@ def _process(filename: str, data: bytes, depth: int = 0, counter=None) -> List[P
         return [(filename + ".md", md.encode("utf-8"), "text/markdown")]
 
     if ext == "doc":
-        raise HTTPException(400, ".doc 旧版格式暂不支持，请另存为 .docx 后上传")
+        logging.info(f"LEGACY_OFFICE_CONVERT ext=.doc filename={filename}")
+        try:
+            docx_bytes = _convert_via_libreoffice(data, "doc", "docx")
+            md = _docx_to_markdown(docx_bytes)
+            return [(filename + ".md", md.encode("utf-8"), "text/markdown")]
+        except HTTPException as e:
+            logging.warning(f".doc convert fail: {filename}: {e.detail}")
+            raise
+
+    if ext == "ppt":
+        logging.info(f"LEGACY_OFFICE_CONVERT ext=.ppt filename={filename}")
+        try:
+            pptx_bytes = _convert_via_libreoffice(data, "ppt", "pptx")
+            md = _pptx_to_markdown(pptx_bytes)
+            return [(filename + ".md", md.encode("utf-8"), "text/markdown")]
+        except HTTPException as e:
+            logging.warning(f".ppt convert fail: {filename}: {e.detail}")
+            raise
+
+    if ext == "pptx":
+        try:
+            md = _pptx_to_markdown(data)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logging.warning(f"pptx 提取失败 {filename}: {e}")
+            raise HTTPException(400, f"pptx 解析失败: {e}")
+        return [(filename + ".md", md.encode("utf-8"), "text/markdown")]
 
     if ext == "zip":
         return _unzip(data, filename, depth=depth, counter=counter)
 
-    raise HTTPException(400, f"不支持的文件类型: .{ext}（支持 pdf/docx/txt/md/xlsx/csv/zip）")
+    raise HTTPException(400, f"不支持的文件类型: .{ext}（支持 pdf/docx/txt/md/xlsx/csv/pptx/ppt/png/jpg/jpeg/zip）")
 
 
 def process_upload(filename: str, data: bytes) -> List[ProcessedFile]:

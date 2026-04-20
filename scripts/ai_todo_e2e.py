@@ -1,9 +1,9 @@
-import sys, sqlite3, httpx, jwt, time
+import os, sys, sqlite3, httpx, jwt, time
 from datetime import datetime, timedelta, timezone
 sys.path.insert(0, '/app')
 from routing import letta
 
-SECRET='6WYGSa8e7EBsSeG3'
+SECRET=os.getenv('OPENWEBUI_JWT_SECRET','6WYGSa8e7EBsSeG3')
 USER='ce1d405b-0b5c-4faf-8864-010e2611b900'
 ADMIN_BASE='http://localhost:8000/admin/api'
 CHAT_BASE='http://localhost:8000/v1'
@@ -29,6 +29,16 @@ c = sqlite3.connect('/data/serving/adapter/adapter.db')
 c.execute("DELETE FROM project_todos WHERE project_id='ai-infra' AND (source='ai' OR title LIKE 'TEST%')")
 c.commit()
 c.close()
+
+# 测试前清一次 wuxn5 的 ai-infra agent 对话历史，避免同 run_all 里前面 suite 污染
+# （AI 会根据 history 判断"已经建过 TODO 了"不再 suggest）
+try:
+    r = httpx.delete(f'{ADMIN_BASE}/personal/conversations/ai-infra', headers=H_ADMIN, timeout=60)
+    if r.status_code == 200:
+        print(f'[setup] cleared wuxn5 ai-infra conversation: new_agent={r.json().get("new_agent_id","")[:16]}...')
+        time.sleep(2)  # 让新 agent 稳定
+except Exception as e:
+    print(f'[setup] clear conversation warn: {e}')
 
 fails = 0
 def assert_eq(name, got, exp):

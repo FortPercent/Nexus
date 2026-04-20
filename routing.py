@@ -16,6 +16,15 @@ _suggest_todo_tool_id = None
 
 PERSONA_TEXT = (
     "你是 TeleAI Nexus 智能助手，服务于中国电信人工智能研究院。\n\n"
+    "【默认行为 — 每次对话都适用】\n"
+    "**只要用户的问题涉及具体事实 / 数据 / 文档内容 / 项目情况，你必须默认主动查当前 project 的知识库**，不要等用户说「查一下」或用「#」引用。流程：\n"
+    "- 结构化统计问题（多少件 / 按类别聚合等）→ 调 list_tables / describe_table / query_table（如已有表）\n"
+    "- 文档内容 / 条款 / 名称查找 → 调 semantic_search_files 或 grep_files\n"
+    "- 搜索范围**仅限当前 project folder**；不要主动跨到 personal / org 知识\n"
+    "**什么时候不查**：闲聊（你好、在吗、今天天气）、工具指令类（「提醒我 X」→ suggest_todo）、纯个人信息（「我是 X」→ memory_insert）\n\n"
+    "【用户显式 # 引用文件时】\n"
+    "如果 user message 里含 `=== 引用文档：文件名 ===` 这种前缀（adapter 已替你做完 passages 检索），"
+    "**必须优先基于这段引用内容回答**，不要再去搜其他文件；只有引用内容明显不足时才扩展搜索。\n\n"
     "【你能做什么 — 被问到相关问题时主动调用】\n"
     "- 项目 / 个人 / 组织文件都已索引在你的 archival memory 里：\n"
     "  用户问涉及项目数据、资产、论文、文档内容时，**先用 archival_memory_search 或 open_files 查**，不要直接说「我访问不了」或「请联系 IT」。项目成员上传的 Excel / PDF / Word 你都能搜到内容。\n"
@@ -27,7 +36,11 @@ PERSONA_TEXT = (
     "2. 项目决策/架构/版本/里程碑 → 调 suggest_project_knowledge\n"
     "   例：「项目用 vLLM」「v1.2 已发布」「架构改成 X」\n"
     "3. 个人身份/偏好 → 调 memory_insert 到 human block\n"
-    "   例：「我是 AI Infra 的吴煊佴」「我喜欢用 Python」\n\n"
+    "   例：「我是 AI Infra 的吴煊佴」「我喜欢用 Python」\n"
+    "4. **数量 / 合计 / 按类别统计 / 排名 / 平均值**（仅在 list_tables 返回了表时）→ 用 query_table 写一条 SELECT，不要用 grep_files\n"
+    "   例：「多少件固定资产」「每个部门多少台机器人」「金额排名 top 10」\n"
+    "   流程：list_tables → describe_table → query_table；SQL 方言是 DuckDB\n"
+    "   grep_files 只用于找文档原文，不用于统计\n\n"
     "【底线】\n"
     "同一条内容只调一次对应工具。不要声称「已记忆」而不真实调用。"
     "不要把「今天要做 X」之类写进 human block，那是 TODO。\n"
@@ -166,6 +179,14 @@ def get_or_create_agent(user_id: str, project: str) -> str:
         except Exception as e:
             logging.warning(f"failed to get suggest_todo tool: {e}")
 
+        # SQL 工具只在 project 已有结构化数据时挂，避免纯文档 agent 被 LLM 乱生 SQL
+        try:
+            from letta_sql_tools import should_attach_sql_tools, get_sql_tool_ids
+            if should_attach_sql_tools(project):
+                custom_tool_ids.extend(get_sql_tool_ids())
+        except Exception as e:
+            logging.warning(f"failed to attach SQL tools for project {project}: {e}")
+
         # 共享 human block（跨项目一份）先准备好，随 agent 创建一起 attach，
         # 这样 Letta 系统提示编译时能拿到 block value。
         human_block_id = get_or_create_personal_human_block(user_id)
@@ -186,12 +207,36 @@ def get_or_create_agent(user_id: str, project: str) -> str:
                 "model": "Qwen3.5-122B-A10B",
                 "model_endpoint_type": "openai",
                 "model_endpoint": VLLM_ENDPOINT,
-                "context_window": 32000,
+                # 临港 vLLM max_model_len=65536, 留 ~5K 余量给 tool/hidden overhead。
+                # 32000 太小: 安全规范类知识密集 project (50+ PDF) 的 system prompt
+                # 轻易超 32K, 实测 biany security-mgmt project system prompt 51K。
+                # 见 2026-04-20 context_window_overflow_in_system_prompt 事故
+                "context_window": 60000,
                 "enable_reasoner": True,
+            },
+            # embedding_config 必须显式传, 否则 Letta 会存成 None,
+            # 导致 semantic_search_files / grep_files 运行时报 "embedding_config must be specified"
+            # / "'NoneType' object has no attribute 'encode'"。见 2026-04-20 security-management
+            # 上 biany 遇到的三个工具同时挂。
+            embedding_config={
+                "embedding_model": "nomic-embed-text",
+                "embedding_endpoint_type": "openai",
+                "embedding_endpoint": "http://ollama:11434/v1",
+                "embedding_dim": 768,
+                "embedding_chunk_size": 300,
+                "batch_size": 32,
             },
         )
 
         _attach_agent_resources(db, agent.id, user_id, project)
+
+        # Letta bug workaround：agents.create 里 tool_ids=[...] 不会让工具进 system prompt，
+        # 必须显式 attach 一遍（见 scripts/migrate_ai_tools.py 同样做法）
+        for tid in custom_tool_ids:
+            try:
+                letta.agents.tools.attach(agent_id=agent.id, tool_id=tid)
+            except Exception as e:
+                logging.warning(f"attach tool {tid} to {agent.id}: {e}")
 
         db.execute(
             "INSERT INTO user_agent_map (user_id, project_id, agent_id) VALUES (?, ?, ?)",

@@ -1,8 +1,14 @@
 fastapi
 uvicorn
+gunicorn
+aiosqlite
 letta-client
 pyjwt
 python-multipart
 httpx
 openpyxl
 python-docx
+python-pptx
+duckdb
+pandas
+sqlglot

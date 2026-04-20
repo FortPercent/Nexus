@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import jwt as pyjwt
 
 BASE = os.getenv("ADAPTER_URL", "http://localhost:8000/admin/api")
-SECRET = os.getenv("JWT_SECRET", "6WYGSa8e7EBsSeG3")
+SECRET = os.getenv("JWT_SECRET") or os.getenv("OPENWEBUI_JWT_SECRET") or "6WYGSa8e7EBsSeG3"
 DB_PATH = os.getenv("DB_PATH", "/data/serving/adapter/adapter.db")
 
 # 已有的成员

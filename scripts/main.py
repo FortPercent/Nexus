@@ -5,7 +5,7 @@ import asyncio
 import logging
 import os
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -65,12 +65,6 @@ def startup():
         return
 
     logging.info(f"worker pid={os.getpid()} IS singleton leader, running startup singletons")
-    # 清 libreoffice 残留 (上次转换崩溃 / kill -9 留的 /tmp/lo_* + zombie soffice)
-    try:
-        from file_processor import _cleanup_stale_lo_tempdirs
-        _cleanup_stale_lo_tempdirs()
-    except Exception as e:
-        logging.warning(f"startup lo cleanup failed: {e}")
     try:
         get_or_create_org_resources()
         sync_org_resources_to_all_agents()
@@ -89,17 +83,8 @@ def startup():
 
 async def _reconcile_loop():
     """每 5 分钟全量对账，覆盖新注册用户和增量同步失败的情况"""
-    _iter = 0
     while True:
         await asyncio.sleep(300)
-        _iter += 1
-        # 每 12 次循环 = 1 小时做一次 libreoffice 残留清理
-        if _iter % 12 == 0:
-            try:
-                from file_processor import _cleanup_stale_lo_tempdirs
-                _cleanup_stale_lo_tempdirs()
-            except Exception as e:
-                logging.warning(f"periodic lo cleanup failed: {e}")
         try:
             reconcile_all()
         except Exception as e:
@@ -459,23 +444,6 @@ async def chat_completions(request: Request):
                         json=vllm_body,
                         headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
                     ) as resp:
-                        # P1-A (2026-04-20 审查补丁): 上游非 200 必须显式透传错误,
-                        # 不要只读 data: 行导致客户端看到空流.
-                        if resp.status_code != 200:
-                            err_body = await resp.aread()
-                            err_text = err_body.decode("utf-8", errors="replace")[:500]
-                            logging.warning(f"vLLM stream upstream {resp.status_code}: {err_text}")
-                            # 发一个标准 SSE error chunk + DONE 让客户端收到明确信号
-                            err_payload = {
-                                "error": {
-                                    "message": f"upstream vLLM returned {resp.status_code}: {err_text[:200]}",
-                                    "type": "upstream_error",
-                                    "code": resp.status_code,
-                                }
-                            }
-                            yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
-                            yield "data: [DONE]\n\n"
-                            return
                         async for line in resp.aiter_lines():
                             if not line or not line.startswith("data: "):
                                 continue
@@ -507,15 +475,6 @@ async def chat_completions(request: Request):
                     json=vllm_body,
                     headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
                 )
-                # P1-A (2026-04-20 审查补丁): 上游非 200 必须显式 raise,
-                # 不要伪装成 adapter 的 200 把错误藏掉.
-                if resp.status_code != 200:
-                    err_text = resp.text[:500]
-                    logging.warning(f"vLLM non-stream upstream {resp.status_code}: {err_text}")
-                    raise HTTPException(
-                        resp.status_code,
-                        f"upstream vLLM returned {resp.status_code}: {err_text[:200]}",
-                    )
                 data = resp.json()
                 # 非流式：把 reasoning 转成 <think> 标签拼入 content
                 try:
@@ -593,6 +552,3 @@ app.include_router(admin_router)
 
 from sql_endpoints import router as sql_router
 app.include_router(sql_router)
-
-from responses_endpoints import router as responses_router
-app.include_router(responses_router)

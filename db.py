@@ -1,8 +1,15 @@
-"""SQLite 数据库初始化和连接"""
+"""SQLite 数据库初始化和连接。
+
+sync `use_db()` 用于 startup / 非 async 脚本（init_db、migrate 脚本等）。
+async `use_db_async()` 用于 FastAPI async 路由，避免同步 I/O 阻塞 event loop。
+两者共享同一个 DB_PATH，底层都是 SQLite 文件。
+"""
 import sqlite3
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 from config import DB_PATH
+
+import aiosqlite
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
@@ -13,7 +20,8 @@ def get_db() -> sqlite3.Connection:
 
 @contextmanager
 def use_db():
-    """Context manager：自动关闭连接，异常时 rollback"""
+    """同步 context manager：用于 init_db / 启动钩子 / 非 async 脚本。
+    异常时 rollback；commit 在 __exit__ 自动做。"""
     conn = get_db()
     try:
         yield conn
@@ -24,7 +32,51 @@ def use_db():
     finally:
         conn.close()
 
+
+@asynccontextmanager
+async def use_db_async():
+    """异步 context manager：用于 FastAPI async 路由，不阻塞 event loop。
+    默认启用 WAL 模式 + 更大 cache，读写可并行。
+    用法：
+        async with use_db_async() as db:
+            async with db.execute("SELECT ...") as cur:
+                rows = await cur.fetchall()
+    """
+    conn = await aiosqlite.connect(DB_PATH)
+    conn.row_factory = aiosqlite.Row
+    # WAL 模式让读不阻塞写，大幅提升并发读性能
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA synchronous=NORMAL")
+    await conn.execute("PRAGMA cache_size=-20000")  # 20MB page cache
+    try:
+        yield conn
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.close()
+
+
+# 同步版也启 WAL（init_db 里全局启一次就够了，后续连接继承）
+_wal_enabled = False
+
+
+def _ensure_wal():
+    global _wal_enabled
+    if _wal_enabled:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.commit()
+    finally:
+        conn.close()
+    _wal_enabled = True
+
 def init_db():
+    _ensure_wal()
     db = get_db()
 
     db.execute("""
