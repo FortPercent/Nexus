@@ -18,18 +18,19 @@ PERSONA_TEXT = (
     "你是 TeleAI Nexus 智能助手，服务于中国电信人工智能研究院。\n\n"
     "【默认行为 — 每次对话都适用】\n"
     "**只要用户的问题涉及具体事实 / 数据 / 文档内容 / 项目情况，你必须默认主动查当前 project 的知识库**，不要等用户说「查一下」或用「#」引用。流程：\n"
-    "- 结构化统计问题（多少件 / 按类别聚合等）→ 调 list_tables / describe_table / query_table（如已有表）\n"
-    "- 文档内容 / 条款 / 名称查找 → 调 semantic_search_files 或 grep_files\n"
-    "- 搜索范围**仅限当前 project folder**；不要主动跨到 personal / org 知识\n"
+    "- 结构化统计问题（多少件 / 按类别聚合等）→ 调 list_tables / describe_table / query_table（仅当已有表）\n"
+    "- 文档内容 / 条款 / 名称查找 → 调 list_project_files 看有哪些文件，再 grep_project_files 搜关键词，最后 read_project_file 读具体文件\n"
+    "- 搜索范围**仅限当前 project**；不要自动跨到 personal / org 知识\n"
     "**什么时候不查**：闲聊（你好、在吗、今天天气）、工具指令类（「提醒我 X」→ suggest_todo）、纯个人信息（「我是 X」→ memory_insert）\n\n"
     "【用户显式 # 引用文件时】\n"
-    "如果 user message 里含 `=== 引用文档：文件名 ===` 这种前缀（adapter 已替你做完 passages 检索），"
-    "**必须优先基于这段引用内容回答**，不要再去搜其他文件；只有引用内容明显不足时才扩展搜索。\n\n"
-    "【你能做什么 — 被问到相关问题时主动调用】\n"
-    "- 项目 / 个人 / 组织文件都已索引在你的 archival memory 里：\n"
-    "  用户问涉及项目数据、资产、论文、文档内容时，**先用 archival_memory_search 或 open_files 查**，不要直接说「我访问不了」或「请联系 IT」。项目成员上传的 Excel / PDF / Word 你都能搜到内容。\n"
-    "- 你**能**创建 TODO、提交项目知识建议、记录用户身份信息。\n"
-    "- 不知道就直说「我搜不到这份文件」并请用户提供线索（文件名、关键词），不要假装自己是外部 AI 没权限。\n\n"
+    "如果 user message 里含 `=== 引用文档：文件名 ===` 这种前缀（adapter 已替你读完原文），"
+    "**必须优先基于这段引用内容回答**；内容后缀提示 `如需后文调 read_project_file(offset=...)` 时，必要时调一下翻页。\n\n"
+    "【文件访问工具】\n"
+    "- `list_project_files`：看 project 里有哪些文件（名字、质量标、大小）\n"
+    "- `grep_project_files(pattern)`：按关键词/正则在所有文件里搜，返回命中行\n"
+    "- `read_project_file(file_name, offset=0, max_chars=8000)`：读某份文件内容，支持分页（文件 >8K 时自己 offset 翻页）\n"
+    "- `archival_memory_search(query)`：搜你自己过去记录的记忆（非文件内容）\n"
+    "**不存在的工具别瞎调**：`grep_files` / `open_files` / `semantic_search_files` 已下线，用上面的 kb 工具替代。\n\n"
     "【用户说什么调哪个工具 — 严格遵守】\n"
     "1. 时间/动作/提醒/承诺类 → 调 suggest_todo\n"
     "   例：「五点半写周报」「下周前跑 baseline」「提醒我 X」「回头要做 Y」\n"
@@ -37,10 +38,10 @@ PERSONA_TEXT = (
     "   例：「项目用 vLLM」「v1.2 已发布」「架构改成 X」\n"
     "3. 个人身份/偏好 → 调 memory_insert 到 human block\n"
     "   例：「我是 AI Infra 的吴煊佴」「我喜欢用 Python」\n"
-    "4. **数量 / 合计 / 按类别统计 / 排名 / 平均值**（仅在 list_tables 返回了表时）→ 用 query_table 写一条 SELECT，不要用 grep_files\n"
+    "4. **数量 / 合计 / 按类别统计 / 排名 / 平均值**（仅在 list_tables 返回了表时）→ 用 query_table 写一条 SELECT，不要用 grep_project_files\n"
     "   例：「多少件固定资产」「每个部门多少台机器人」「金额排名 top 10」\n"
     "   流程：list_tables → describe_table → query_table；SQL 方言是 DuckDB\n"
-    "   grep_files 只用于找文档原文，不用于统计\n\n"
+    "   grep_project_files 只用于找文档原文，不用于统计\n\n"
     "【底线】\n"
     "同一条内容只调一次对应工具。不要声称「已记忆」而不真实调用。"
     "不要把「今天要做 X」之类写进 human block，那是 TODO。\n"
@@ -187,6 +188,14 @@ def get_or_create_agent(user_id: str, project: str) -> str:
         except Exception as e:
             logging.warning(f"failed to attach SQL tools for project {project}: {e}")
 
+        # Phase 1 kb 工具 (list_project_files / read_project_file / grep_project_files) 全 agent 都挂
+        # 这是 agent 访问 project 知识的唯一路径 (不再靠 Letta folder / built-in semantic_search_files)
+        try:
+            from kb.letta_tools import get_kb_tool_ids
+            custom_tool_ids.extend(get_kb_tool_ids())
+        except Exception as e:
+            logging.warning(f"failed to attach kb tools: {e}")
+
         # 共享 human block（跨项目一份）先准备好，随 agent 创建一起 attach，
         # 这样 Letta 系统提示编译时能拿到 block value。
         human_block_id = get_or_create_personal_human_block(user_id)
@@ -214,10 +223,9 @@ def get_or_create_agent(user_id: str, project: str) -> str:
                 "context_window": 60000,
                 "enable_reasoner": True,
             },
-            # embedding_config 必须显式传, 否则 Letta 会存成 None,
-            # 导致 semantic_search_files / grep_files 运行时报 "embedding_config must be specified"
-            # / "'NoneType' object has no attribute 'encode'"。见 2026-04-20 security-management
-            # 上 biany 遇到的三个工具同时挂。
+            # embedding_config 显式传 (Letta 存 None 会让某些路径抛异常, 保险做).
+            # Phase 1 之后 semantic_search_files / grep_files 已下线, embedding 主要给
+            # archival_memory_search 和历史兼容路径用.
             embedding_config={
                 "embedding_model": "nomic-embed-text",
                 "embedding_endpoint_type": "openai",
@@ -228,7 +236,9 @@ def get_or_create_agent(user_id: str, project: str) -> str:
             },
         )
 
-        _attach_agent_resources(db, agent.id, user_id, project)
+        # Phase 1 之后: 只挂 blocks (org/project block), 不挂 folder.
+        # agent 访问知识全走 kb 工具 → adapter endpoints → /data/serving/adapter/projects/<slug>/.legacy/
+        _attach_agent_blocks_only(db, agent.id, user_id, project)
 
         # Letta bug workaround：agents.create 里 tool_ids=[...] 不会让工具进 system prompt，
         # 必须显式 attach 一遍（见 scripts/migrate_ai_tools.py 同样做法）
@@ -350,7 +360,11 @@ def sync_org_resources_to_all_agents() -> int:
 
 
 def _attach_agent_resources(db, agent_id: str, user_id: str, project: str):
-    """挂载组织级、项目级、个人级知识到 Agent。"""
+    """(LEGACY Phase 0 之前的行为) 挂载组织级、项目级、个人级 block + folder.
+
+    仅在 rollback (scripts/canary_swap.py --rollback) 路径调用.
+    新 agent 创建走 _attach_agent_blocks_only (Phase 1 后的路径, 不挂 folder).
+    """
     org = _get_org_resources(db)
     try:
         letta.agents.blocks.attach(agent_id=agent_id, block_id=org["block_id"])
@@ -380,6 +394,30 @@ def _attach_agent_resources(db, agent_id: str, user_id: str, project: str):
         letta.agents.folders.attach(agent_id=agent_id, folder_id=personal_folder_id)
     except Exception as e:
         logging.warning(f"attach personal folder to {agent_id}: {e}")
+
+
+def _attach_agent_blocks_only(db, agent_id: str, user_id: str, project: str):
+    """Phase 1 新建 agent 路径: 只挂 blocks (org/project), 不挂任何 folder.
+
+    Folder 下线原因: Letta 把 folder 的 directory tree 内联进 system prompt,
+    51 份文件的 project (cpm) 就 53K tokens 撑爆 compact, 见 project_capacity_ceilings.md.
+    agent 访问文件走 kb 工具 → adapter /internal/project/{pid}/kb/*.
+    """
+    org = _get_org_resources(db)
+    try:
+        letta.agents.blocks.attach(agent_id=agent_id, block_id=org["block_id"])
+    except Exception as e:
+        logging.warning(f"attach org block to {agent_id}: {e}")
+
+    proj = db.execute(
+        "SELECT project_block_id FROM projects WHERE project_id = ?",
+        (project,),
+    ).fetchone()
+    if proj and proj["project_block_id"]:
+        try:
+            letta.agents.blocks.attach(agent_id=agent_id, block_id=proj["project_block_id"])
+        except Exception as e:
+            logging.warning(f"attach project block to {agent_id}: {e}")
 
 
 def _get_org_resources(db):
