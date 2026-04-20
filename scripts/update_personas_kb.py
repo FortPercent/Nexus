@@ -59,7 +59,7 @@ def main():
                 print(f"  [would_upd]  {pid:30s} {aid[-12:]}  old {len(current)} chars → new {len(PERSONA_TEXT)} chars")
                 continue
 
-            letta.blocks.modify(block_id=persona_block.id, value=PERSONA_TEXT)
+            letta.blocks.update(block_id=persona_block.id, value=PERSONA_TEXT)
             stats["updated"] += 1
             print(f"  [updated]    {pid:30s} {aid[-12:]}  {len(current)} → {len(PERSONA_TEXT)} chars")
         except Exception as e:
