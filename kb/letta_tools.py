@@ -16,6 +16,7 @@ from routing import letta
 
 _list_tool_id: str | None = None
 _read_tool_id: str | None = None
+_grep_tool_id: str | None = None
 
 
 def _get_list_files_tool_id() -> str:
@@ -144,6 +145,69 @@ def _get_read_tool_id() -> str:
     return _read_tool_id
 
 
+def _get_grep_tool_id() -> str:
+    global _grep_tool_id
+    if _grep_tool_id:
+        return _grep_tool_id
+
+    def grep_project_files(pattern: str, agent_state: "AgentState") -> str:
+        """Search for a regex/literal pattern across all knowledge files in the current project.
+
+        Use this when the user asks 'which document mentions X' or 'is there anywhere
+        it talks about Y'. Returns up to 20 hits grouped by file, each with line number
+        and a snippet. After finding hits, you can call read_project_file on the most
+        relevant file to see the full context.
+
+        Args:
+            pattern: The regex or literal string to search for. Case-insensitive by default.
+                e.g. "消防|火灾" or "DLP.*安装"
+
+        Returns:
+            Markdown of hits grouped by file, or a message saying no matches found.
+        """
+        import os
+        import urllib.request
+        import urllib.parse
+        import json as _json
+
+        project_id = agent_state.metadata.get("project", "")
+        user_id = agent_state.metadata.get("owner", "")
+        api_key = os.environ.get("ADAPTER_API_KEY", "")
+        if not project_id or not user_id or not api_key:
+            return "Tool misconfigured: missing project, user, or API key."
+
+        url = (
+            f"http://teleai-adapter:8000/internal/project/"
+            f"{urllib.parse.quote(project_id, safe='')}/kb/grep"
+        )
+        try:
+            body = _json.dumps({
+                "user_id": user_id,
+                "pattern": pattern,
+                "scope": "project",
+                "max_hits": 20,
+                "ignore_case": True,
+            }).encode()
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read().decode())
+            return data.get("text", "(no response text)")
+        except Exception as e:
+            return f"grep_project_files call failed: {e}"
+
+    tool = letta.tools.upsert_from_function(func=grep_project_files)
+    _grep_tool_id = tool.id
+    logging.info(f"kb grep_project_files tool: {tool.id}")
+    return _grep_tool_id
+
+
 def get_kb_tool_ids() -> list[str]:
-    """返回 [list_tool_id, read_tool_id]。首次调用注册，后续返回缓存。"""
-    return [_get_list_files_tool_id(), _get_read_tool_id()]
+    """返回 [list_tool_id, read_tool_id, grep_tool_id]。首次调用注册，后续返回缓存。"""
+    return [_get_list_files_tool_id(), _get_read_tool_id(), _get_grep_tool_id()]

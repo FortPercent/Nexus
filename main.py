@@ -540,11 +540,14 @@ async def chat_completions(request: Request):
 
     # 拦截 # 引用的 Letta 镜像文件
     # Open WebUI 会 pop 掉 files 做自己的 RAG，Pipeline Filter 提前备份到 _letta_files
+    # Phase 1 优先走盘上直读 (read_project_file 同款路径), 失败才 fallback 到老 passages.search
     ref_files = body.get("_letta_files", []) or body.get("files", [])
     if ref_files:
         logging.info(f"# ref: {json.dumps(ref_files, ensure_ascii=False, default=str)}")
     if ref_files and user_message:
         from knowledge_mirror import get_letta_file_id_by_knowledge
+        KB_ROOT = "/data/serving/adapter/projects"
+        MAX_REF_CHARS = 8000
         ref_context_parts = []
         for rf in ref_files:
             kid = rf.get("id") or rf.get("collection_name") or ""
@@ -554,9 +557,49 @@ async def chat_completions(request: Request):
             if not mirror:
                 continue
             file_name = mirror.get("display_name") or rf.get("name", kid)
+            scope = mirror.get("scope", "project")
+            scope_id = mirror.get("scope_id", "") or ""
+
+            # Phase 1 新路径: 从盘上读文件 (不依赖 Letta folder / passages)
+            kb_content = None
+            try:
+                if scope == "project":
+                    base = os.path.join(KB_ROOT, scope_id)
+                elif scope == "personal":
+                    base = os.path.join(KB_ROOT, ".personal", mirror.get("owner_id") or scope_id)
+                elif scope == "org":
+                    base = os.path.join(KB_ROOT, ".org")
+                else:
+                    base = None
+                if base:
+                    legacy_dir = os.path.join(base, ".legacy")
+                    # file_name 是 display name, 盘上多半带 .md 后缀
+                    candidates = [file_name]
+                    if not file_name.endswith(".md"):
+                        candidates.append(file_name + ".md")
+                    for cand in candidates:
+                        full_path = os.path.join(legacy_dir, cand)
+                        if os.path.isfile(full_path):
+                            with open(full_path, encoding="utf-8", errors="replace") as rfp:
+                                content = rfp.read()
+                            if len(content) > MAX_REF_CHARS:
+                                kb_content = content[:MAX_REF_CHARS] + (
+                                    f"\n...(原文共 {len(content)} 字, 已截前 {MAX_REF_CHARS} 字, "
+                                    f"如需后文可调 read_project_file(file_name=\"{cand}\", offset={MAX_REF_CHARS}))"
+                                )
+                            else:
+                                kb_content = content
+                            break
+            except Exception as e:
+                logging.warning(f"# ref kb read fallback: {e}")
+
+            if kb_content:
+                ref_context_parts.append(f"=== 引用文档：{file_name} ===\n{kb_content}")
+                continue
+
+            # 老 fallback: passages.search (folder 已 detach 时大概率返空, 但对未 backfill 的文件仍可能有效)
             letta_file_id = mirror["letta_file_id"]
             try:
-                # 按 source_id（即 letta_file_id）过滤搜索该文件的 passages
                 results = letta.agents.passages.search(
                     agent_id=agent_id, query=user_message, top_k=5,
                     source_id=letta_file_id,
@@ -567,8 +610,12 @@ async def chat_completions(request: Request):
                     continue
             except Exception:
                 pass
-            # passages API 不支持 source_id 过滤时，提示 Agent 按文件名搜索
-            ref_context_parts.append(f"[用户引用了文档「{file_name}」，请使用 archival memory search 搜索关键词「{file_name}」的相关内容来回答]")
+
+            # 两条路都失败：引导 agent 用 kb 工具
+            ref_context_parts.append(
+                f"[用户引用了文档「{file_name}」, 盘上和 passages 都没找到, "
+                f"请用 list_project_files 看看有没有名字近的文件再 read_project_file]"
+            )
         if ref_context_parts:
             context = "\n".join(ref_context_parts)
             user_message = f"{context}\n\n{user_message}"

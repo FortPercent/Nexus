@@ -209,5 +209,29 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 列已存在
 
+    # 知识层重构 Phase 1 新表: 目录即知识库的索引 (非真相源, 真相是盘上文件)
+    # source='legacy' = backfill 从 Letta file_contents.text 导的存量
+    # source='current' = Phase 2 后用户新上传, adapter 拦 WebUI Phase 2 落盘的
+    # quality='clean' / 'cid_dirty' (pdf 解析乱码) / 'legacy_dirty' 通用过渡态
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS project_files (
+            project_id    TEXT NOT NULL,
+            scope         TEXT NOT NULL,      -- 'project' / 'personal' / 'org'
+            scope_id      TEXT DEFAULT '',    -- personal 时是 user_id, 其他空
+            file_name     TEXT NOT NULL,      -- 盘上实际文件名 (可能带 .md 后缀)
+            display_name  TEXT NOT NULL,      -- UI / agent 看到的名字 (foo.docx.md → foo.docx)
+            source        TEXT NOT NULL,      -- 'legacy' / 'current'
+            quality       TEXT DEFAULT 'clean',
+            size_bytes    INTEGER DEFAULT 0,
+            webui_file_id TEXT DEFAULT '',    -- 新上传才有, 关联 webui.file.id
+            uploaded_by   TEXT DEFAULT '',
+            uploaded_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (project_id, scope, scope_id, file_name)
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_pfiles_project ON project_files(project_id, scope)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_pfiles_source ON project_files(source)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_pfiles_webui ON project_files(webui_file_id)")
+
     db.commit()
     db.close()

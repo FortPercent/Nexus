@@ -3,13 +3,13 @@
 路由: POST /internal/project/{project_id}/kb/{list-files,read}
 鉴权: Authorization: Bearer $ADAPTER_API_KEY
 
-PoC v0 约束（硬限）:
-  - scope 只接受 "project" (personal / org 留 Phase 1)
-  - read 只处理 .md / .txt / 无后缀 (on-the-fly 转换留 Phase 2)
-  - PoC 读 <slug>/.poc/.legacy/*  (namespace 隔离, 避免踩 Phase 1 生产路径)
-  - Phase 1+ 会改成读 <slug>/.legacy/ + <slug>/ 主目录, 本文件届时更新
-  - 显示名 = _display_name 规则 (foo.docx.md → foo.docx), 直接内联实现, 不 import admin_api
-  - PoC v0 不查 project_members 严格鉴权 (只靠 API key)
+Phase 1 约束:
+  - scope 支持 "project" / "personal" / "org" (personal 需要 user_id, 读对应用户目录)
+  - read 只处理 .md / .txt / 无后缀 (on-the-fly 转换 Phase 2 做)
+  - 读 <slug>/.legacy/* (生产路径, 已退掉 PoC 的 .poc/ 子 namespace)
+  - Phase 2 新上传会进 <slug>/ 主目录, 届时 list/read 合并两层
+  - 显示名 = _display_name 规则 (foo.docx.md → foo.docx), 内联, 不 import admin_api
+  - Phase 1 起查 project_members ACL (project scope), personal 限 owner
 """
 from __future__ import annotations
 
@@ -51,7 +51,25 @@ def _resolve_base(project_id: str, scope: str, user_id: str) -> str:
         raise HTTPException(400, f"unsafe project_id: {project_id!r}")
     if scope == "project":
         return os.path.join(KB_ROOT, project_id)
-    raise HTTPException(400, f"PoC v0 only supports scope='project', got: {scope}")
+    if scope == "personal":
+        if not user_id or "/" in user_id or ".." in user_id:
+            raise HTTPException(400, f"unsafe user_id: {user_id!r}")
+        return os.path.join(KB_ROOT, ".personal", user_id)
+    if scope == "org":
+        return os.path.join(KB_ROOT, ".org")
+    raise HTTPException(400, f"bad scope: {scope}")
+
+
+def _check_project_member(project_id: str, user_id: str) -> None:
+    """project scope ACL: user_id 必须是该 project 的成员."""
+    from db import use_db
+    with use_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM project_members WHERE user_id = ? AND project_id = ?",
+            (user_id, project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(403, f"user {user_id[:8]}... is not a member of project {project_id}")
 
 
 async def _require_api_key(authorization: Optional[str] = Header(None)) -> None:
@@ -72,6 +90,14 @@ class ReadReq(BaseModel):
     scope: str = "project"
     offset: int = 0
     max_chars: int = 8000
+
+
+class GrepReq(BaseModel):
+    user_id: str
+    pattern: str
+    scope: str = "project"
+    max_hits: int = 20
+    ignore_case: bool = True
 
 
 def _scan_dir(dirpath: str, source: str, cid_dirty: set[str]) -> list[dict]:
@@ -99,9 +125,11 @@ def _scan_dir(dirpath: str, source: str, cid_dirty: set[str]) -> list[dict]:
 @router.post("/list-files", dependencies=[Depends(_require_api_key)])
 async def list_files(project_id: str, req: ListFilesReq):
     base = _resolve_base(project_id, req.scope, req.user_id)
+    if req.scope == "project":
+        _check_project_member(project_id, req.user_id)
 
-    # PoC v0: 只读 <slug>/.poc/.legacy/, Phase 1 会扩到 <slug>/ 主目录 + <slug>/.legacy/
-    legacy_dir = os.path.join(base, ".poc", ".legacy")
+    # Phase 1: <slug>/.legacy/ (存量 backfill). Phase 2 再加 <slug>/ 主目录 (新上传)
+    legacy_dir = os.path.join(base, ".legacy")
     quality_file = os.path.join(legacy_dir, ".quality", "cid_dirty.list")
     cid_dirty: set[str] = set()
     if os.path.exists(quality_file):
@@ -131,12 +159,12 @@ async def list_files(project_id: str, req: ListFilesReq):
 def _find_file(base: str, name: str) -> Optional[tuple[str, str, str]]:
     """找文件: 返回 (path, source, raw_name) 或 None.
 
-    PoC v0: 只在 <base>/.poc/.legacy/ 查. Phase 1 扩到 <base>/ 主目录 + <base>/.legacy/.
+    Phase 1: 在 <base>/.legacy/ 查. Phase 2 扩到 <base>/ 主目录.
     支持两种传法:
       - raw 名（foo.docx.md）→ 直接命中
       - display 名（foo.docx）→ 尝试加 .md 后缀命中
     """
-    d = os.path.join(base, ".poc", ".legacy")
+    d = os.path.join(base, ".legacy")
     if not os.path.isdir(d):
         return None
     # 原名直接命中
@@ -151,9 +179,80 @@ def _find_file(base: str, name: str) -> Optional[tuple[str, str, str]]:
     return None
 
 
+import re as _re
+
+
+@router.post("/grep", dependencies=[Depends(_require_api_key)])
+async def grep_files(project_id: str, req: GrepReq):
+    """简易全文 grep — 在 <slug>/.legacy/ 所有文件里搜 pattern.
+
+    PoC 范围不追求 rg 的速度 (文件小, 纯 Python 正则 < 10ms/文件), 字面匹配 + 大小写默认忽略.
+    返回 max_hits 条命中, 每条 (file, line_no, line_snippet).
+    """
+    base = _resolve_base(project_id, req.scope, req.user_id)
+    if req.scope == "project":
+        _check_project_member(project_id, req.user_id)
+
+    legacy_dir = os.path.join(base, ".legacy")
+    if not os.path.isdir(legacy_dir):
+        return {"text": f"project {project_id} 暂无文件可 grep", "items": []}
+
+    try:
+        pattern = _re.compile(req.pattern, _re.IGNORECASE if req.ignore_case else 0)
+    except _re.error as e:
+        raise HTTPException(400, f"invalid regex pattern: {e}")
+
+    items: list[dict] = []
+    files_scanned = 0
+    for name in sorted(os.listdir(legacy_dir)):
+        if name.startswith("."):
+            continue
+        if len(items) >= req.max_hits:
+            break
+        full = os.path.join(legacy_dir, name)
+        if not os.path.isfile(full):
+            continue
+        files_scanned += 1
+        try:
+            with open(full, encoding="utf-8", errors="replace") as f:
+                for lineno, line in enumerate(f, 1):
+                    if pattern.search(line):
+                        snippet = line.rstrip("\n")[:180]
+                        items.append({
+                            "file": _display_name(name),
+                            "raw": name,
+                            "line": lineno,
+                            "snippet": snippet,
+                        })
+                        if len(items) >= req.max_hits:
+                            break
+        except Exception as e:
+            logging.warning(f"kb.grep: read {name} failed: {e}")
+
+    if not items:
+        return {
+            "text": f"在 {files_scanned} 个文件里没找到匹配 `{req.pattern}` 的内容。可以换关键词再试。",
+            "items": [],
+        }
+
+    md = f"## grep `{req.pattern}` 在 project {project_id} (命中 {len(items)} 条, 扫了 {files_scanned} 个文件)\n\n"
+    by_file: dict[str, list[dict]] = {}
+    for it in items:
+        by_file.setdefault(it["file"], []).append(it)
+    for fname, hits in by_file.items():
+        md += f"### {fname}\n"
+        for h in hits:
+            md += f"- L{h['line']}: `{h['snippet']}`\n"
+        md += "\n"
+
+    return {"text": md, "items": items, "files_scanned": files_scanned}
+
+
 @router.post("/read", dependencies=[Depends(_require_api_key)])
 async def read_file(project_id: str, req: ReadReq):
     base = _resolve_base(project_id, req.scope, req.user_id)
+    if req.scope == "project":
+        _check_project_member(project_id, req.user_id)
     name = _safe_filename(req.file_name)
 
     found = _find_file(base, name)
