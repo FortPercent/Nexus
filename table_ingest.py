@@ -77,6 +77,12 @@ def _ensure_meta(con) -> None:
         )
         """
     )
+    # Phase 3: 加 webui_file_id 列 (幂等). 老行 letta_file_id 保留过渡,
+    # 新 ingest 同时写两个, drop 支持双 key. Phase 4 再谈清老列.
+    try:
+        con.execute("ALTER TABLE __nexus_meta ADD COLUMN webui_file_id VARCHAR")
+    except Exception:
+        pass
 
 
 def _read_sheets(original_name: str, data: bytes) -> list[tuple[str, "pandas.DataFrame"]]:
