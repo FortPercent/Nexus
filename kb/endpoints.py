@@ -166,28 +166,34 @@ async def list_files(project_id: str, req: ListFilesReq):
     return {"text": md, "items": items}
 
 
+_TEXT_EXTS = ("", ".md", ".txt")
+
+
 def _find_file(base: str, name: str) -> Optional[tuple[str, str, str]]:
     """找文件: 返回 (path, source, raw_name) 或 None.
 
-    查找顺序 (current 优先, 再 legacy):
-      1. <base>/<name> (raw)
-      2. <base>/<name>.md (display name → 加 .md)
-      3. <base>/.legacy/<name>
-      4. <base>/.legacy/<name>.md
+    优先找**文本版本** (agent 读的是 .md 派生, 不是原 binary):
+      对于 current 和 legacy 两层各:
+        1. 如果 name 不以 .md 结尾, 先查 <name>.md (派生)
+        2. 查原名, 且只有原名本身是文本 ext (.md/.txt/无 ext) 才返回
+    这样对 pdf/docx 等 binary, 如果派生 .md 不在, 直接返回 None (endpoint 会 404);
+    不会误返 binary 再被 ext 校验挡到 415.
     """
     for subdir, source in (("", "current"), (".legacy", "legacy")):
         d = os.path.join(base, subdir) if subdir else base
         if not os.path.isdir(d):
             continue
-        # 原名直接命中
-        p = os.path.join(d, name)
-        if os.path.isfile(p):
-            return (p, source, name)
-        # display name → 尝试加 .md 后缀
+        # 派生优先
         if not name.endswith(".md"):
             p_md = os.path.join(d, name + ".md")
             if os.path.isfile(p_md):
                 return (p_md, source, name + ".md")
+        # 原名 (仅文本 ext)
+        ext = os.path.splitext(name)[1].lower()
+        if ext in _TEXT_EXTS:
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return (p, source, name)
     return None
 
 
