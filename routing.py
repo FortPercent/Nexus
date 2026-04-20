@@ -341,21 +341,16 @@ def sync_org_resources_to_all_agents() -> int:
     rows = db.execute("SELECT DISTINCT agent_id FROM user_agent_map").fetchall()
     db.close()
 
+    # Phase 1 后: 不再 attach org folder (agent 走 adapter kb 工具, 不依赖 Letta folder).
+    # 否则每次 adapter startup 跑这个函数, 会把 rollout_all 的 detach 全抵消掉.
+    # org folder 本身保留 (admin 后台用), 只是 agent 不挂.
     attached = 0
     for row in rows:
-        changed = False
         try:
             letta.agents.blocks.attach(agent_id=row["agent_id"], block_id=resources["block_id"])
-            changed = True
-        except Exception:
-            pass
-        try:
-            letta.agents.folders.attach(agent_id=row["agent_id"], folder_id=resources["folder_id"])
-            changed = True
-        except Exception:
-            pass
-        if changed:
             attached += 1
+        except Exception:
+            pass
     return attached
 
 
