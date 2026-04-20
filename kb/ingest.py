@@ -141,21 +141,50 @@ def ingest_webui_file(
     size_bytes = os.path.getsize(dst_bin)
 
     # 4. 生成 .md 派生 (让 agent 能读)
+    #    优先级: file_processor 转 (docx/xlsx/pptx/csv) → Letta pg file_contents.text (pdf 等透传格式) → skip
     dst_md = None
+    with open(src, "rb") as f:
+        data = f.read()
     try:
-        with open(src, "rb") as f:
-            data = f.read()
         from file_processor import process_upload
         processed = process_upload(original_name, data)
-        # process_upload returns [(new_name, content_bytes, mime), ...]
         if processed:
-            # 只取第一份 (多份情况是 zip 展开, 本函数暂不处理)
-            new_name, content_bytes, mime = processed[0]
-            dst_md = os.path.join(target_dir, new_name)
-            with open(dst_md, "wb") as f:
-                f.write(content_bytes)
+            first_name, first_content, first_mime = processed[0]
+            # file_processor 对透传格式 (pdf/txt/md/png) 会 echo binary, 这种情况不算派生
+            if first_mime == "text/x-markdown" and first_name != original_name:
+                dst_md = os.path.join(target_dir, first_name)
+                with open(dst_md, "wb") as f:
+                    f.write(first_content)
     except Exception as e:
-        logging.warning(f"ingest md derive failed for {original_name}: {e}")
+        logging.warning(f"ingest file_processor failed for {original_name}: {e}")
+
+    # Fallback: file_processor 没产出 md (典型 pdf 透传), 查 Letta pg file_contents.text
+    if dst_md is None:
+        try:
+            import psycopg2
+            pg = psycopg2.connect(
+                host="letta-db", dbname="letta", user="letta",
+                password=os.environ["POSTGRES_PASSWORD"],
+            )
+            pg_cur = pg.cursor()
+            # 按 original_file_name 最精确匹配 (Letta 里 biany 上传的 pdf original_file_name 就是原名)
+            pg_cur.execute("""
+                SELECT fc.text FROM file_contents fc
+                JOIN files f ON f.id = fc.file_id
+                WHERE f.original_file_name = %s
+                  AND NOT f.is_deleted
+                  AND LENGTH(COALESCE(fc.text, '')) > 0
+                LIMIT 1
+            """, (original_name,))
+            row = pg_cur.fetchone()
+            pg.close()
+            if row and row[0]:
+                dst_md = os.path.join(target_dir, original_name + ".md")
+                with open(dst_md, "w", encoding="utf-8") as f:
+                    f.write(row[0])
+                logging.info(f"ingest: used Letta pg file_contents for {original_name}")
+        except Exception as e:
+            logging.warning(f"ingest pg fallback failed for {original_name}: {e}")
 
     # 5. 确定 project_id (对 project scope 就是 scope_id, 其他 scope 用 scope_id 做 project_id 字段值)
     project_id_for_row = scope_id if scope == "project" else scope_id
