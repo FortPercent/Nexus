@@ -596,3 +596,6 @@ app.include_router(sql_router)
 
 from responses_endpoints import router as responses_router
 app.include_router(responses_router)
+
+from kb.endpoints import router as kb_router
+app.include_router(kb_router)
