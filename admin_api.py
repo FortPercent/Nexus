@@ -2,7 +2,7 @@
 import asyncio
 import os
 import logging
-from fastapi import APIRouter, Request, UploadFile, HTTPException, File
+from fastapi import APIRouter, Request, UploadFile, HTTPException, File, Form
 
 import config
 from config import ORG_ADMIN_EMAILS
@@ -542,19 +542,30 @@ def _display_name(letta_name: str) -> str:
     return letta_name
 
 
-async def _process_and_upload(file, folder_id: str, scope: str, scope_id: str = "", owner_id: str = "", display_scope: str = "", project_id_for_size: str = None):
-    """读取上传文件 → file_processor 预处理 → 逐条上传到 Letta + mirror。
-    返回 [display_name, ...]（用户看到的名字，不带 .md 后缀）。"""
+async def _process_and_upload(
+    file, folder_id: str, scope: str, scope_id: str = "",
+    owner_id: str = "", display_scope: str = "", project_id_for_size: str = None,
+) -> list[dict]:
+    """读取上传文件 → file_processor 预处理 → 逐条上传到 Letta + mirror + 落盘层 + 索引.
+
+    **返回**: list of dict {letta_file_id, display_name, letta_name}.
+    调用方拿 display_name 给用户看, letta_file_id 可查 knowledge_mirrors 反推 per-user kid.
+
+    Phase 5 改动 (2026-04-21):
+      - 返回从 [str] 改成 [dict], 带出 letta_file_id 方便 Chat [+] 注入 # 引用
+      - 加盘层写入 projects/<slug>/<binary> + .md 派生, 写 project_files 行索引
+      - 盘写 / 索引失败不阻塞 Letta + mirror (老行为兼容)
+    """
     import io as _io
     from file_processor import process_upload
     import table_ingest
+    from kb.ingest import _target_dir, _insert_project_files_row
 
     data = await file.read()
     _check_folder_size_bytes(folder_id, len(data), project_id_for_size)
     processed = process_upload(file.filename, data)
 
     # 结构化入库只做顶层上传（非 zip 内嵌文件），且只对 project scope 入库。
-    # zip 展开后的文件 bytes 已在 file_processor 内部处理掉，这里不负责。
     do_ingest = (
         scope == "project"
         and scope_id
@@ -562,20 +573,42 @@ async def _process_and_upload(file, folder_id: str, scope: str, scope_id: str = 
         and len(processed) == 1  # 防御：理论上 xlsx/csv 只产出 1 个 md
     )
 
-    uploaded_names = []
+    # 盘层目标目录 (Phase 5)
+    # project → projects/<scope_id>/
+    # personal → projects/.personal/<owner_id>/
+    # org → projects/.org/
+    _kb_disk_scope_id = scope_id if scope == "project" else (owner_id if scope == "personal" else "")
+    _kb_dir = None
+    try:
+        _kb_dir = _target_dir(scope, _kb_disk_scope_id)
+        os.makedirs(_kb_dir, exist_ok=True)
+        # 原 binary 只写一次 (zip 展开情况下, 各 processed 文件单独写, binary 是 zip 本身也值得保留?
+        # 简化: 非 zip 才写 binary. zip 展开后每个 processed 的 content 也会独立写, 已足够)
+        if len(processed) == 1 or not file.filename.lower().endswith(".zip"):
+            bin_path = os.path.join(_kb_dir, file.filename)
+            with open(bin_path, "wb") as f:
+                f.write(data)
+    except Exception as e:
+        logging.warning(f"[kb-disk] binary write {file.filename}: {e}")
+        _kb_dir = None  # 盘层失败, 后续 .md 写入跳过
+
+    uploaded = []  # [{letta_file_id, display_name, letta_name}, ...]
+    project_id_for_row = scope_id if scope == "project" else scope_id  # project_files 列
+
     for letta_name, content, mime in processed:
         try:
-            uploaded = await letta_async.folders.files.upload(folder_id=folder_id, file=(letta_name, _io.BytesIO(content), mime))
+            up = await letta_async.folders.files.upload(folder_id=folder_id, file=(letta_name, _io.BytesIO(content), mime))
         except Exception as e:
             logging.warning(f"upload {letta_name} failed: {e}")
             continue
         disp = _display_name(letta_name)
-        fid = uploaded.id if hasattr(uploaded, "id") else None
+        fid = up.id if hasattr(up, "id") else None
         try:
             if fid:
                 mirror_file(fid, folder_id, disp, scope, scope_id, owner_id, display_scope)
         except Exception as e:
             logging.warning(f"mirror failed for {disp}: {e}")
+
         # D2 顺序：Letta upload 成功后再 ingest，用原始 bytes；失败不阻塞
         ingested = None
         if do_ingest and fid:
@@ -583,18 +616,36 @@ async def _process_and_upload(file, folder_id: str, scope: str, scope_id: str = 
                 ingested = await table_ingest.ingest_if_structured(scope_id, fid, file.filename, data)
             except Exception as e:
                 logging.warning(f"ingest_if_structured failed for {file.filename}: {e}")
-        # F1 (L2 M3 审查补丁)：ingest 成功且是 project 首次有表 → 对所有 agent 触发 attach.
-        # 优化: 后续上传时 agent 已 attached, 重复 attach 是 N_agent×3 次无效 Letta API 调用;
-        # 只在 first_ingest 时跑能把每次上传的 Letta API 调用数从 ~75 砍到 0 (25-agent project).
-        # reconcile loop 每 300s 兜底, 任何漂移也会被补上.
         if ingested and ingested.get("is_first_ingest"):
             try:
                 from letta_sql_tools import attach_sql_tools_for_project
                 await asyncio.to_thread(attach_sql_tools_for_project, scope_id)
             except Exception as e:
                 logging.warning(f"post-ingest attach for project {scope_id} failed: {e}")
-        uploaded_names.append(disp)
-    return uploaded_names
+
+        # Phase 5: 盘层 .md 派生 + project_files 索引 (失败只 log)
+        if _kb_dir:
+            try:
+                # letta_name 是 file_processor 输出名 (foo.xlsx 转出 foo.xlsx.md; pdf 透传 foo.pdf)
+                # 如果 letta_name 和 file.filename 不同 (= 派生了 .md), 单独把 .md 写盘
+                if letta_name != file.filename:
+                    with open(os.path.join(_kb_dir, letta_name), "wb") as f:
+                        f.write(content)
+                _insert_project_files_row(
+                    project_id=project_id_for_row,
+                    scope=scope,
+                    scope_id=(owner_id if scope == "personal" else ""),
+                    file_name=letta_name,
+                    display_name=disp,
+                    size_bytes=len(content),
+                    webui_file_id="",
+                    uploaded_by=owner_id,
+                )
+            except Exception as e:
+                logging.warning(f"[kb-disk] md/index {letta_name}: {e}")
+
+        uploaded.append({"letta_file_id": fid, "display_name": disp, "letta_name": letta_name})
+    return uploaded
 
 
 @router.get("/project/{project_id}/files")
@@ -616,12 +667,12 @@ async def upload_project_file(project_id: str, request: Request, file: UploadFil
             "SELECT project_folder_id, name FROM projects WHERE project_id = ?", (project_id,)
         ).fetchone()
     proj_name = row["name"] if row else ""
-    names = await _process_and_upload(
+    uploaded = await _process_and_upload(
         file, row["project_folder_id"],
         scope="project", scope_id=project_id, owner_id="",
         display_scope=proj_name, project_id_for_size=project_id,
     )
-    return {"status": "ok", "filename": file.filename, "uploaded": names}
+    return {"status": "ok", "filename": file.filename, "uploaded": [x["display_name"] for x in uploaded]}
 
 
 @router.delete("/project/{project_id}/files/{file_id}")
@@ -740,10 +791,10 @@ async def list_org_files(request: Request):
 async def upload_org_file(request: Request, file: UploadFile = File(...)):
     await require_org_admin(request)
     resources = get_or_create_org_resources()
-    names = await _process_and_upload(
+    uploaded = await _process_and_upload(
         file, resources["folder_id"], scope="org",
     )
-    return {"status": "ok", "filename": file.filename, "uploaded": names}
+    return {"status": "ok", "filename": file.filename, "uploaded": [x["display_name"] for x in uploaded]}
 
 
 @router.delete("/org/files/{file_id}")
@@ -773,10 +824,10 @@ async def list_personal_files(request: Request):
 async def upload_personal_file(request: Request, file: UploadFile = File(...)):
     user = await extract_user_from_admin(request)
     folder_id = get_or_create_personal_folder(user["id"])
-    names = await _process_and_upload(
+    uploaded = await _process_and_upload(
         file, folder_id, scope="personal", owner_id=user["id"],
     )
-    return {"status": "ok", "filename": file.filename, "uploaded": names}
+    return {"status": "ok", "filename": file.filename, "uploaded": [x["display_name"] for x in uploaded]}
 
 
 @router.delete("/personal/files/{file_id}")
@@ -789,6 +840,224 @@ async def delete_personal_file(file_id: str, request: Request):
     except Exception as e:
         logging.warning(f"unmirror failed for personal file {file_id}: {e}")
     return {"status": "ok"}
+
+
+# ===== 统一上传入口 (Phase 5 WebUI scope 弹窗 + Chat [+] 用) =====
+
+def _find_existing_in_letta_folder(folder_id: str, filename: str) -> list:
+    """Return Letta folder files whose original_file_name matches {filename, filename+'.md'}.
+    覆盖 xlsx/csv 转换后 Letta 存名带 .md 的场景."""
+    candidates = {filename, filename + ".md"}
+    files = letta.folders.files.list(folder_id=folder_id, limit=500)
+    items = list(getattr(files, "items", files) if hasattr(files, "items") else files)
+    return [f for f in items if getattr(f, "original_file_name", None) in candidates]
+
+
+def _get_existing_metadata(fid: str, scope: str, scope_id: str) -> dict:
+    """查 project_files 拿 uploaded_by / uploaded_at (可能查不到, 老数据没这一行)"""
+    project_id_col = scope_id if scope == "project" else scope_id
+    scope_id_col = scope_id if scope == "personal" else ""
+    with use_db() as db:
+        # project_files 按 (project_id, scope, scope_id, file_name) 主键, file_name 是 letta_name
+        # 但 file_name 可能是 foo.xlsx.md 而 fid 对应的 letta 名也是 foo.xlsx.md, 一致
+        # 这里用 display_name 也行, 先按 letta_file_id 反查 knowledge_mirrors 拿到 display_name
+        rows = db.execute(
+            "SELECT display_name FROM knowledge_mirrors WHERE letta_file_id = ? LIMIT 1",
+            (fid,),
+        ).fetchone()
+        if not rows:
+            return {}
+        # knowledge_mirrors 的 display_name 带 scope 前缀 ([AI Infra] foo.pdf), 剥一下
+        raw_display = rows["display_name"]
+        # Try multiple strip patterns
+        import re as _re
+        stripped = _re.sub(r"^\[[^\]]+\]\s*", "", raw_display)
+        # 查 project_files 看有没有索引
+        pf = db.execute(
+            "SELECT uploaded_by, uploaded_at, size_bytes FROM project_files "
+            "WHERE project_id=? AND scope=? AND COALESCE(scope_id,'')=? AND display_name=?",
+            (project_id_col, scope, scope_id_col, stripped),
+        ).fetchone()
+    meta = {"display_name": stripped}
+    if pf:
+        meta["uploaded_by"] = pf["uploaded_by"] or ""
+        meta["uploaded_at"] = pf["uploaded_at"] or ""
+        meta["size_bytes"] = pf["size_bytes"] or 0
+    return meta
+
+
+async def _atomic_replace_old(old_files: list, scope: str, scope_id: str, owner_id: str):
+    """新 upload 成功后调. 逐个删老 Letta file + unmirror + 删盘文件 + 删 project_files 行.
+    失败只 log, 不 raise (保留 best-effort 语义). 调用前 new 已就绪, 删老不成功最坏结果是
+    folder 里暂时有重复, 下次 replace 或手动清理收敛."""
+    from kb.ingest import _target_dir
+    _kb_dir = None
+    try:
+        _kb_dir = _target_dir(scope, scope_id if scope == "project" else (owner_id if scope == "personal" else ""))
+    except Exception:
+        pass
+
+    for old in old_files:
+        fid = getattr(old, "id", None)
+        letta_name = getattr(old, "original_file_name", None)
+        if not fid:
+            continue
+        # delete Letta file
+        try:
+            await letta_async.folders.files.delete(folder_id=old.source.folder_id if hasattr(old, "source") else None, file_id=fid)
+        except Exception as e:
+            # Fallback: 老 API 路径可能用 folder_id 参数名不同, 试同步版本
+            try:
+                # 需要 folder_id; 从 knowledge_mirrors 查
+                with use_db() as db:
+                    row = db.execute("SELECT letta_folder_id FROM knowledge_mirrors WHERE letta_file_id=? LIMIT 1", (fid,)).fetchone()
+                if row:
+                    letta.folders.files.delete(folder_id=row["letta_folder_id"], file_id=fid)
+            except Exception as e2:
+                logging.warning(f"[replace] delete letta file {fid} failed: {e}, fallback also failed: {e2}")
+        # unmirror (清 knowledge_mirrors 行 + 对应 WebUI knowledge collections)
+        try:
+            unmirror_file(fid)
+        except Exception as e:
+            logging.warning(f"[replace] unmirror {fid} failed: {e}")
+        # 删 project_files 行 + 老盘文件
+        try:
+            project_id_col = scope_id if scope == "project" else scope_id
+            scope_id_col = scope_id if scope == "personal" else ""
+            with use_db() as db:
+                db.execute(
+                    "DELETE FROM project_files WHERE project_id=? AND scope=? AND COALESCE(scope_id,'')=? AND file_name=?",
+                    (project_id_col, scope, scope_id_col, letta_name or ""),
+                )
+                db.commit()
+        except Exception as e:
+            logging.warning(f"[replace] project_files row delete failed: {e}")
+        if _kb_dir and letta_name:
+            try:
+                old_path = os.path.join(_kb_dir, letta_name)
+                if os.path.isfile(old_path):
+                    os.remove(old_path)
+            except Exception as e:
+                logging.warning(f"[replace] disk delete {letta_name}: {e}")
+
+
+@router.post("/upload-with-scope")
+async def upload_with_scope(
+    request: Request,
+    file: UploadFile = File(...),
+    scope: str = Form(...),
+    scope_id: str = Form(""),
+    replace_existing: bool = Form(False),
+):
+    """统一上传入口 (Phase 5).
+
+    scope:
+      - "project" — 必须传 scope_id (project_id), 调用方必须是 project 成员
+      - "personal" — 忽略 scope_id, 落当前登录用户的 personal folder
+      - "org"     — 忽略 scope_id, 需要 org admin
+
+    replace_existing=false (默认): 同名文件存在 → 409 + 元数据, 让 UI 问用户
+    replace_existing=true: 同名文件先 upload 新的 → 再删老的 (best-effort)
+
+    返回:
+      - 200 {status, filename, uploaded, mirrors, scope, scope_id, replaced}
+      - 409 {status:"conflict", existing: {display_name, uploaded_by, uploaded_at, size_bytes}}
+    """
+    # 1. scope + 权限 + 目标 folder_id 路由
+    user_for_mirror_lookup = None
+    if scope == "project":
+        if not scope_id:
+            raise HTTPException(400, "scope=project 必须传 scope_id (project_id)")
+        user = await require_project_member(request, scope_id)
+        user_for_mirror_lookup = user["id"]
+        with use_db() as db:
+            row = db.execute(
+                "SELECT project_folder_id, name FROM projects WHERE project_id = ?", (scope_id,),
+            ).fetchone()
+        if not row:
+            raise HTTPException(404, f"project {scope_id} 不存在")
+        folder_id = row["project_folder_id"]
+        display_scope = row["name"] or ""
+        owner_id = ""
+        project_id_for_size = scope_id
+    elif scope == "personal":
+        user = await extract_user_from_admin(request)
+        user_for_mirror_lookup = user["id"]
+        folder_id = get_or_create_personal_folder(user["id"])
+        display_scope = ""
+        owner_id = user["id"]
+        project_id_for_size = None
+    elif scope == "org":
+        user = await require_org_admin(request)
+        user_for_mirror_lookup = user["id"]
+        resources = get_or_create_org_resources()
+        folder_id = resources["folder_id"]
+        display_scope = ""
+        owner_id = ""
+        project_id_for_size = None
+    else:
+        raise HTTPException(400, f"无效 scope '{scope}', 只接受 project/personal/org")
+
+    # 2. 冲突检测 (Letta folder 里是否已有 original_file_name 匹配的 file)
+    existing = _find_existing_in_letta_folder(folder_id, file.filename)
+    if existing and not replace_existing:
+        # 409 — UI 弹 "同名文件已存在, 替换 / 取消"
+        meta = _get_existing_metadata(existing[0].id, scope, scope_id)
+        raise HTTPException(409, detail={
+            "status": "conflict",
+            "existing": {
+                "display_name": meta.get("display_name") or file.filename,
+                "uploaded_by": meta.get("uploaded_by", ""),
+                "uploaded_at": meta.get("uploaded_at", ""),
+                "size_bytes": meta.get("size_bytes", 0),
+                "count": len(existing),
+            },
+        })
+
+    # 3. Upload new (走统一 _process_and_upload)
+    uploaded = await _process_and_upload(
+        file, folder_id,
+        scope=scope, scope_id=scope_id, owner_id=owner_id,
+        display_scope=display_scope, project_id_for_size=project_id_for_size,
+    )
+
+    # 4. replace 模式: 成功后删老的 (best-effort)
+    replaced = False
+    if existing and replace_existing:
+        # 不要删刚上传的 (new fid 不在 old_files 里, existing 是上传前 list 的快照)
+        new_fids = {x["letta_file_id"] for x in uploaded if x["letta_file_id"]}
+        to_delete = [f for f in existing if f.id not in new_fids]
+        if to_delete:
+            await _atomic_replace_old(to_delete, scope, scope_id, owner_id)
+            replaced = True
+
+    # 5. 查 per-user mirrors (for Chat [+] # 引用注入)
+    mirrors_out = []
+    if user_for_mirror_lookup:
+        fids = [x["letta_file_id"] for x in uploaded if x["letta_file_id"]]
+        if fids:
+            with use_db() as db:
+                placeholders = ",".join(["?"] * len(fids))
+                rows = db.execute(
+                    f"SELECT letta_file_id, knowledge_id, display_name "
+                    f"FROM knowledge_mirrors WHERE letta_file_id IN ({placeholders}) "
+                    f"AND for_user_id = ?",
+                    fids + [user_for_mirror_lookup],
+                ).fetchall()
+            mirrors_out = [
+                {"letta_file_id": r["letta_file_id"], "kid": r["knowledge_id"], "display_name": r["display_name"]}
+                for r in rows
+            ]
+
+    return {
+        "status": "ok",
+        "filename": file.filename,
+        "uploaded": [x["display_name"] for x in uploaded],
+        "mirrors": mirrors_out,
+        "scope": scope,
+        "scope_id": scope_id if scope == "project" else "",
+        "replaced": replaced,
+    }
 
 
 # ===== 批量文件 embedding 状态 —— 前端索引徽章用 =====
