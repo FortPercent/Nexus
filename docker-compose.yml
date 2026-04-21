@@ -49,6 +49,8 @@ services:
       - ./letta-patches/core_tool_executor.py:/app/letta/services/tool_executor/core_tool_executor.py:ro
       # TeleAI patch 2026-04-20: grep_files 在 file.content=None 时 skip (原 .encode() 直接 NoneType crash)
       - ./letta-patches/files_tool_executor.py:/app/letta/services/tool_executor/files_tool_executor.py:ro
+      # TeleAI patch 2026-04-21: pre-step compact for overfull agents (summarizer 只反应式触发 bug)
+      - ./letta-patches/letta_agent_v3.py:/app/letta/agents/letta_agent_v3.py:ro
     depends_on:
       - letta-db
     restart: unless-stopped
