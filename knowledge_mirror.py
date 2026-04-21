@@ -172,11 +172,17 @@ def unmirror_file(letta_file_id):
 
 
 def get_letta_file_id_by_knowledge(knowledge_id):
-    """通过 Knowledge Collection ID 反查 Letta 文件 ID"""
+    """通过 Knowledge Collection ID 反查 Letta 文件 ID + scope 元信息.
+
+    2026-04-21 bug fix: 补 owner_id 字段. main.py # ref resolver 对 personal scope
+    用 owner_id 构造 .personal/<uid>/ 路径. 之前漏返 → 路径缺 uid 子目录 → 永远
+    找不到个人文件.
+    """
     db = get_db()
     try:
         row = db.execute(
-            "SELECT letta_file_id, letta_folder_id, scope, scope_id, display_name FROM knowledge_mirrors WHERE knowledge_id = ?",
+            "SELECT letta_file_id, letta_folder_id, scope, scope_id, owner_id, display_name "
+            "FROM knowledge_mirrors WHERE knowledge_id = ?",
             (knowledge_id,),
         ).fetchone()
         if row:
@@ -185,6 +191,7 @@ def get_letta_file_id_by_knowledge(knowledge_id):
                 "letta_folder_id": row["letta_folder_id"],
                 "scope": row["scope"],
                 "scope_id": row["scope_id"],
+                "owner_id": row["owner_id"],
                 "display_name": row["display_name"],
             }
     finally:
