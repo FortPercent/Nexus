@@ -135,80 +135,8 @@ async def start_reconcile_loop():
 # ===== 聊天 API（在下方 /v1/models 之后定义）=====
 
 
-# Issue #2 (2026-04-21): # ref 去重缓存.
-# WebUI # chip 会跨消息保留, body.files 会带上历史 ref → adapter 每轮重复注入同内容.
-# 实测: 3 轮后 _letta_files 从 2 涨到 4, 老内容挤占当前 message 的 prompt 余量.
-# per-(agent_id, ref_id) TTL 1h, 同 session 内跳过重复. 用户想强制重注入的话改个新消息 / 重开 chat.
-# 跨 worker (gunicorn -w 4) 不全局一致, 可能偶尔漏一次 dedup, 无大害.
-import time as _time
-_ref_injection_cache: dict = {}
-_REF_INJECTION_TTL_SEC = 3600
-
-
-def _should_inject_ref(agent_id: str, ref_id: str) -> bool:
-    key = (agent_id, ref_id)
-    now = _time.time()
-    ts = _ref_injection_cache.get(key)
-    if ts and now - ts < _REF_INJECTION_TTL_SEC:
-        return False
-    # 机会性 prune 防 cache 无限涨
-    if len(_ref_injection_cache) > 5000:
-        expired = [k for k, t in _ref_injection_cache.items() if now - t > _REF_INJECTION_TTL_SEC]
-        for k in expired:
-            _ref_injection_cache.pop(k, None)
-    _ref_injection_cache[key] = now
-    return True
-
-
-def _load_chat_ref_context(chat_id: str, current_user_id: str, max_chars: int = 6000, max_messages: int = 10) -> str:
-    """读取 webui.db chat 表, 返回"[role] content"格式的历史对话字符串.
-
-    用于 Issue #1 修补: # 下拉选 type=chat 时之前静默丢弃, 现加载真实历史注入.
-
-    权限: 只允许读当前 user_id 自己的 chat, 防止跨用户窥视别人对话.
-    截断: 取最近 max_messages 条 + 字符数封顶 max_chars (从尾部保留, 砍开头).
-    """
-    import sqlite3 as _sqlite3
-    from config import WEBUI_DB_PATH
-    try:
-        c = _sqlite3.connect(WEBUI_DB_PATH, timeout=5)
-        row = c.execute(
-            "SELECT user_id, title, chat FROM chat WHERE id = ?",
-            (chat_id,),
-        ).fetchone()
-        c.close()
-    except Exception as e:
-        logging.warning(f"_load_chat_ref_context read {chat_id[:8]}: {e}")
-        return ""
-    if not row:
-        return ""
-    owner, _title, chat_json = row[0], row[1], row[2]
-    if owner != current_user_id:
-        logging.warning(
-            f"# ref chat {chat_id[:8]} owner={owner[:8]} != requester={current_user_id[:8]}, DENY"
-        )
-        return ""
-    try:
-        j = json.loads(chat_json or "{}")
-        messages = j.get("messages") or []
-    except Exception:
-        return ""
-    if not messages:
-        return ""
-    recent = messages[-max_messages:]
-    parts = []
-    for m in recent:
-        role = m.get("role", "?")
-        raw = m.get("content")
-        # content 可能是 str 或 list (多模态结构), 简单 str() 保险
-        content = str(raw).strip() if raw else ""
-        if not content:
-            continue
-        parts.append(f"[{role}]\n{content}")
-    combined = "\n\n".join(parts)
-    if len(combined) > max_chars:
-        combined = "(...历史更早内容已省略)\n\n" + combined[-max_chars:]
-    return combined
+# Issue #1 + #2 (2026-04-21): # ref 处理抽到 chat_ref.py 便于单元测试
+from chat_ref import _should_inject_ref, _load_chat_ref_context  # noqa: F401
 
 
 def _extract_letta_response(response) -> str:
