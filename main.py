@@ -741,8 +741,15 @@ async def chat_completions(request: Request):
                 f"请用 list_project_files 看看有没有名字近的文件再 read_project_file]"
             )
         if ref_context_parts:
+            # Issue #2 (2026-04-21): 用【本轮当前引用】块把所有本轮注入包起来, 让 agent 能区分
+            # 本轮新挂载 vs 老 in-context 里的历史引用. persona 里解释了这个标记.
             context = "\n".join(ref_context_parts)
-            user_message = f"{context}\n\n{user_message}"
+            user_message = (
+                "【本轮当前引用 开始】\n"
+                + context
+                + "\n【本轮当前引用 结束】\n\n"
+                + user_message
+            )
 
     if not user_message:
         return {"error": "No user message found"}
