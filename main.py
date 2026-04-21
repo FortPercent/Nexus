@@ -613,6 +613,10 @@ async def chat_completions(request: Request):
             scope_id = mirror.get("scope_id", "") or ""
 
             # Phase 1 新路径: 从盘上读文件 (不依赖 Letta folder / passages)
+            # 2026-04-21 bug fix: display_name 带 "[scope] " 前缀 (e.g. "[AI Infra] foo.pdf"),
+            # 盘文件无前缀; Phase 5a 新上传落到主目录 <base>/, 不是 .legacy/.
+            # 扩展: 剥前缀 + 双目录查 (主目录 + .legacy) + .md 派生名.
+            import re as _re
             kb_content = None
             try:
                 if scope == "project":
@@ -624,24 +628,36 @@ async def chat_completions(request: Request):
                 else:
                     base = None
                 if base:
-                    legacy_dir = os.path.join(base, ".legacy")
-                    # file_name 是 display name, 盘上多半带 .md 后缀
-                    candidates = [file_name]
-                    if not file_name.endswith(".md"):
-                        candidates.append(file_name + ".md")
-                    for cand in candidates:
-                        full_path = os.path.join(legacy_dir, cand)
-                        if os.path.isfile(full_path):
-                            with open(full_path, encoding="utf-8", errors="replace") as rfp:
-                                content = rfp.read()
-                            if len(content) > MAX_REF_CHARS:
-                                kb_content = content[:MAX_REF_CHARS] + (
-                                    f"\n...(原文共 {len(content)} 字, 已截前 {MAX_REF_CHARS} 字, "
-                                    f"如需后文可调 read_project_file(file_name=\"{cand}\", offset={MAX_REF_CHARS}))"
-                                )
-                            else:
-                                kb_content = content
+                    # 剥 display_name 的 "[XXX] " 前缀 → 真实盘文件名
+                    raw_name = _re.sub(r"^\[[^\]]+\]\s*", "", file_name)
+                    candidates_names = {file_name, raw_name}
+                    for n in list(candidates_names):
+                        if not n.endswith(".md"):
+                            candidates_names.add(n + ".md")
+                    # 两个目录都查: 主目录 (Phase 5a 新上传) + .legacy (backfill 老数据)
+                    search_dirs = [base, os.path.join(base, ".legacy")]
+                    found_path = None
+                    for d in search_dirs:
+                        for cand in candidates_names:
+                            p = os.path.join(d, cand)
+                            if os.path.isfile(p):
+                                found_path = p
+                                break
+                        if found_path:
                             break
+                    if found_path:
+                        with open(found_path, encoding="utf-8", errors="replace") as rfp:
+                            content = rfp.read()
+                        basename = os.path.basename(found_path)
+                        if len(content) > MAX_REF_CHARS:
+                            kb_content = content[:MAX_REF_CHARS] + (
+                                f"\n...(原文共 {len(content)} 字, 已截前 {MAX_REF_CHARS} 字, "
+                                f"如需后文可调 read_project_file(file_name=\"{basename}\", offset={MAX_REF_CHARS}))"
+                            )
+                        else:
+                            kb_content = content
+                    else:
+                        logging.info(f"# ref {file_name} not on disk (searched {search_dirs} for {candidates_names})")
             except Exception as e:
                 logging.warning(f"# ref kb read fallback: {e}")
 
