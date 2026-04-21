@@ -135,6 +135,57 @@ async def start_reconcile_loop():
 # ===== 聊天 API（在下方 /v1/models 之后定义）=====
 
 
+def _load_chat_ref_context(chat_id: str, current_user_id: str, max_chars: int = 6000, max_messages: int = 10) -> str:
+    """读取 webui.db chat 表, 返回"[role] content"格式的历史对话字符串.
+
+    用于 Issue #1 修补: # 下拉选 type=chat 时之前静默丢弃, 现加载真实历史注入.
+
+    权限: 只允许读当前 user_id 自己的 chat, 防止跨用户窥视别人对话.
+    截断: 取最近 max_messages 条 + 字符数封顶 max_chars (从尾部保留, 砍开头).
+    """
+    import sqlite3 as _sqlite3
+    from config import WEBUI_DB_PATH
+    try:
+        c = _sqlite3.connect(WEBUI_DB_PATH, timeout=5)
+        row = c.execute(
+            "SELECT user_id, title, chat FROM chat WHERE id = ?",
+            (chat_id,),
+        ).fetchone()
+        c.close()
+    except Exception as e:
+        logging.warning(f"_load_chat_ref_context read {chat_id[:8]}: {e}")
+        return ""
+    if not row:
+        return ""
+    owner, _title, chat_json = row[0], row[1], row[2]
+    if owner != current_user_id:
+        logging.warning(
+            f"# ref chat {chat_id[:8]} owner={owner[:8]} != requester={current_user_id[:8]}, DENY"
+        )
+        return ""
+    try:
+        j = json.loads(chat_json or "{}")
+        messages = j.get("messages") or []
+    except Exception:
+        return ""
+    if not messages:
+        return ""
+    recent = messages[-max_messages:]
+    parts = []
+    for m in recent:
+        role = m.get("role", "?")
+        raw = m.get("content")
+        # content 可能是 str 或 list (多模态结构), 简单 str() 保险
+        content = str(raw).strip() if raw else ""
+        if not content:
+            continue
+        parts.append(f"[{role}]\n{content}")
+    combined = "\n\n".join(parts)
+    if len(combined) > max_chars:
+        combined = "(...历史更早内容已省略)\n\n" + combined[-max_chars:]
+    return combined
+
+
 def _extract_letta_response(response) -> str:
     """从 Letta 响应提取：reasoning 包 <think>，工具调用/返回人话化，最后拼 assistant_message"""
     parts = []
@@ -565,6 +616,8 @@ async def chat_completions(request: Request):
     # 拦截 # 引用的 Letta 镜像文件
     # Open WebUI 会 pop 掉 files 做自己的 RAG，Pipeline Filter 提前备份到 _letta_files
     # Phase 1 优先走盘上直读 (read_project_file 同款路径), 失败才 fallback 到老 passages.search
+    # Issue #1 修补 (2026-04-21): 以前对 type="chat" 的引用静默丢弃 (UI 有 chip 模型不可见),
+    # 现加 handler 读 webui.db chat 表注入历史消息 (权限: 只能读当前 user 自己的 chat).
     ref_files = body.get("_letta_files", []) or body.get("files", [])
     if ref_files:
         logging.info(f"# ref: {json.dumps(ref_files, ensure_ascii=False, default=str)}")
@@ -574,11 +627,28 @@ async def chat_completions(request: Request):
         MAX_REF_CHARS = 8000
         ref_context_parts = []
         for rf in ref_files:
+            ref_type = (rf.get("type") or "").lower()  # "chat" / "collection" / "" (旧格式)
             kid = rf.get("id") or rf.get("collection_name") or ""
             if not kid:
                 continue
+
+            # Issue #1 新分支: chat 引用 → 读 webui.db 历史消息
+            if ref_type == "chat":
+                chat_ctx = _load_chat_ref_context(kid, user["id"])
+                if chat_ctx:
+                    title = rf.get("title") or rf.get("name") or f"chat-{kid[:8]}"
+                    ref_context_parts.append(f"=== 引用对话：{title} ===\n{chat_ctx}")
+                else:
+                    logging.info(f"# ref chat {kid[:8]} empty or no access, skip")
+                continue
+
             mirror = get_letta_file_id_by_knowledge(kid)
             if not mirror:
+                # 不是 chat 也不是已知 collection → 可能是用户自建 collection 或未知类型, log + skip
+                if ref_type and ref_type != "collection":
+                    logging.info(f"# ref unsupported type={ref_type} id={kid[:8]}, skip")
+                else:
+                    logging.info(f"# ref unknown kid {kid[:8]}, skip")
                 continue
             file_name = mirror.get("display_name") or rf.get("name", kid)
             scope = mirror.get("scope", "project")
