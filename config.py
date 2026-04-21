@@ -17,3 +17,9 @@ OPENWEBUI_ADMIN_PASSWORD = os.environ["OPENWEBUI_ADMIN_PASSWORD"]
 # vLLM 配置
 VLLM_ENDPOINT = os.environ["VLLM_ENDPOINT"]
 VLLM_API_KEY = os.environ["VLLM_API_KEY"]
+
+# Preflight compact 阈值 (见 docs/compact-preflight-v1-spec.md §2)
+# 安全余量: 和 regression t_agent_prompt_under_vllm_limit 的 5000 一致
+CTX_SAFE_MARGIN = int(os.getenv("CTX_SAFE_MARGIN", "5000"))
+# tool schema / letta 侧 system injection 的常数开销
+CTX_USER_MSG_OVERHEAD = int(os.getenv("CTX_USER_MSG_OVERHEAD", "500"))
