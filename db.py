@@ -156,19 +156,6 @@ def init_db():
         )
     """)
 
-    # Phase 5b (2026-04-21): user 新建 knowledge collection 时在 UI 选 scope, Svelte 调
-    # /admin/api/knowledge-mirror-register 写入本表. webui_hook.py 收到 nginx mirror 的
-    # /knowledge/{kid}/file/add 时先查 knowledge_mirrors, 未命中再 fallback 本表拿 scope.
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS knowledge_scope_registry (
-            knowledge_id TEXT PRIMARY KEY,
-            scope TEXT NOT NULL,
-            scope_id TEXT DEFAULT '',
-            owner_id TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    db.execute("CREATE INDEX IF NOT EXISTS idx_kscope_scope ON knowledge_scope_registry(scope, scope_id)")
 
     db.execute("""
         CREATE TABLE IF NOT EXISTS knowledge_suggestions (

@@ -56,39 +56,23 @@ async def webui_knowledge_add_hook(request: Request):
     if not webui_file_id:
         return {"status": "skip_no_file_id", "kid": kid}
 
-    # 反推 scope: 优先 knowledge_mirrors (adapter 主动镜像的 collection),
-    # fallback knowledge_scope_registry (Phase 5b: 用户 Svelte 新建 collection 时 register 的 scope)
-    scope = None
-    scope_id = ""
-    uploader = ""
+    # 反推 scope: 查 knowledge_mirrors (adapter 主动镜像的 collection)
     with use_db() as db:
         row = db.execute(
             "SELECT scope, scope_id, owner_id, for_user_id "
             "FROM knowledge_mirrors WHERE knowledge_id=? LIMIT 1",
             (kid,),
         ).fetchone()
-        if row:
-            scope = row["scope"]
-            if scope == "project":
-                scope_id = row["scope_id"] or ""
-            elif scope == "personal":
-                scope_id = row["owner_id"] or row["for_user_id"]
-            uploader = row["for_user_id"]
-        else:
-            reg = db.execute(
-                "SELECT scope, scope_id, owner_id FROM knowledge_scope_registry WHERE knowledge_id=? LIMIT 1",
-                (kid,),
-            ).fetchone()
-            if reg:
-                scope = reg["scope"]
-                if scope == "project":
-                    scope_id = reg["scope_id"] or ""
-                elif scope == "personal":
-                    scope_id = reg["owner_id"]
-                uploader = reg["owner_id"]
-    if not scope:
-        logging.info(f"[webui-hook] unknown kid {kid[:8]} (neither mirrors nor registry), skip")
+    if not row:
+        logging.info(f"[webui-hook] unknown kid {kid[:8]}, skip")
         return {"status": "skip_unknown_kid", "kid": kid}
+    scope = row["scope"]
+    scope_id = ""
+    if scope == "project":
+        scope_id = row["scope_id"] or ""
+    elif scope == "personal":
+        scope_id = row["owner_id"] or row["for_user_id"]
+    uploader = row["for_user_id"]
 
     asyncio.create_task(_do_ingest(webui_file_id, scope, scope_id, uploader))
     return {"status": "queued", "kid": kid, "scope": scope, "scope_id": scope_id}
