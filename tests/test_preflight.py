@@ -535,15 +535,43 @@ async def test_resolve_current_agent_keeps_preferred_when_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_resolve_current_agent_fallback_when_map_gone():
-    """map 行意外消失 → 用 preferred 兜底, 不抛."""
+async def test_resolve_current_agent_raises_when_map_gone():
+    """P2 (2026-04-21): map 行 gone → raise MapGoneError, 不再 fallback preferred.
+
+    理由: _rebuild_agent_async 是 DELETE map → delete agent → create new 的顺序,
+    map gone 是它的中间态. 如果 fallback preferred 会把消息发给已被删的 old agent.
+    改成 raise 让 main.py 返 503, 用户几秒后重试时 map 已稳.
+    """
+    from preflight import MapGoneError
+
     def mock_read(uid, pid):
         return None
 
     with patch.object(preflight, "_read_agent_id_from_map_sync", side_effect=mock_read):
-        final = await resolve_current_agent("u1", "p1", preferred_agent_id="agent-preferred")
+        with pytest.raises(MapGoneError, match="user_agent_map row missing"):
+            await resolve_current_agent("u1", "p1", preferred_agent_id="agent-preferred")
 
-    assert final == "agent-preferred"
+
+@pytest.mark.asyncio
+async def test_resolve_current_agent_raises_covers_clear_conversation_race():
+    """P2 verify: 模拟 clear_conversation 与 chat 并发中 map gone 窗口不会让消息
+    落到旧 agent. 场景:
+      - 请求 B 过 preflight fast-path, 拿 preferred='agent-old'
+      - 并发: admin_api _rebuild_agent_async 走到 DELETE map 这一步 → map=None
+      - B 调 resolve_current_agent → 应 raise, 上层会返 503
+      - 绝不返 'agent-old' (此时 old 可能马上被删)
+    """
+    from preflight import MapGoneError
+
+    # 模拟 admin 路径删了 map 但还没写新 map
+    map_state = {"current": None}
+
+    def mock_read(uid, pid):
+        return map_state["current"]
+
+    with patch.object(preflight, "_read_agent_id_from_map_sync", side_effect=mock_read):
+        with pytest.raises(MapGoneError):
+            await resolve_current_agent("u1", "p1", preferred_agent_id="agent-old")
 
 
 @pytest.mark.asyncio

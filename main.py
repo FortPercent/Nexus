@@ -715,7 +715,17 @@ async def chat_completions(request: Request):
     # v1.1.1 race 修补: forward 前再 re-read map, 防 fast-path 判 safe 后
     # 别 worker 立刻 rebuild 把 map 切走 — 仍往旧 agent 发消息导致会话分叉.
     # 10ms 残余窗口由旧 agent 延迟删除兜住.
-    agent_id = await resolve_current_agent(user["id"], project, agent_id)
+    # P2 (2026-04-21): map gone 时 raise MapGoneError, 不再 fallback 避开
+    # _rebuild_agent_async 中间态发给已删 agent.
+    try:
+        from preflight import MapGoneError
+        agent_id = await resolve_current_agent(user["id"], project, agent_id)
+    except MapGoneError as e:
+        logging.warning(f"[preflight] map gone mid-request {user['id'][:8]}/{project}: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="会话正在清理/重建, 请稍后重试",
+        )
 
     # 流式：调 Letta 的 streaming API 边收边转发
     if body.get("stream", False):

@@ -277,6 +277,13 @@ async def _atomic_rebuild(old_agent_id: str, user_id: str, project_id: str) -> s
     return winner_id
 
 
+class MapGoneError(RuntimeError):
+    """Raised by resolve_current_agent when user_agent_map row missing at forward time.
+    Typically means admin_api._rebuild_agent_async / clear-conversation is in mid-flight
+    (DELETE map → delete agent → create new). 若继续 fallback preferred 会发给已删
+    agent, 静默 404 / 数据漂. 让 main.py 捕获后返 503, 用户重试时 map 已稳定."""
+
+
 async def resolve_current_agent(user_id: str, project_id: str, preferred_agent_id: str) -> str:
     """Forward 前再 SELECT 一次 map, 把 fast-path 与 concurrent rebuild 之间的
     分叉窗口从 ~100ms 压到 ~10ms.
@@ -287,19 +294,22 @@ async def resolve_current_agent(user_id: str, project_id: str, preferred_agent_i
       3. B 回到 main.py, 在 forward Letta 之前调这个函数 re-verify
       4. 发现 map 已变, 采用 current (new), 不会再把消息发给 old
 
-    注意不能 100% 消灭 race: 在本函数返回后 → Letta HTTP 发出之间 (~10ms),
-    仍可能有 rebuild 发生. 旧 agent 延迟删除 (1h+ 宽限) 兜住这个残余窗口.
-    严格串行需要跨 worker advisory lock / generation fence, 挂 v2 todo.
+    map gone (P2 修补 2026-04-21): 原设计 fallback preferred_agent_id, 但 admin_api
+    的 _rebuild_agent_async 是"DELETE map → delete agent → create new", map gone 是它
+    中间态. fallback 会把消息发给已删 agent → 静默 404. 改成 raise MapGoneError, main.py
+    捕获后返 503, 用户重试 (几秒内 map 已稳定).
 
-    如果 map 行意外为空 (reconcile 扫到半成品状态, 极罕见), 返 preferred 兜底.
+    注意残余窗口: 本函数返回后 → Letta HTTP 发出之间 (~10ms), 仍可能有 rebuild 发生.
+    旧 agent 延迟删除 (1h+ 宽限) 兜住这个残余窗口. 严格串行需要跨 worker advisory
+    lock / generation fence, 挂 v2 todo.
     """
     current = await asyncio.to_thread(_read_agent_id_from_map_sync, user_id, project_id)
     if current is None:
         logging.warning(
-            f"[preflight] resolve_current_agent: map row gone for {user_id}/{project_id}, "
-            f"fallback to preferred {preferred_agent_id[-12:]}"
+            f"[preflight] resolve_current_agent: map row gone for {user_id}/{project_id} "
+            f"(clear-conversation in progress?), raising MapGoneError"
         )
-        return preferred_agent_id
+        raise MapGoneError(f"user_agent_map row missing for {user_id}/{project_id}")
     if current != preferred_agent_id:
         logging.info(
             f"[preflight] map shifted {preferred_agent_id[-12:]} → {current[-12:]} "
