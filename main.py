@@ -643,7 +643,7 @@ async def chat_completions(request: Request):
     # 见 docs/compact-preflight-v1-spec.md. user_message 此时已经展开 # 引用/附件,
     # 是最终发给 Letta 的 content.
     # v1.1: 不吞异常 — 明确失败 > 表面成功但会话裂开.
-    from preflight import preflight_compact
+    from preflight import preflight_compact, resolve_current_agent
     from fastapi import HTTPException
     notice_prefix = None
     try:
@@ -661,13 +661,18 @@ async def chat_completions(request: Request):
                 f"{agent_id[-12:]} ({pf.ctx_before} → {pf.ctx_after})"
             )
         else:
-            agent_id = pf.agent_id  # noop 可能 map 已被其他请求切, 用 preflight 读到的
+            agent_id = pf.agent_id
     except Exception as e:
         logging.error(f"[preflight] chat {user['id'][:8]}/{project} failed: {e}")
         raise HTTPException(
             status_code=503,
             detail=f"对话预处理失败 ({type(e).__name__}), 请稍后重试",
         )
+
+    # v1.1.1 race 修补: forward 前再 re-read map, 防 fast-path 判 safe 后
+    # 别 worker 立刻 rebuild 把 map 切走 — 仍往旧 agent 发消息导致会话分叉.
+    # 10ms 残余窗口由旧 agent 延迟删除兜住.
+    agent_id = await resolve_current_agent(user["id"], project, agent_id)
 
     # 流式：调 Letta 的 streaming API 边收边转发
     if body.get("stream", False):

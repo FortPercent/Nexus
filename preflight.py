@@ -275,3 +275,34 @@ async def _atomic_rebuild(old_agent_id: str, user_id: str, project_id: str) -> s
         f"using winner {winner_id[-12:]}"
     )
     return winner_id
+
+
+async def resolve_current_agent(user_id: str, project_id: str, preferred_agent_id: str) -> str:
+    """Forward 前再 SELECT 一次 map, 把 fast-path 与 concurrent rebuild 之间的
+    分叉窗口从 ~100ms 压到 ~10ms.
+
+    场景:
+      1. 请求 B 走 preflight fast path, 返 safe + agent_id = old
+      2. 请求 A 在别的 worker 同时 rebuild, map 切到 new
+      3. B 回到 main.py, 在 forward Letta 之前调这个函数 re-verify
+      4. 发现 map 已变, 采用 current (new), 不会再把消息发给 old
+
+    注意不能 100% 消灭 race: 在本函数返回后 → Letta HTTP 发出之间 (~10ms),
+    仍可能有 rebuild 发生. 旧 agent 延迟删除 (1h+ 宽限) 兜住这个残余窗口.
+    严格串行需要跨 worker advisory lock / generation fence, 挂 v2 todo.
+
+    如果 map 行意外为空 (reconcile 扫到半成品状态, 极罕见), 返 preferred 兜底.
+    """
+    current = await asyncio.to_thread(_read_agent_id_from_map_sync, user_id, project_id)
+    if current is None:
+        logging.warning(
+            f"[preflight] resolve_current_agent: map row gone for {user_id}/{project_id}, "
+            f"fallback to preferred {preferred_agent_id[-12:]}"
+        )
+        return preferred_agent_id
+    if current != preferred_agent_id:
+        logging.info(
+            f"[preflight] map shifted {preferred_agent_id[-12:]} → {current[-12:]} "
+            f"between preflight and forward (adopting current)"
+        )
+    return current

@@ -58,6 +58,7 @@ from preflight import (
     _estimate_user_tokens,
     _get_ctx_fresh,
     preflight_compact,
+    resolve_current_agent,
 )
 
 
@@ -502,6 +503,88 @@ async def test_get_ctx_fresh_http_error_propagates():
     with patch.object(preflight.httpx, "AsyncClient", return_value=fake_client):
         with pytest.raises(httpx.HTTPStatusError):
             await _get_ctx_fresh("agent-deleted")
+
+
+# ======================================================================
+# TestForwardTimeReverify — v1.1.1 fast-path + rebuild 不分叉
+# ======================================================================
+
+@pytest.mark.asyncio
+async def test_resolve_current_agent_uses_current_when_map_shifted():
+    """fast path 返 old; 之后 map 被别的请求切到 new; forward 前 re-read 采用 new."""
+    # resolve 只读 map, 不查 ctx
+    def mock_read(uid, pid):
+        return "agent-new"  # map 已被其他请求切换
+
+    with patch.object(preflight, "_read_agent_id_from_map_sync", side_effect=mock_read):
+        final = await resolve_current_agent("u1", "p1", preferred_agent_id="agent-old")
+
+    assert final == "agent-new"
+
+
+@pytest.mark.asyncio
+async def test_resolve_current_agent_keeps_preferred_when_unchanged():
+    """map 仍指 preferred → 直接用."""
+    def mock_read(uid, pid):
+        return "agent-x"
+
+    with patch.object(preflight, "_read_agent_id_from_map_sync", side_effect=mock_read):
+        final = await resolve_current_agent("u1", "p1", preferred_agent_id="agent-x")
+
+    assert final == "agent-x"
+
+
+@pytest.mark.asyncio
+async def test_resolve_current_agent_fallback_when_map_gone():
+    """map 行意外消失 → 用 preferred 兜底, 不抛."""
+    def mock_read(uid, pid):
+        return None
+
+    with patch.object(preflight, "_read_agent_id_from_map_sync", side_effect=mock_read):
+        final = await resolve_current_agent("u1", "p1", preferred_agent_id="agent-preferred")
+
+    assert final == "agent-preferred"
+
+
+@pytest.mark.asyncio
+async def test_fast_path_adopts_new_agent_after_concurrent_rebuild():
+    """**Finding 3 核心测试**: B fast-path safe 返 old; A 在别 worker 完成 rebuild
+    把 map 切到 new; B 的 main.py 层 resolve_current_agent 再 SELECT 一次 map,
+    采用 new. 最终两个请求 forward 到的 agent_id 相同 (= new).
+
+    用 deterministic sequence 模拟竞态 (asyncio.gather + mock 难精确交错,
+    改成: 先跑 B 的 preflight, 中间手动切 map 模拟 A 的 rebuild, 再跑 B 的
+    resolve_current_agent).
+    """
+    map_state = {"current": "agent-old"}
+
+    def mock_read(uid, pid):
+        return map_state["current"]
+
+    async def mock_ctx(aid):
+        # agent-old 此刻 safe (触发 fast path)
+        return ContextInfo(current=10000, window=60000)
+
+    with patch.object(preflight, "_read_agent_id_from_map_sync", side_effect=mock_read), \
+         patch.object(preflight, "_get_ctx_fresh", side_effect=mock_ctx):
+
+        # 阶段 1: B 的 preflight (fast path safe)
+        pf = await preflight_compact("u1", "p1", "hi B")
+        assert pf.action == "noop"
+        assert pf.agent_id == "agent-old", "fast-path 应该返 map 当前值"
+
+        # 阶段 2: 模拟别 worker 的 A 完成 rebuild, map 切到 new
+        # (整个过程发生在 B 的 preflight 返回后、forward 调用前的窗口里)
+        map_state["current"] = "agent-new"
+
+        # 阶段 3: B 的 main.py 在 forward 前 re-read map
+        final_aid = await resolve_current_agent("u1", "p1", pf.agent_id)
+
+    # **关键断言**: 即使 B fast-path 判的 safe 是对 old 做的, forward 时也用 new
+    assert final_aid == "agent-new", \
+        f"Finding 3 分叉! B 应该采纳 rebuild 后的 new agent, 实际 {final_aid}"
+    assert final_aid != pf.agent_id, \
+        "preflight 返的 agent_id 和 forward 实际用的不同, 说明 re-read 生效"
 
 
 if __name__ == "__main__":
