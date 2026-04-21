@@ -887,58 +887,36 @@ def _get_existing_metadata(fid: str, scope: str, scope_id: str) -> dict:
 
 
 async def _atomic_replace_old(old_files: list, scope: str, scope_id: str, owner_id: str):
-    """新 upload 成功后调. 逐个删老 Letta file + unmirror + 删盘文件 + 删 project_files 行.
-    失败只 log, 不 raise (保留 best-effort 语义). 调用前 new 已就绪, 删老不成功最坏结果是
-    folder 里暂时有重复, 下次 replace 或手动清理收敛."""
-    from kb.ingest import _target_dir
-    _kb_dir = None
-    try:
-        _kb_dir = _target_dir(scope, scope_id if scope == "project" else (owner_id if scope == "personal" else ""))
-    except Exception:
-        pass
+    """新 upload 成功后调. 只清 Letta folder 里老的 file + 老的 per-user mirrors.
 
+    关键: 不删盘文件, 不删 project_files 行 —— 因为新 upload 用的是同 filename,
+    盘路径相同被新文件覆盖; project_files PK (project_id, scope, scope_id, file_name)
+    被新 INSERT ON CONFLICT DO UPDATE 更新过, 没有"老行"可删.
+
+    失败只 log (best-effort). 失败最坏结果: Letta folder 留个重复 entry, 用户在
+    Knowledge UI 看到双份 - 下次 replace 或 reconcile 兜底清.
+    """
     for old in old_files:
         fid = getattr(old, "id", None)
-        letta_name = getattr(old, "original_file_name", None)
         if not fid:
             continue
-        # delete Letta file
+        # 删 Letta folder file (reuse knowledge_mirrors 查 folder_id, 因为 Letta Python
+        # SDK 的 FileMetadata.source 未必填 folder_id)
         try:
-            await letta_async.folders.files.delete(folder_id=old.source.folder_id if hasattr(old, "source") else None, file_id=fid)
+            with use_db() as db:
+                row = db.execute(
+                    "SELECT letta_folder_id FROM knowledge_mirrors WHERE letta_file_id=? LIMIT 1",
+                    (fid,),
+                ).fetchone()
+            if row:
+                letta.folders.files.delete(folder_id=row["letta_folder_id"], file_id=fid)
         except Exception as e:
-            # Fallback: 老 API 路径可能用 folder_id 参数名不同, 试同步版本
-            try:
-                # 需要 folder_id; 从 knowledge_mirrors 查
-                with use_db() as db:
-                    row = db.execute("SELECT letta_folder_id FROM knowledge_mirrors WHERE letta_file_id=? LIMIT 1", (fid,)).fetchone()
-                if row:
-                    letta.folders.files.delete(folder_id=row["letta_folder_id"], file_id=fid)
-            except Exception as e2:
-                logging.warning(f"[replace] delete letta file {fid} failed: {e}, fallback also failed: {e2}")
-        # unmirror (清 knowledge_mirrors 行 + 对应 WebUI knowledge collections)
+            logging.warning(f"[replace] delete letta file {fid} failed: {e}")
+        # unmirror: 清 knowledge_mirrors 行 + 对应所有 per-user WebUI knowledge collection
         try:
             unmirror_file(fid)
         except Exception as e:
             logging.warning(f"[replace] unmirror {fid} failed: {e}")
-        # 删 project_files 行 + 老盘文件
-        try:
-            project_id_col = scope_id if scope == "project" else scope_id
-            scope_id_col = scope_id if scope == "personal" else ""
-            with use_db() as db:
-                db.execute(
-                    "DELETE FROM project_files WHERE project_id=? AND scope=? AND COALESCE(scope_id,'')=? AND file_name=?",
-                    (project_id_col, scope, scope_id_col, letta_name or ""),
-                )
-                db.commit()
-        except Exception as e:
-            logging.warning(f"[replace] project_files row delete failed: {e}")
-        if _kb_dir and letta_name:
-            try:
-                old_path = os.path.join(_kb_dir, letta_name)
-                if os.path.isfile(old_path):
-                    os.remove(old_path)
-            except Exception as e:
-                logging.warning(f"[replace] disk delete {letta_name}: {e}")
 
 
 @router.post("/upload-with-scope")
