@@ -191,11 +191,13 @@ def _extract_letta_response(response) -> str:
     return header + assistant_content
 
 
-async def non_stream_response(agent_id: str, message: str, model: str):
+async def non_stream_response(agent_id: str, message: str, model: str, notice_prefix: str | None = None):
     response = letta.agents.messages.create(
         agent_id=agent_id, messages=[{"role": "user", "content": message}]
     )
     assistant_content = _extract_letta_response(response)
+    if notice_prefix:
+        assistant_content = f"{notice_prefix}\n\n{assistant_content}"
 
     return {
         "id": f"chatcmpl-{agent_id[:8]}",
@@ -281,8 +283,11 @@ def _assistant_delta_text(content) -> str:
     return ""
 
 
-async def stream_from_letta(agent_id: str, message: str, model: str):
-    """真流式：边调 Letta 边转发 token。reasoning 片段用 <think></think> 包裹。"""
+async def stream_from_letta(agent_id: str, message: str, model: str, notice_prefix: str | None = None):
+    """真流式：边调 Letta 边转发 token。reasoning 片段用 <think></think> 包裹。
+
+    notice_prefix: 若非空 (比如 preflight rebuild 后的 '对话已重置' 提示),
+    作为首个 SSE content chunk 发出, 再开始 Letta stream."""
     chunk_id = f"chatcmpl-{agent_id[:8]}"
 
     def _sse(delta: dict, finish_reason=None) -> str:
@@ -293,6 +298,9 @@ async def stream_from_letta(agent_id: str, message: str, model: str):
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         }
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    if notice_prefix:
+        yield _sse({"role": "assistant", "content": notice_prefix + "\n\n"})
 
     in_thinking = False
     # tool_call 是流式 delta：name 先来一次，args 分多片。聚合后在 tool_return 或 flush 时整体输出。
@@ -631,14 +639,37 @@ async def chat_completions(request: Request):
     if not user_message:
         return {"error": "No user message found"}
 
+    # Pre-flight compact: 在调 Letta 前预检上下文占用, 必要时 summarize 或 rebuild.
+    # 见 docs/compact-preflight-v1-spec.md. user_message 此时已经展开 # 引用/附件,
+    # 是最终发给 Letta 的 content.
+    from preflight import preflight_compact
+    notice_prefix = None
+    try:
+        pf = await preflight_compact(agent_id, user["id"], project, user_message)
+        if pf.rebuilt:
+            logging.info(
+                f"[preflight] chat {user['id'][:8]}/{project}: rebuilt "
+                f"{agent_id[-12:]} → {pf.agent_id[-12:]} ({pf.ctx_before} → 0)"
+            )
+            agent_id = pf.agent_id
+            notice_prefix = pf.user_msg
+        elif pf.action == "sync_summarized":
+            logging.info(
+                f"[preflight] chat {user['id'][:8]}/{project}: summarized "
+                f"{agent_id[-12:]} ({pf.ctx_before} → {pf.ctx_after})"
+            )
+    except Exception as e:
+        # pre-flight 自身挂了不应阻塞聊天, 记 warning 继续转发
+        logging.warning(f"[preflight] chat {user['id'][:8]}/{project}: skipped due to error: {e}")
+
     # 流式：调 Letta 的 streaming API 边收边转发
     if body.get("stream", False):
         return StreamingResponse(
-            stream_from_letta(agent_id, user_message, model),
+            stream_from_letta(agent_id, user_message, model, notice_prefix=notice_prefix),
             media_type="text/event-stream",
         )
     else:
-        return await non_stream_response(agent_id, user_message, model)
+        return await non_stream_response(agent_id, user_message, model, notice_prefix=notice_prefix)
 
 
 # ===== 挂载管理 API =====
