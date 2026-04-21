@@ -451,6 +451,14 @@ async def list_models(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    # 所有分支先验 API_KEY. 之前 qwen-no-mem 分支直接透传到 vLLM 没鉴权,
+    # 导致内网任何机器能免费刷 vLLM tokens (recon 2026-04-21 发现).
+    # letta-* 分支原本在 get_current_user 内也查 API_KEY, 这里提前是为了覆盖 qwen-no-mem.
+    _token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if _token != ADAPTER_API_KEY:
+        from fastapi import HTTPException
+        raise HTTPException(401, "Invalid API key")
+
     body = await request.json()
 
     model = body.get("model", "")
