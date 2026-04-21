@@ -1,108 +1,117 @@
-# Letta Summarizer 失效诊断（2026-04-21）
+# Letta Summarizer 失效诊断（2026-04-21, v2 修正版）
+
+> ⚠️ v1 诊断误以为 "proactive compaction 全被注释"——**错了**。实际 proactive 在 `letta_agent_v3.py:1439` 是活的，但依赖一个仅在 LLM 成功后才被设置的运行时变量，对已超限 agent 永远不触发。
 
 ## 现象
 - biany `asset-management` agent `num_tokens_current=71268`（>65K vLLM 上限），新消息必 400
-- 其他 28 agent 对话历史单调递增、不自动压缩（本次巡检 ai-infra-cache 达 50575 / 65K）
-- Letta `/v1/agents/{id}/summarize` 调用后生成 summary 但 messages 数不减
+- 其他 28 agent 对话历史单调递增、不自动压缩（本次巡检 ai-infra-cache 达 50575 tokens）
+- 手动 rebuild 才能救
 
 ## 根因（源码级）
 
 ### Letta 版本: 0.16.7
 实际聊天路径走 `LettaAgentV3`（确认来源：`server/rest_api/routers/v1/conversations.py:1061/1079` + `routers/v1/agents.py:2444`）
 
-### 关键发现 1: v3 **proactive compaction 全被注释**
+### Proactive compaction 活着，但触发条件有缺陷
 
-`/app/letta/agents/letta_agent_v3.py`:
-- **lines 368–382** — 原本"step 后检查 total_tokens > context_window × SUMMARIZATION_TRIGGER_MULTIPLIER 就触发"的预防性压缩，**整块注释**
-- **lines 628–638** — 原本"loop 结束后 safety-net rebuild context"的兜底压缩，**整块注释**
-
-意味着：**agent 步进过程中从不主动压缩**。只有在 LLM 请求抛 `ContextWindowExceededError` 后才反应式补救（line 1218 retry 分支）。
-
-### 关键发现 2: 反应式路径能触发但易失败
-
-`/app/letta/agents/letta_agent_v3.py:1218`:
+`letta_agent_v3.py:1439`:
 ```python
-except Exception as e:
-    if isinstance(e, ContextWindowExceededError) and llm_request_attempt < summarizer_settings.max_summarizer_retries:
-        summary_message, messages, summary_text = await self.compact(...)
-        await self._checkpoint_messages(new_messages=[summary_message], in_context_messages=messages)
-        continue
+if self.context_token_estimate is not None and self.context_token_estimate > compaction_trigger_threshold:
+    ...
+    summary_message, messages, summary_text = await self.compact(...)
+    await self._checkpoint_messages(...)
 ```
 
-vLLM 400 映射为 `ContextWindowExceededError` 的条件（`llm_api/error_utils.py:8`）：
+`compaction_trigger_threshold = get_compaction_trigger_threshold(llm_config)` 当前实现（`services/summarizer/thresholds.py`）：
 ```python
-return (
-    "exceeds the context window" in msg
-    or "This model's maximum context length is" in msg
-    or "maximum context length" in msg
-    or "context_length_exceeded" in msg
-    or ...
-)
+return int(llm_config.context_window * SUMMARIZATION_TRIGGER_MULTIPLIER)  # 0.9
+```
+对我们 Qwen 60000 ctx_window = **54000 阈值**。
+
+### 缺陷：`context_token_estimate` 何时被设置？
+
+`letta_agent_v3.py:129`：`self.context_token_estimate: int | None = None`（__init__）
+`letta_agent_v3.py:1306`：`self.context_token_estimate = llm_adapter.usage.total_tokens`（**LLM 成功返回 usage 后**）
+
+`LettaAgentV3` **每个请求新实例化一次**（`conversations.py:1061` `agent_loop = LettaAgentV3(agent_state=agent, actor=actor)`）。所以：
+
+**对已超限的 agent 打开新会话**：
+1. `self.context_token_estimate = None` （构造器）
+2. pre-step 检查在 line 935 只 log warning
+3. LLM 请求失败（vLLM 400，prompt 已超 65K）
+4. 异常从 line 1306 上面抛出，`context_token_estimate` 仍然 None
+5. post-step line 1439 检查 `is not None` → 跳过
+6. messages 表没变，next request 同样失败
+
+**反应式路径** line 1218 依赖 `ContextWindowExceededError`，vLLM 400 理论能映射（`"This model's maximum context length is"` 匹配 `is_context_window_overflow_message`），但 compact 本身也调 LLM，如果摘要请求也超限，三次 retry 全败，**`_checkpoint_messages` 从不被调**，DB 不变。
+
+### 为什么 biany 会撞 71K？
+
+biany 一开始 agent 还没超 54000，但 proactive 只在 post-step 检查，依赖 `usage.total_tokens`。vLLM 返回的 usage 可能**低估**（不含 tool 定义、tokenizer 和 Letta 预估器不一致），导致 estimate < 54000 但实际 context 已到 55K+。下一次 LLM 调用就已经 60K+，post-step 拿到真实 usage 才意识到——但此时已经来不及了，从此一路漂到 71K，之后每次 LLM 调用都 400，反应式 compact 也撑不住。
+
+## 修复（路线 A，已上线 2026-04-21）
+
+`letta-patches/letta_agent_v3.py` 通过 docker-compose bind-mount 覆盖容器内文件。
+
+### 补丁位置
+`letta_agent_v3.py:938` 后，step 主逻辑前，插入 **pre-step 预估 + 强制 compact** 块：
+
+```python
+# 如果 context_token_estimate 为 None, 用 persisted messages + tools 预估
+if self.context_token_estimate is None:
+    _teleai_tools = await self._get_valid_tools()
+    _teleai_estimate = await count_tokens_with_tools(
+        actor=self.actor, llm_config=self.agent_state.llm_config,
+        messages=messages, tools=_teleai_tools,
+    )
+    self.context_token_estimate = _teleai_estimate
+
+# 超阈值就立刻 compact, 别等 LLM 先挂
+if (self.context_token_estimate is not None
+        and self.context_token_estimate > compaction_trigger_threshold
+        and not self.agent_state.message_buffer_autoclear):
+    _pre_step_id = generate_step_id()
+    summary_msg, messages, _ = await self.compact(messages, ...)
+    await self.agent_manager.rebuild_system_prompt_async(...)
+    messages = await self._refresh_messages(messages, force_system_prompt_refresh=True)
+    self.response_messages.append(summary_msg)
+    await self._checkpoint_messages(
+        run_id=run_id, step_id=_pre_step_id,
+        new_messages=[summary_msg],
+        in_context_messages=messages,
+    )
 ```
 
-vLLM 实际返回 `"This model's maximum context length is 65536 tokens. However, you requested 71268 tokens..."` —— 理论上能匹配 `"maximum context length"`，**应**进 retry 分支。
+### 异常处理
+- `SystemPromptTokenExceededError` 透传（系统提示本身超限是另一个问题，非我们能修）
+- 其他异常只 log 不阻塞，让原 post-step 兜底
 
-但反应式路径有两个隐患：
-1. `compact()` 内部会再次调 LLM 生成 summary。如果传给 summarizer 的消息子集仍超 65K → summarizer 本身 400 → 三次 retry 耗尽 → 抛原异常，**agent 状态不变**
-2. 用户看到一次 5xx/400（根据 adapter 怎么 proxy），**下次再聊仍是同一状态，继续失败**
-
-### 关键发现 3: compact 成功才持久化
-
-`services/summarizer/compact.py::compact_messages` (line 135):
-- 返回 `CompactResult(summary_message, compacted_messages, ...)`
-- **自己不写 DB**，靠调用方 `_checkpoint_messages` 更新 `agent.message_ids`
-
-如果 compact 抛异常，`_checkpoint_messages` 不被调，**DB 状态毫无改变**。观察到的"messages 单调递增"现象吻合。
-
-## 修法建议（三条路，按风险 / 收益排）
-
-### 路线 A：**重新启用 v3 proactive compaction**（首选）
-本地 patch `letta_agent_v3.py` 取消两段注释：
-- lines 368–382（step 后检查 + 主动 compact）
-- lines 628–638（loop 结束后 safety-net）
-
-修改后 agent 每一步结束都会检查 `last_step_usage.total_tokens > context_window × SUMMARIZATION_TRIGGER_MULTIPLIER`，在**还没撞墙前**主动压缩。
-
-**风险**：
-- 这段代码被 Letta 团队注释必有原因（性能？递归死循环？）—— 先查 git blame / PR
-- `SUMMARIZATION_TRIGGER_MULTIPLIER` 值若为 0.7 则每次聊天都试 compact，可能增加 token 成本
-- 兜底逻辑本地生效但 Letta 升级时会丢失（需维护 patch 到 adapter 启动脚本）
-
-**工期**：patch 写 + 测试 0.5 天；提 upstream PR 附 reproduction 1 天
-
-### 路线 B：**adapter 侧 auto_rebuild_overfull_agents.py**（兜底保底）
-定时扫 `num_tokens_current > 60000` → 触发 rebuild（= 删 agent 重建，丢历史）。
-这是本次会话原方案，**不依赖修 Letta**。
-
-**优劣**：
-- 稳（不动 Letta 内部）
-- 粗（整段对话丢）
-- 与路线 A **不互斥**。A 先做，B 作为 A 失败时的最后防线
-
-### 路线 C：**让 adapter 在 compact 失败时再 rebuild**
-改 `letta_agent_v3.py` 的 except 分支：retry 全败后调 adapter `_rebuild_agent_async` 而非抛异常。
-**风险高**：耦合 adapter 和 letta，动 letta 内部代码，回归面大。
-
-**不建议现阶段做**。
-
-## 决策
-
-今天这个 session 做**路线 B**（`auto_rebuild_overfull_agents.py`），0.5–1 天能落、不动 letta。
-
-下一步做**路线 A 的验证**：
-1. 查 Letta repo `letta_agent_v3.py` 近期 git blame：**为什么**这两段被注释（故意 vs 忘了删）？如果是故意（比如递归问题），得换思路
-2. 查 Letta issue tracker 是否已有人报告 "agent context unbounded growth" 类问题
-3. 若 upstream 没修过也没讨论过 → 提 PR；我们本地先 patch
-
-## 补充数据（2026-04-21 巡检）
-
+### 部署
+`docker-compose.yml` 加一行：
+```yaml
+- ./letta-patches/letta_agent_v3.py:/app/letta/agents/letta_agent_v3.py:ro
 ```
-top 5 by tokens (ceiling 60000):
-  50575  ai-infra-cache     msgs=149  CLOSE
-  49809  ai-infra           msgs=269
-  37280  01                 msgs=115
-  35835  security-mgmt      msgs= 35
-  35135  ai-infra           msgs=100
-```
+restart letta-server 即生效。
 
-`ai-infra-cache` 距 65K 只差 15K tokens，预计下一周内将撞墙，**B 方案在此之前必须上**。
+### 验证
+- regression 36/36 PASS
+- Letta log 出现 `[teleai-patch] pre-step token estimate: 36441` —— 预估路径真的进入
+- 补丁影响面：每个 LLM 请求多一次 `count_tokens_with_tools` 调用，毫秒级，可忽略
+
+## 备选方案（没做）
+
+### 路线 B: adapter 侧 auto_rebuild_overfull_agents.py
+定时扫 `num_tokens_current > 60000` → rebuild（删 agent、丢历史）。
+- 优：零修改 Letta
+- 劣：用户体验差（整段对话丢），属降级方案
+- 决策：**不做**，路线 A 成立后没必要。但如果路线 A 有边缘 case 失败，B 可作最后兜底
+
+### 路线 C: 改 Letta except 调 adapter rebuild
+耦合 Letta 和 adapter，回归面大。**不做**。
+
+## TODO
+
+- [ ] 构造触发用例：人为推 agent 过 54K 验证 pre-step compact 真的生效
+- [ ] 观察 1-2 周，若线上没有再现 71K 这种超限状态，关闭 #26 监控告警
+- [ ] Letta 上游可能修改 compaction 策略（近期 commit 密集）：定期 sync / 决定是否保留本地 patch
+- [ ] 若 Letta 上游改得更合理，上游 PR 反馈这个边缘情况（冷启动 overfull agent）
