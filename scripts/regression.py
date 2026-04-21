@@ -341,23 +341,86 @@ def t_user_agent_map_count():
     return f"{n} rows"
 
 
+_TOOL_BAD_MARKERS = ["NoneType", "has no attribute", "encode", "Traceback", "not attached",
+                     "tool call failed", "500 Internal", "not available"]
+
+
+def _fetch_project_filenames() -> list:
+    """从 admin API 拿 TEST_PROJECT 的真实文件名列表, 用于 tool-use 证据断言"""
+    data = _admin_get(f"/admin/api/project/{TEST_PROJECT}/files")
+    items = data if isinstance(data, list) else data.get("files", []) if isinstance(data, dict) else []
+    names = []
+    for it in items:
+        n = it.get("display_name") or it.get("file_name") or it.get("name") or ""
+        if n:
+            names.append(n)
+    return names
+
+
 def t_letta_grep_tool_end_to_end():
-    """真实触发 grep_files 工具执行, 断言不 crash.
-    教训来源 (04-20): 两次 embedding_config / file.content=None 类 bug 都因为
-    regression 的 letta 聊天只问'你好'、不触发工具调用, 隐藏数天直到用户报。
-    这里用 TEST_PROJECT 发一个强制搜索意图的 query, 断言工具返回不含错误关键字。"""
+    """真实触发 grep 工具执行, 断言不 crash 且响应含 tool-use 证据.
+    教训来源 (04-20): embedding_config / file.content=None 类 bug 因为
+    regression letta 聊天只问'你好'、不触发工具调用, 隐藏数天直到用户报。
+    这里发强制搜索意图的 query, 断言工具返回不含错误关键字 + 响应出现被搜的关键词。"""
+    keyword = "TeleAI"  # 项目文档里高频出现, 如果 grep 工作应该返回带这个词的片段
     body = _chat_body(f"letta-{TEST_PROJECT}", stream=False,
-                      content="搜索一下项目知识库里关于『规范』的内容, 列出 2-3 条")
+                      content=f"在项目文档里搜索关键词『{keyword}』, 把找到的原文片段列 1-2 条")
     headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
     r = httpx.post(f"{ADAPTER_URL}/v1/chat/completions", json=body, headers=headers, timeout=120)
     assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:200]}"
     content = r.json()["choices"][0]["message"]["content"]
-    # 真实工具报错的标志串: 如果任一工具 crash, adapter 会把错误字串嵌在输出里
-    bad_markers = ["NoneType", "has no attribute", "encode", "Traceback", "not attached"]
-    hits = [m for m in bad_markers if m in content]
+    hits = [m for m in _TOOL_BAD_MARKERS if m in content]
     assert not hits, f"工具调用疑似失败, 命中关键字: {hits}; 片段: {content[:300]}"
     assert len(content) > 20, f"答复太短 ({len(content)} chars): {content!r}"
-    return f"len={len(content)}  第一行={content.strip().splitlines()[0][:60]!r}"
+    # tool-use 证据: 响应里应出现被搜关键词 (grep 真调用才可能带回)
+    assert keyword in content, f"响应未包含被搜关键词 {keyword!r}, 可能 grep 未被调用或无结果; 片段: {content[:300]}"
+    return f"len={len(content)} keyword_hit=1"
+
+
+def t_letta_list_tool_end_to_end():
+    """真实触发 list_project_files 工具, 断言响应里至少出现一个真实文件名.
+    强 tool-use 证据: 如果工具没调用或返回空, agent 不可能猜中文件名."""
+    filenames = _fetch_project_filenames()
+    assert filenames, f"project {TEST_PROJECT} 没文件, list 测试没法断言 (跳过请明示)"
+    body = _chat_body(f"letta-{TEST_PROJECT}", stream=False,
+                      content="用中文列出本项目知识库里所有的文件名, 每行一个")
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    r = httpx.post(f"{ADAPTER_URL}/v1/chat/completions", json=body, headers=headers, timeout=120)
+    assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:200]}"
+    content = r.json()["choices"][0]["message"]["content"]
+    hits = [m for m in _TOOL_BAD_MARKERS if m in content]
+    assert not hits, f"工具调用疑似失败, 命中关键字: {hits}; 片段: {content[:300]}"
+    # 至少一个真实文件名出现在响应里 (strong signal)
+    # 用 stem 而非全名, 避免 agent 省略扩展名导致误判
+    import os as _os
+    stems = {_os.path.splitext(n)[0] for n in filenames if n}
+    matched = [s for s in stems if s and s in content]
+    assert matched, f"响应里没出现任何项目文件名 stem (候选={list(stems)[:5]}); 片段: {content[:300]}"
+    return f"matched={len(matched)}/{len(stems)} files"
+
+
+def t_letta_all_models_alive():
+    """遍历所有 letta-* 模型, 发轻量 query 确认每个 project 的 agent 可用.
+    防止单 project 配置漂移 (llm_config / embedding_config) 只有该 project 用户撞到才暴露."""
+    r = httpx.get(f"{ADAPTER_URL}/v1/models",
+                  headers={"Authorization": f"Bearer {API_KEY}"}, timeout=10)
+    assert r.status_code == 200
+    letta_models = [m["id"] for m in r.json()["data"] if m["id"].startswith("letta-")]
+    assert letta_models, "没有 letta-* 模型"
+    failed = []
+    for m in letta_models:
+        try:
+            msg, _ = _call_chat(m, stream=False, content="你好", timeout=60)
+            if not msg or "system_alert" in msg.lower():
+                failed.append(f"{m}:empty_or_alert")
+                continue
+            hits = [bm for bm in _TOOL_BAD_MARKERS if bm in msg]
+            if hits:
+                failed.append(f"{m}:{hits[0]}")
+        except Exception as e:
+            failed.append(f"{m}:{type(e).__name__}")
+    assert not failed, f"以下 letta 模型响应异常: {failed}"
+    return f"{len(letta_models)} models ok"
 
 
 def t_no_orphan_letta_agents():
@@ -626,7 +689,9 @@ def main():
     T("letta-* 非流式（无 system_alert）", t_chat_letta_nonstream)
     T("letta-* 流式（无 system_alert）", t_chat_letta_stream)
     T("letta-* 真流式 TTFT<3s", t_letta_stream_ttft_under_3s)
-    T("letta grep 工具真实调用不 crash", t_letta_grep_tool_end_to_end)
+    T("letta grep 工具真实调用 (含 keyword 命中)", t_letta_grep_tool_end_to_end)
+    T("letta list 工具真实调用 (含文件名命中)", t_letta_list_tool_end_to_end)
+    T("所有 letta-* 模型 alive (每 project 一次)", t_letta_all_models_alive)
     T("<think> 闭合平衡（3 种路径）", t_think_balanced)
 
     print("\n── 权限 ──")
