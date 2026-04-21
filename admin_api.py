@@ -919,6 +919,42 @@ async def _atomic_replace_old(old_files: list, scope: str, scope_id: str, owner_
             logging.warning(f"[replace] unmirror {fid} failed: {e}")
 
 
+@router.post("/knowledge-mirror-register")
+async def register_knowledge_mirror(request: Request):
+    """Svelte 新建 knowledge collection + user 选 scope 后调这里, 写 knowledge_scope_registry.
+
+    Body: {knowledge_id, scope: project/personal/org, scope_id (project_id only)}
+    返 {status, ...}
+    webui_hook.py 收到 WebUI 后续上传 /knowledge/{kid}/file/add 时会用本表反推 scope → ingest.
+    """
+    body = await request.json()
+    kid = body.get("knowledge_id") or ""
+    scope = body.get("scope") or ""
+    scope_id = body.get("scope_id") or ""
+    if not kid or scope not in ("project", "personal", "org"):
+        raise HTTPException(400, "missing knowledge_id or invalid scope")
+
+    # 权限 check
+    if scope == "project":
+        if not scope_id:
+            raise HTTPException(400, "scope=project 要求 scope_id")
+        user = await require_project_member(request, scope_id)
+    elif scope == "org":
+        user = await require_org_admin(request)
+    else:  # personal
+        user = await extract_user_from_admin(request)
+
+    owner_id = user["id"]
+    with use_db() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO knowledge_scope_registry "
+            "(knowledge_id, scope, scope_id, owner_id) VALUES (?, ?, ?, ?)",
+            (kid, scope, scope_id if scope == "project" else "", owner_id),
+        )
+    logging.info(f"[kb-reg] kid={kid[:8]} scope={scope} scope_id={scope_id[:20]} owner={owner_id[:8]}")
+    return {"status": "ok", "knowledge_id": kid, "scope": scope, "scope_id": scope_id}
+
+
 @router.post("/upload-with-scope")
 async def upload_with_scope(
     request: Request,
