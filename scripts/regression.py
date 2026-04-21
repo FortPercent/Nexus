@@ -400,27 +400,47 @@ def t_letta_list_tool_end_to_end():
 
 
 def t_letta_all_models_alive():
-    """遍历所有 letta-* 模型, 发轻量 query 确认每个 project 的 agent 可用.
-    防止单 project 配置漂移 (llm_config / embedding_config) 只有该 project 用户撞到才暴露."""
-    r = httpx.get(f"{ADAPTER_URL}/v1/models",
-                  headers={"Authorization": f"Bearer {API_KEY}"}, timeout=10)
-    assert r.status_code == 200
-    letta_models = [m["id"] for m in r.json()["data"] if m["id"].startswith("letta-")]
-    assert letta_models, "没有 letta-* 模型"
+    """每 project 挑 1 个已有 agent 的 user 发轻量 query, 确认各 project agent 可用.
+    防止单 project 配置漂移 (llm_config / embedding_config) 只有该 project 用户撞到才暴露.
+
+    不用 TEST_USER_ID 遍历: 会触发 get_or_create_agent 在 user 非成员项目里新建 agent,
+    制造测试污染 (wuxn5 7 个孤儿). 改用 user_agent_map 已有 (user,project) 对."""
+    c = sqlite3.connect(DB_PATH)
+    # 每个 project 取一个 user (任选 rowid 最小的那行)
+    rows = c.execute("""
+        SELECT project_id, user_id FROM user_agent_map
+        GROUP BY project_id
+    """).fetchall()
+    c.close()
+    pairs = [(pid, uid) for pid, uid in rows if pid and uid]
+    assert pairs, "user_agent_map 空"
     failed = []
-    for m in letta_models:
+    for pid, uid in pairs:
+        model = f"letta-{pid}"
+        # 给该 user 签 JWT, 直接用 httpx 发 (不经 TEST_USER_ID)
+        body = {"model": model, "stream": False, "messages": [{"role": "user", "content": "你好"}],
+                "user_id": uid, "user_email": f"{uid[:8]}@regression.local",
+                "user_name": "regression-probe"}
         try:
-            msg, _ = _call_chat(m, stream=False, content="你好", timeout=60)
-            if not msg or "system_alert" in msg.lower():
-                failed.append(f"{m}:empty_or_alert")
+            r = httpx.post(f"{ADAPTER_URL}/v1/chat/completions", json=body,
+                           headers={"Authorization": f"Bearer {API_KEY}"}, timeout=60)
+            if r.status_code != 200:
+                failed.append(f"{model}:HTTP{r.status_code}")
+                continue
+            msg = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
+            if not msg:
+                failed.append(f"{model}:empty")
+                continue
+            if "system_alert" in msg.lower():
+                failed.append(f"{model}:system_alert")
                 continue
             hits = [bm for bm in _TOOL_BAD_MARKERS if bm in msg]
             if hits:
-                failed.append(f"{m}:{hits[0]}")
+                failed.append(f"{model}:{hits[0]}")
         except Exception as e:
-            failed.append(f"{m}:{type(e).__name__}")
+            failed.append(f"{model}:{type(e).__name__}")
     assert not failed, f"以下 letta 模型响应异常: {failed}"
-    return f"{len(letta_models)} models ok"
+    return f"{len(pairs)} projects ok"
 
 
 def t_no_orphan_letta_agents():
