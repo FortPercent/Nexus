@@ -965,6 +965,11 @@ class LettaAgentV3(LettaAgentV2):
             )
             try:
                 _teleai_pre_step_id = generate_step_id()
+                # 必须先在 steps 表注册, 否则 _checkpoint_messages insert message
+                # 的 fk_messages_step_id 外键会 violate (踩过: FK IntegrityError)
+                await self.step_manager.register_step_for_run_async(
+                    step_id=_teleai_pre_step_id, run_id=run_id,
+                )
                 _teleai_ctx_before = self.context_token_estimate
                 _teleai_mc_before = len(messages)
                 _teleai_summary_msg, messages, _teleai_summary_text = await self.compact(
