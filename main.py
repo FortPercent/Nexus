@@ -613,10 +613,8 @@ async def chat_completions(request: Request):
             scope_id = mirror.get("scope_id", "") or ""
 
             # Phase 1 新路径: 从盘上读文件 (不依赖 Letta folder / passages)
-            # 2026-04-21 bug fix: display_name 带 "[scope] " 前缀 (e.g. "[AI Infra] foo.pdf"),
-            # 盘文件无前缀; Phase 5a 新上传落到主目录 <base>/, 不是 .legacy/.
-            # 查盘逻辑抽到 chat_ref._find_kb_file_on_disk 便于单元测试.
-            from chat_ref import _find_kb_file_on_disk
+            from chat_ref import _find_kb_file_on_disk, _fetch_letta_text_and_write_md
+            _BINARY_EXTS = (".pdf", ".pptx", ".ppt", ".doc", ".xls")
             kb_content = None
             try:
                 if scope == "project":
@@ -629,6 +627,16 @@ async def chat_completions(request: Request):
                     base = None
                 if base:
                     found_path, basename = _find_kb_file_on_disk(base, file_name)
+                    # 2026-04-21 bug fix: 找到的是 binary (pdf 等) 且 .md 派生缺席 → 同步拉 Letta pg text 写 .md, 再用 .md
+                    # 这样首次引用 binary 的用户不需要等 / 重试, adapter 自己在 15s 内补齐.
+                    if found_path and not found_path.endswith(".md"):
+                        ext = os.path.splitext(found_path)[1].lower()
+                        if ext in _BINARY_EXTS:
+                            md_target = found_path + ".md"
+                            letta_fid = mirror.get("letta_file_id", "")
+                            if letta_fid and _fetch_letta_text_and_write_md(letta_fid, md_target, timeout_sec=15.0):
+                                found_path, basename = md_target, os.path.basename(md_target)
+                            # 拉不到也继续用 binary (读到的是 PDF header 元数据, 比完全无引用好)
                     if found_path:
                         with open(found_path, encoding="utf-8", errors="replace") as rfp:
                             content = rfp.read()

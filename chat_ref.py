@@ -12,6 +12,53 @@ import sqlite3
 import time
 
 
+def _fetch_letta_text_and_write_md(letta_file_id: str, md_path: str, timeout_sec: float = 15.0) -> bool:
+    """同步查 Letta pg file_contents.text 写 <md_path>. 成功返 True.
+
+    场景: resolver 发现 binary (.pdf 等) 没 .md 派生, 调这个现场拉一次. Letta 上传
+    后 text 提取是 async 的, 所以用 500ms 间隔轮询直到超时 (默认 15s).
+
+    用 psycopg2 直连 letta pg. 失败不 raise, 返 False 让 caller 自己 fallback.
+    """
+    try:
+        import psycopg2  # type: ignore
+    except Exception:
+        return False
+    import os as _os
+    import time as _t
+    deadline = _t.time() + timeout_sec
+    while _t.time() < deadline:
+        try:
+            pg = psycopg2.connect(
+                host="letta-db", dbname="letta", user="letta",
+                password=_os.environ.get("POSTGRES_PASSWORD", ""),
+                connect_timeout=3,
+            )
+            cur = pg.cursor()
+            cur.execute(
+                "SELECT COALESCE(fc.text, '') FROM file_contents fc "
+                "JOIN files f ON f.id = fc.file_id "
+                "WHERE f.id = %s AND NOT f.is_deleted LIMIT 1",
+                (letta_file_id,),
+            )
+            row = cur.fetchone()
+            pg.close()
+            text = (row and row[0] and row[0].strip()) or ""
+            if text:
+                try:
+                    with open(md_path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    logging.info(f"[kb-disk] sync-fetched {md_path} ({len(text)} chars)")
+                    return True
+                except Exception as e:
+                    logging.warning(f"[kb-disk] write {md_path}: {e}")
+                    return False
+        except Exception as e:
+            logging.warning(f"[kb-disk] pg fetch fail: {e}")
+        _t.sleep(0.5)
+    return False
+
+
 def _find_kb_file_on_disk(base: str, file_name: str) -> tuple[str | None, str | None]:
     """在 <base>/ 和 <base>/.legacy/ 里找 file_name 对应的实际盘文件.
 
