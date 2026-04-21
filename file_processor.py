@@ -59,41 +59,52 @@ MAX_ROWS_PER_SHEET = 5000  # 单 sheet 行上限；50MB 上传限额已是硬防
 
 
 def _xlsx_to_markdown(data: bytes) -> str:
+    """Streaming 版: 不 list(ws.iter_rows(...)), 大表 RSS 保持常数级.
+    之前 list() 一次性吃进内存, 50MB × 并发时 RSS 尖峰. openpyxl iter_rows
+    本身就是 generator, 只要不 list() + 达到 MAX_ROWS_PER_SHEET 立刻 break."""
     import openpyxl
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
     out = []
     for sheet in wb.sheetnames:
         ws = wb[sheet]
         out.append(f"## 📑 工作表: {sheet}")
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
+        row_iter = ws.iter_rows(values_only=True)
+
+        # 找第一个非空行当 header
+        header = None
+        for row in row_iter:
+            if any(c is not None for c in row):
+                header = row
+                break
+        if header is None:
             out.append("_(空表)_")
             out.append("")
             continue
-        # header: first non-empty row
-        header_idx = 0
-        while header_idx < len(rows) and all(c is None for c in rows[header_idx]):
-            header_idx += 1
-        if header_idx >= len(rows):
-            out.append("_(空表)_")
-            out.append("")
-            continue
-        headers = [_fmt_cell(c) for c in rows[header_idx]]
+
+        headers = [_fmt_cell(c) for c in header]
         out.append("| " + " | ".join(headers) + " |")
         out.append("|" + "---|" * len(headers))
-        body = rows[header_idx + 1:]
-        truncated = False
-        if len(body) > MAX_ROWS_PER_SHEET:
-            body = body[:MAX_ROWS_PER_SHEET]
-            truncated = True
-        for row in body:
-            cells = [_fmt_cell(c) for c in row]
-            while len(cells) < len(headers):
-                cells.append("")
-            cells = cells[: len(headers)]
-            out.append("| " + " | ".join(cells) + " |")
-        if truncated:
-            out.append(f"_(…另有 {len(rows) - header_idx - 1 - MAX_ROWS_PER_SHEET} 行已省略)_")
+
+        # 流式读 body, 满 MAX_ROWS 就 break
+        written = 0
+        extra_seen = 0  # 超限后只计数, 不写 out
+        for row in row_iter:
+            if written < MAX_ROWS_PER_SHEET:
+                cells = [_fmt_cell(c) for c in row]
+                while len(cells) < len(headers):
+                    cells.append("")
+                cells = cells[: len(headers)]
+                out.append("| " + " | ".join(cells) + " |")
+                written += 1
+            else:
+                extra_seen += 1
+                # 再扫一小段确认真有额外行就停 — 避免无谓遍历剩余百万行
+                if extra_seen > 100:
+                    out.append(f"_(…另有 {MAX_ROWS_PER_SHEET}+ 行已省略, 前 {MAX_ROWS_PER_SHEET} 行即为样本)_")
+                    break
+        else:
+            if extra_seen > 0:
+                out.append(f"_(…另有 {extra_seen} 行已省略)_")
         out.append("")
     wb.close()
     return "\n".join(out)
@@ -303,6 +314,7 @@ def _convert_via_libreoffice(data: bytes, src_ext: str, to_ext: str) -> bytes:
 
 
 def _csv_to_markdown(data: bytes) -> str:
+    """Streaming 版: 逐行读 + 到 MAX_ROWS break. 大 CSV 不 list()."""
     # 试多种编码
     text = None
     for enc in ("utf-8", "gbk", "utf-16"):
@@ -314,23 +326,33 @@ def _csv_to_markdown(data: bytes) -> str:
     if text is None:
         text = data.decode("utf-8", errors="replace")
     reader = _csv.reader(io.StringIO(text))
-    rows = list(reader)
-    if not rows:
+
+    # 读 header
+    try:
+        header = next(reader)
+    except StopIteration:
         return "_(空 CSV)_"
-    headers = [_fmt_cell(c) for c in rows[0]]
+
+    headers = [_fmt_cell(c) for c in header]
     out = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
-    body = rows[1:]
-    truncated = False
-    if len(body) > MAX_ROWS_PER_SHEET:
-        body = body[:MAX_ROWS_PER_SHEET]
-        truncated = True
-    for row in body:
-        cells = [_fmt_cell(c) for c in row]
-        while len(cells) < len(headers):
-            cells.append("")
-        out.append("| " + " | ".join(cells[: len(headers)]) + " |")
-    if truncated:
-        out.append(f"_(…另有 {len(rows) - 1 - MAX_ROWS_PER_SHEET} 行已省略)_")
+
+    written = 0
+    extra_seen = 0
+    for row in reader:
+        if written < MAX_ROWS_PER_SHEET:
+            cells = [_fmt_cell(c) for c in row]
+            while len(cells) < len(headers):
+                cells.append("")
+            out.append("| " + " | ".join(cells[: len(headers)]) + " |")
+            written += 1
+        else:
+            extra_seen += 1
+            if extra_seen > 100:
+                out.append(f"_(…另有 {MAX_ROWS_PER_SHEET}+ 行已省略, 前 {MAX_ROWS_PER_SHEET} 行即为样本)_")
+                break
+    else:
+        if extra_seen > 0:
+            out.append(f"_(…另有 {extra_seen} 行已省略)_")
     return "\n".join(out)
 
 
