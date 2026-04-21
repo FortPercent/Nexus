@@ -28,14 +28,28 @@ def _find_kb_file_on_disk(base: str, file_name: str) -> tuple[str | None, str | 
     Returns: (full_path, basename) or (None, None)
     """
     raw_name = re.sub(r"^\[[^\]]+\]\s*", "", file_name)
-    candidates = {file_name, raw_name}
-    for n in list(candidates):
-        if n and not n.endswith(".md"):
-            candidates.add(n + ".md")
+    # 优先级排序: .md 派生 > 原 binary. 避免 pdf binary 被当 UTF-8 读出 PDF header 乱码.
+    # 2026-04-21 bug: tester 传 pdf 后 agent 只看到 PDF metadata, 因为没 .md 派生,
+    # resolver 随机返 binary. 现加严格优先级 — .md > 原名.
+    md_candidates = []
+    bin_candidates = []
+    for n in [file_name, raw_name]:
+        if not n:
+            continue
+        if n.endswith(".md"):
+            md_candidates.append(n)
+        else:
+            md_candidates.append(n + ".md")
+            bin_candidates.append(n)
+    ordered = []
+    seen = set()
+    for c in md_candidates + bin_candidates:
+        if c in seen:
+            continue
+        seen.add(c)
+        ordered.append(c)
     for d in (base, os.path.join(base, ".legacy")):
-        for cand in candidates:
-            if not cand:
-                continue
+        for cand in ordered:
             p = os.path.join(d, cand)
             if os.path.isfile(p):
                 return p, os.path.basename(p)

@@ -644,8 +644,58 @@ async def _process_and_upload(
             except Exception as e:
                 logging.warning(f"[kb-disk] md/index {letta_name}: {e}")
 
+            # Phase 5 2026-04-21 bug fix: 对 binary 格式 (pdf/pptx/doc 等 file_processor 透传的)
+            # 后台异步拉 Letta pg file_contents.text 写 .md 派生.
+            # Letta 上传是 async 的, text 提取需要 5-30s. 非阻塞 task + 轮询.
+            _binary_exts = (".pdf", ".pptx", ".ppt", ".doc", ".xls")
+            if letta_name == file.filename and file.filename.lower().endswith(_binary_exts) and fid:
+                md_path = os.path.join(_kb_dir, file.filename + ".md")
+                if not os.path.isfile(md_path):
+                    asyncio.create_task(_backfill_letta_text_as_md(fid, md_path, file.filename))
+
         uploaded.append({"letta_file_id": fid, "display_name": disp, "letta_name": letta_name})
     return uploaded
+
+
+async def _backfill_letta_text_as_md(letta_file_id: str, md_path: str, original_name: str):
+    """Phase 5 2026-04-21: Letta 对 pdf/pptx 等 binary 格式会在后台抽文本存 pg.
+    上传完立刻读 pg 大概率空; 本函数每 5s 轮询一次 (最多 6 次 = 30s 上限), 拿到
+    非空文本就写 <kb_dir>/<filename>.md.
+
+    目的: agent # ref resolver 能在用户很快再问下一问时读到正文, 不是只看到 PDF header
+    乱码. 失败不阻塞, 用户如果问太快拿不到 .md 就让他隔几秒再问 / 走 read_project_file
+    工具(工具会自己再查)."""
+    try:
+        import psycopg2 as _pg
+    except Exception:
+        logging.warning("[kb-disk-bg] psycopg2 not available, skip .md backfill")
+        return
+
+    for attempt in range(6):
+        await asyncio.sleep(5)
+        try:
+            pg = _pg.connect(
+                host="letta-db", dbname="letta", user="letta",
+                password=os.environ.get("POSTGRES_PASSWORD", ""),
+            )
+            cur = pg.cursor()
+            cur.execute(
+                "SELECT COALESCE(fc.text, '') FROM file_contents fc "
+                "JOIN files f ON f.id = fc.file_id "
+                "WHERE f.id = %s AND NOT f.is_deleted LIMIT 1",
+                (letta_file_id,),
+            )
+            row = cur.fetchone()
+            pg.close()
+            text = (row and row[0] and row[0].strip()) or ""
+            if text:
+                with open(md_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                logging.info(f"[kb-disk-bg] wrote {md_path} ({len(text)} chars) after {(attempt+1)*5}s")
+                return
+        except Exception as e:
+            logging.warning(f"[kb-disk-bg] attempt {attempt+1} {original_name}: {e}")
+    logging.warning(f"[kb-disk-bg] giving up {original_name} after 30s, no text from Letta pg")
 
 
 @router.get("/project/{project_id}/files")
