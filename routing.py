@@ -139,6 +139,88 @@ def _get_suggest_todo_tool_id() -> str:
     return _suggest_todo_tool_id
 
 
+def _create_agent_fresh(user_id: str, project: str) -> str:
+    """创建新 agent 并挂 blocks/tools, **不读不写 user_agent_map**.
+
+    用途: preflight._atomic_rebuild 需要"无 map 窗口"地造出新 agent, 然后
+    通过 CAS UPDATE 原子切 map. 如果 fresh create 失败, map 不受影响.
+
+    仍然检查 project membership. 返回新 agent.id.
+    """
+    db = get_db()
+    try:
+        is_member = db.execute(
+            "SELECT 1 FROM project_members WHERE user_id = ? AND project_id = ?",
+            (user_id, project),
+        ).fetchone()
+        if not is_member:
+            raise HTTPException(403, f"你不是项目 {project} 的成员，请联系项目管理员添加")
+
+        # 获取自定义工具（两个：suggest_project_knowledge + suggest_todo）
+        custom_tool_ids = []
+        try:
+            custom_tool_ids.append(_get_suggest_tool_id())
+        except Exception as e:
+            logging.warning(f"failed to get suggest tool: {e}")
+        try:
+            custom_tool_ids.append(_get_suggest_todo_tool_id())
+        except Exception as e:
+            logging.warning(f"failed to get suggest_todo tool: {e}")
+
+        try:
+            from letta_sql_tools import should_attach_sql_tools, get_sql_tool_ids
+            if should_attach_sql_tools(project):
+                custom_tool_ids.extend(get_sql_tool_ids())
+        except Exception as e:
+            logging.warning(f"failed to attach SQL tools for project {project}: {e}")
+
+        try:
+            from kb.letta_tools import get_kb_tool_ids
+            custom_tool_ids.extend(get_kb_tool_ids())
+        except Exception as e:
+            logging.warning(f"failed to attach kb tools: {e}")
+
+        human_block_id = get_or_create_personal_human_block(user_id)
+
+        agent = letta.agents.create(
+            name=f"user-{user_id}-{project}",
+            model="openai/Qwen3.5-122B-A10B",
+            metadata={"owner": user_id, "project": project},
+            tool_ids=custom_tool_ids,
+            block_ids=[human_block_id],
+            memory_blocks=[{"label": "persona", "value": PERSONA_TEXT}],
+            llm_config={
+                "model": "Qwen3.5-122B-A10B",
+                "model_endpoint_type": "openai",
+                "model_endpoint": VLLM_ENDPOINT,
+                "context_window": 60000,
+                "enable_reasoner": True,
+            },
+            embedding_config={
+                "embedding_model": "nomic-embed-text",
+                "embedding_endpoint_type": "openai",
+                "embedding_endpoint": "http://ollama:11434/v1",
+                "embedding_dim": 768,
+                "embedding_chunk_size": 300,
+                "batch_size": 32,
+            },
+        )
+
+        _attach_agent_blocks_only(db, agent.id, user_id, project)
+
+        for tid in custom_tool_ids:
+            try:
+                letta.agents.tools.attach(agent_id=agent.id, tool_id=tid)
+            except Exception as e:
+                logging.warning(f"attach tool {tid} to {agent.id}: {e}")
+
+        db.commit()  # block attachments 等
+        return agent.id
+    finally:
+        if db:
+            db.close()
+
+
 def get_or_create_agent(user_id: str, project: str) -> str:
     """获取用户对应的 Agent，不存在则自动创建并挂载分级知识。"""
     db = get_db()

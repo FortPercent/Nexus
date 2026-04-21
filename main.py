@@ -642,10 +642,12 @@ async def chat_completions(request: Request):
     # Pre-flight compact: 在调 Letta 前预检上下文占用, 必要时 summarize 或 rebuild.
     # 见 docs/compact-preflight-v1-spec.md. user_message 此时已经展开 # 引用/附件,
     # 是最终发给 Letta 的 content.
+    # v1.1: 不吞异常 — 明确失败 > 表面成功但会话裂开.
     from preflight import preflight_compact
+    from fastapi import HTTPException
     notice_prefix = None
     try:
-        pf = await preflight_compact(agent_id, user["id"], project, user_message)
+        pf = await preflight_compact(user["id"], project, user_message)
         if pf.rebuilt:
             logging.info(
                 f"[preflight] chat {user['id'][:8]}/{project}: rebuilt "
@@ -658,9 +660,14 @@ async def chat_completions(request: Request):
                 f"[preflight] chat {user['id'][:8]}/{project}: summarized "
                 f"{agent_id[-12:]} ({pf.ctx_before} → {pf.ctx_after})"
             )
+        else:
+            agent_id = pf.agent_id  # noop 可能 map 已被其他请求切, 用 preflight 读到的
     except Exception as e:
-        # pre-flight 自身挂了不应阻塞聊天, 记 warning 继续转发
-        logging.warning(f"[preflight] chat {user['id'][:8]}/{project}: skipped due to error: {e}")
+        logging.error(f"[preflight] chat {user['id'][:8]}/{project} failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"对话预处理失败 ({type(e).__name__}), 请稍后重试",
+        )
 
     # 流式：调 Letta 的 streaming API 边收边转发
     if body.get("stream", False):
