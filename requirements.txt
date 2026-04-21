@@ -12,3 +12,4 @@ python-pptx
 duckdb
 pandas
 sqlglot
+psycopg2-binary
