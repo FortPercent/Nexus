@@ -258,7 +258,18 @@ async def _atomic_rebuild(letta_async, old_agent_id: str,
 | A/B 同时都进 danger 区（锁在各自 worker 内独立） | 两次 rebuild，产生 2 个新 agent；map 指向竞态 winner；另一个也成孤儿，reconcile 扫 |
 | A 删 map 但 (b) 崩了 | map 行被删但没重写。下次请求走 get_or_create_agent → 建新的。旧 agent 和崩掉的那次建到一半的 agent 都孤儿（reconcile 扫）|
 
-所有路径：**要么正常、要么产生可被清理的冗余**。**不存在 "用户发完消息没回音"**。
+所有路径：**要么正常、要么产生可被清理的冗余**。
+
+### v1 消除的"无回音"场景（精确边界）
+- ✅ 不再出现 "因 Letta 内部 compact 缺陷静默卡死" 导致的无回音
+- ✅ 不再出现 "旧 agent 被热路径删除、in-flight 请求 404" 导致的无回音
+
+### v1 仍可能发生的失败（不在本方案覆盖）
+- summarize 卡住 **且** rebuild 也失败（例 Letta HTTP 完全挂了）→ 返回 5xx 给用户，用户能看到错误
+- `get_or_create_agent` 内部 attach blocks/tools/folders 某步失败 → raise，上层返回 5xx
+- rebuild 后正常转发到 Letta，但 Letta 仍因其他原因（系统 prompt 超限、工具返回巨大等）LLM 400
+
+这些失败都**有明确的 HTTP 错误码**给客户端，不是"默默没回音"。真正的无回音类（静默挂住）由 v1 消除。
 
 ## 7. SSE / 非流式里的 user_msg 注入
 
@@ -334,7 +345,10 @@ return resp
 ### Step 4（30 分钟）: 集成验证
 - [ ] `/tmp/force_overfull.py` 推 ai-infra-cache 过危险线
 - [ ] 下一条 chat 应该看到 `[preflight] rebuilt` 日志 + 用户看到"对话已重置"文本
-- [ ] 验证 `letta agent 总数 == user_agent_map 行数`（或差 1 等 reconcile）
+- [ ] 验证 `user_agent_map` 行指向**新** agent_id，用新 agent_id 发后续 chat 正常返回
+- [ ] 验证**旧** agent_id 仍存在于 Letta（未被同步删），至少在 1h 宽限期内 `letta.agents.retrieve(old_id)` 成功
+- [ ] 验证下次 `reconcile_orphan_agents --dry-run` 能识别该旧 agent 为 eligible orphan（待清）
+- [ ] **不验** "agent 总数 == map 行数"——v1 延迟删除设计下，短时间内不相等是预期行为，验这个会误报
 
 ### Step 5（30 分钟）: 压测
 - [ ] bench_mixed_100，对比 preflight 前后 p50 / p99
