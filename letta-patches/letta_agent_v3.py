@@ -965,9 +965,10 @@ class LettaAgentV3(LettaAgentV2):
             )
             try:
                 _teleai_pre_step_id = generate_step_id()
-                # 必须先在 steps 表注册, 否则 _checkpoint_messages insert message
-                # 的 fk_messages_step_id 外键会 violate (踩过: FK IntegrityError)
-                await self.step_manager.register_step_for_run_async(
+                # 必须先在 steps 表落 checkpoint, 否则 _checkpoint_messages
+                # insert message 时 fk_messages_step_id 外键 violate. 用 v3 内部
+                # 既有路径 _step_checkpoint_start (同 line 1095 approval 分支的用法).
+                await self._step_checkpoint_start(
                     step_id=_teleai_pre_step_id, run_id=run_id,
                 )
                 _teleai_ctx_before = self.context_token_estimate
