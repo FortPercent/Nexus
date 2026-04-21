@@ -615,8 +615,8 @@ async def chat_completions(request: Request):
             # Phase 1 新路径: 从盘上读文件 (不依赖 Letta folder / passages)
             # 2026-04-21 bug fix: display_name 带 "[scope] " 前缀 (e.g. "[AI Infra] foo.pdf"),
             # 盘文件无前缀; Phase 5a 新上传落到主目录 <base>/, 不是 .legacy/.
-            # 扩展: 剥前缀 + 双目录查 (主目录 + .legacy) + .md 派生名.
-            import re as _re
+            # 查盘逻辑抽到 chat_ref._find_kb_file_on_disk 便于单元测试.
+            from chat_ref import _find_kb_file_on_disk
             kb_content = None
             try:
                 if scope == "project":
@@ -628,27 +628,10 @@ async def chat_completions(request: Request):
                 else:
                     base = None
                 if base:
-                    # 剥 display_name 的 "[XXX] " 前缀 → 真实盘文件名
-                    raw_name = _re.sub(r"^\[[^\]]+\]\s*", "", file_name)
-                    candidates_names = {file_name, raw_name}
-                    for n in list(candidates_names):
-                        if not n.endswith(".md"):
-                            candidates_names.add(n + ".md")
-                    # 两个目录都查: 主目录 (Phase 5a 新上传) + .legacy (backfill 老数据)
-                    search_dirs = [base, os.path.join(base, ".legacy")]
-                    found_path = None
-                    for d in search_dirs:
-                        for cand in candidates_names:
-                            p = os.path.join(d, cand)
-                            if os.path.isfile(p):
-                                found_path = p
-                                break
-                        if found_path:
-                            break
+                    found_path, basename = _find_kb_file_on_disk(base, file_name)
                     if found_path:
                         with open(found_path, encoding="utf-8", errors="replace") as rfp:
                             content = rfp.read()
-                        basename = os.path.basename(found_path)
                         if len(content) > MAX_REF_CHARS:
                             kb_content = content[:MAX_REF_CHARS] + (
                                 f"\n...(原文共 {len(content)} 字, 已截前 {MAX_REF_CHARS} 字, "
@@ -657,7 +640,7 @@ async def chat_completions(request: Request):
                         else:
                             kb_content = content
                     else:
-                        logging.info(f"# ref {file_name} not on disk (searched {search_dirs} for {candidates_names})")
+                        logging.info(f"# ref {file_name} not on disk under {base}")
             except Exception as e:
                 logging.warning(f"# ref kb read fallback: {e}")
 

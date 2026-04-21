@@ -1,4 +1,4 @@
-"""# 引用处理: chat 历史加载 + dedup cache.
+"""# 引用处理: chat 历史加载 + dedup cache + disk lookup.
 
 Issue #1 + #2 修补提取成独立模块, 方便单元测试 (不拉 FastAPI 依赖).
 """
@@ -6,8 +6,40 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import sqlite3
 import time
+
+
+def _find_kb_file_on_disk(base: str, file_name: str) -> tuple[str | None, str | None]:
+    """在 <base>/ 和 <base>/.legacy/ 里找 file_name 对应的实际盘文件.
+
+    处理两类语义错配:
+      1. display_name 带 "[scope_prefix] " (来自 knowledge_mirrors.display_name),
+         盘上无前缀 → 剥 "[XXX] " 前缀
+      2. 非 .md 的上传也会有 `.md` 派生文件 (file_processor 转换), 加 candidate
+
+    搜索顺序:
+      1. base/ (Phase 5a 新上传主目录)
+      2. base/.legacy/ (Phase 1 backfill 老文件)
+    任一目录 × 任一候选名命中即返回, 否则返回 (None, None).
+
+    Returns: (full_path, basename) or (None, None)
+    """
+    raw_name = re.sub(r"^\[[^\]]+\]\s*", "", file_name)
+    candidates = {file_name, raw_name}
+    for n in list(candidates):
+        if n and not n.endswith(".md"):
+            candidates.add(n + ".md")
+    for d in (base, os.path.join(base, ".legacy")):
+        for cand in candidates:
+            if not cand:
+                continue
+            p = os.path.join(d, cand)
+            if os.path.isfile(p):
+                return p, os.path.basename(p)
+    return None, None
 
 # Issue #2: per-(agent_id, ref_id) TTL dedup 防 WebUI # chip 跨消息累积
 _ref_injection_cache: dict = {}
