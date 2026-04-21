@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -32,7 +33,14 @@ import httpx
 import pytest
 
 import preflight
-from preflight import ContextInfo, _danger, _estimate_user_tokens, _get_ctx_fresh
+from preflight import (
+    ContextInfo,
+    PreflightResult,
+    _danger,
+    _estimate_user_tokens,
+    _get_ctx_fresh,
+    preflight_compact,
+)
 
 
 # ======================== _estimate_user_tokens ========================
@@ -184,6 +192,203 @@ async def test_get_ctx_fresh_http_error_propagates():
     with patch.object(preflight.httpx, "AsyncClient", return_value=fake_client):
         with pytest.raises(httpx.HTTPStatusError):
             await _get_ctx_fresh("agent-deleted")
+
+
+# ======================== preflight_compact (integration of _danger + flow) ========================
+
+
+@pytest.fixture(autouse=True)
+def _reset_agent_locks():
+    """每个 test 清空 per-agent lock dict, 避免跨 test 污染."""
+    preflight._agent_locks.clear()
+    yield
+    preflight._agent_locks.clear()
+
+
+@pytest.mark.asyncio
+async def test_preflight_noop_when_safe():
+    """current 远低于 window → fast path, action=noop"""
+    async def mock_ctx(aid):
+        return ContextInfo(current=10000, window=60000)
+
+    with patch.object(preflight, "_get_ctx_fresh", side_effect=mock_ctx):
+        r = await preflight_compact("agent-x", "user-1", "proj-1", "你好")
+
+    assert r.action == "noop"
+    assert r.rebuilt is False
+    assert r.agent_id == "agent-x"
+    assert r.user_msg is None
+
+
+@pytest.mark.asyncio
+async def test_preflight_sync_summarized_when_summarize_helps():
+    """进 danger, summarize 成功降到 safe, action=sync_summarized"""
+    state = {"compacted": False}
+
+    async def mock_ctx(aid):
+        if state["compacted"]:
+            return ContextInfo(current=30000, window=60000)
+        return ContextInfo(current=58000, window=60000)
+
+    async def mock_summ(aid, timeout=30):
+        state["compacted"] = True
+
+    with patch.object(preflight, "_get_ctx_fresh", side_effect=mock_ctx), \
+         patch.object(preflight, "_call_summarize", side_effect=mock_summ):
+        r = await preflight_compact("agent-x", "user-1", "proj-1", "你好")
+
+    assert r.action == "sync_summarized"
+    assert r.rebuilt is False
+    assert r.agent_id == "agent-x"
+    assert r.ctx_before == 58000
+    assert r.ctx_after == 30000
+
+
+@pytest.mark.asyncio
+async def test_preflight_rebuilt_when_summarize_raises():
+    """summarize 抛异常 → 走 rebuild, action=rebuilt"""
+    async def mock_ctx(aid):
+        return ContextInfo(current=58000, window=60000)
+
+    async def mock_summ(aid, timeout=30):
+        raise RuntimeError("letta 500")
+
+    async def mock_rebuild(old_aid, uid, pid):
+        assert old_aid == "agent-old"
+        return "agent-new"
+
+    with patch.object(preflight, "_get_ctx_fresh", side_effect=mock_ctx), \
+         patch.object(preflight, "_call_summarize", side_effect=mock_summ), \
+         patch.object(preflight, "_atomic_rebuild", side_effect=mock_rebuild):
+        r = await preflight_compact("agent-old", "user-1", "proj-1", "你好")
+
+    assert r.action == "rebuilt"
+    assert r.rebuilt is True
+    assert r.agent_id == "agent-new"
+    assert r.ctx_before == 58000
+    assert r.ctx_after == 0
+    assert r.user_msg and "对话历史已压缩重置" in r.user_msg
+
+
+@pytest.mark.asyncio
+async def test_preflight_rebuilt_when_summarize_insufficient():
+    """summarize 成功但压完仍 danger → 走 rebuild"""
+    async def mock_ctx(aid):
+        return ContextInfo(current=58000, window=60000)  # always danger
+
+    async def mock_summ(aid, timeout=30):
+        pass  # succeeds but doesn't help
+
+    async def mock_rebuild(old_aid, uid, pid):
+        return "agent-new2"
+
+    with patch.object(preflight, "_get_ctx_fresh", side_effect=mock_ctx), \
+         patch.object(preflight, "_call_summarize", side_effect=mock_summ), \
+         patch.object(preflight, "_atomic_rebuild", side_effect=mock_rebuild):
+        r = await preflight_compact("agent-old2", "user-1", "proj-1", "你好")
+
+    assert r.action == "rebuilt"
+    assert r.agent_id == "agent-new2"
+
+
+@pytest.mark.asyncio
+async def test_preflight_rebuilt_on_timeout():
+    """summarize 超时 → rebuild"""
+    async def mock_ctx(aid):
+        return ContextInfo(current=58000, window=60000)
+
+    async def mock_summ(aid, timeout=30):
+        await asyncio.sleep(60)  # simulate hang; asyncio.wait_for will timeout
+
+    async def mock_rebuild(old_aid, uid, pid):
+        return "agent-new3"
+
+    # Patch wait_for timeout small to make test fast
+    import asyncio as _asyncio
+    orig_wait_for = _asyncio.wait_for
+
+    async def fast_wait_for(coro, timeout):
+        return await orig_wait_for(coro, 0.05)
+
+    with patch.object(preflight, "_get_ctx_fresh", side_effect=mock_ctx), \
+         patch.object(preflight, "_call_summarize", side_effect=mock_summ), \
+         patch.object(preflight, "_atomic_rebuild", side_effect=mock_rebuild), \
+         patch.object(preflight.asyncio, "wait_for", side_effect=fast_wait_for):
+        r = await preflight_compact("agent-old3", "user-1", "proj-1", "你好")
+
+    assert r.action == "rebuilt"
+
+
+# ======================== Concurrency ========================
+
+
+@pytest.mark.asyncio
+async def test_lock_per_agent_not_shared_across_agents():
+    """不同 agent 的 lock 是不同对象"""
+    la = await preflight._acquire_agent_lock("agent-a")
+    lb = await preflight._acquire_agent_lock("agent-b")
+    la2 = await preflight._acquire_agent_lock("agent-a")
+    assert la is not lb
+    assert la is la2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_only_one_summarizes():
+    """两个并发请求都进 danger, 锁序列化, 第二个进锁后看到已压缩 → noop.
+    关键断言: summarize 只被调用 1 次 (不是 2 次)."""
+    state = {"compacted": False}
+    summ_calls = {"n": 0}
+
+    async def mock_ctx(aid):
+        if state["compacted"]:
+            return ContextInfo(current=30000, window=60000)
+        return ContextInfo(current=58000, window=60000)
+
+    async def mock_summ(aid, timeout=30):
+        summ_calls["n"] += 1
+        await asyncio.sleep(0.05)  # let the other coroutine wait on lock
+        state["compacted"] = True
+
+    with patch.object(preflight, "_get_ctx_fresh", side_effect=mock_ctx), \
+         patch.object(preflight, "_call_summarize", side_effect=mock_summ):
+        r1, r2 = await asyncio.gather(
+            preflight_compact("agent-X", "user-1", "proj-1", "你好 A"),
+            preflight_compact("agent-X", "user-1", "proj-1", "你好 B"),
+        )
+
+    actions = {r1.action, r2.action}
+    assert summ_calls["n"] == 1, f"summarize called {summ_calls['n']} times (expected 1)"
+    assert actions == {"sync_summarized", "noop"}, f"got {actions}"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_both_rebuilt_if_summarize_fails():
+    """一个极端 case: summarize 两次都失败, 两个请求都各自 rebuild.
+    这种情况 v1 接受 (会产生 1 个多余孤儿, reconcile 扫). 测试确认不 crash."""
+    rebuild_calls = {"n": 0}
+
+    async def mock_ctx(aid):
+        return ContextInfo(current=58000, window=60000)  # always danger
+
+    async def mock_summ(aid, timeout=30):
+        raise RuntimeError("summarize fails")
+
+    async def mock_rebuild(old_aid, uid, pid):
+        rebuild_calls["n"] += 1
+        return f"agent-new-{rebuild_calls['n']}"
+
+    with patch.object(preflight, "_get_ctx_fresh", side_effect=mock_ctx), \
+         patch.object(preflight, "_call_summarize", side_effect=mock_summ), \
+         patch.object(preflight, "_atomic_rebuild", side_effect=mock_rebuild):
+        r1, r2 = await asyncio.gather(
+            preflight_compact("agent-X", "user-1", "proj-1", "你好"),
+            preflight_compact("agent-X", "user-1", "proj-1", "你好"),
+        )
+
+    # 锁序列化: A 完成 rebuild 后, B 进锁重查 ctx 仍 danger (mock 永远返 58000),
+    # 所以 B 也会 rebuild. rebuild 2 次, 符合 v1 说的"接受冗余, reconcile 兜底"
+    assert r1.action == "rebuilt" and r2.action == "rebuilt"
+    assert rebuild_calls["n"] == 2
 
 
 if __name__ == "__main__":
