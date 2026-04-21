@@ -114,6 +114,14 @@ async def _reconcile_loop():
             logging.info(f"sql tools reconcile: {stats}")
         except Exception as e:
             logging.error(f"periodic sql tools reconcile failed: {e}")
+        # 每 48 次循环 = 4h 扫一次孤儿 Letta agent (rebuild 失败/rename 残留)
+        if _iter % 48 == 0:
+            try:
+                from scripts.reconcile_orphan_agents import reconcile_orphans
+                stats = await asyncio.to_thread(reconcile_orphans, False, 1.0)
+                logging.info(f"orphan agents reconcile: {stats}")
+            except Exception as e:
+                logging.error(f"periodic orphan reconcile failed: {e}")
 
 
 @app.on_event("startup")
