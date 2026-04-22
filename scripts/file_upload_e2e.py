@@ -103,14 +103,32 @@ def t_unsupported_ext():
             return 'rejected 400'
         raise
 
+def t_png_rejected_with_clear_msg():
+    """04-22 加: Letta 后端 415 拒图. adapter 必须早 400 + 提示文案, 不再静默吞 200+uploaded=[].
+    回归点: PASSTHROUGH_EXTS 不许包含 png/jpg/jpeg."""
+    # 最小 PNG: 8 字节 signature + 一个空 IHDR, 不需要真合法图, file_processor 看扩展名就拒
+    png_bytes = b'\x89PNG\r\n\x1a\n' + b'\x00' * 16
+    try:
+        upload('TEST_screenshot.png', png_bytes, 'image/png')
+        raise AssertionError('应 400')
+    except AssertionError as e:
+        msg = str(e)
+        if '400' not in msg:
+            raise
+        # 验提示文案命中预期关键词, 不只是 status 对
+        if '图片' not in msg and 'image' not in msg.lower():
+            raise AssertionError(f'400 但提示文案不提"图片": {msg[:200]}')
+        return 'rejected 400 with image hint'
+
 run('xlsx → markdown', t_xlsx)
 run('csv → markdown', t_csv)
 run('docx → markdown', t_docx)
 run('zip 递归展开', t_zip)
 run('pdf 原样透传', t_pdf_passthrough)
 run('未知扩展 → 400', t_unsupported_ext)
+run('png → 400 + 图片提示', t_png_rejected_with_clear_msg)
 
 delete_test_files()
 print()
-print(f'==== {6-fails}/6 ====')
+print(f'==== {7-fails}/7 ====')
 import sys; sys.exit(fails)

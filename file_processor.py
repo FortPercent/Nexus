@@ -18,15 +18,13 @@ ZIP_MAX_DEPTH = 3
 ZIP_MAX_FILES = 50
 ZIP_MAX_UNCOMPRESSED = 200 * 1024 * 1024  # 200 MB
 
-PASSTHROUGH_EXTS = {"pdf", "txt", "md", "png", "jpg", "jpeg"}  # Letta 原生接受的 blob
+PASSTHROUGH_EXTS = {"pdf", "txt", "md"}  # Letta 实际只收 PDF / text / code, 图片走 IMAGE_EXTS 显式拒绝
+IMAGE_EXTS = {"png", "jpg", "jpeg"}  # Letta 415 Unsupported, 早拒避免 admin_api 静默吞异常返空 uploaded
 
 _MIME_BY_EXT = {
     "pdf": "application/pdf",
     "txt": "text/plain",
     "md": "text/markdown",
-    "png": "image/png",
-    "jpg": "image/jpeg",
-    "jpeg": "image/jpeg",
 }
 
 
@@ -390,6 +388,16 @@ def _process(filename: str, data: bytes, depth: int = 0, counter=None) -> List[P
 
     if ext in PASSTHROUGH_EXTS:
         return [(filename, data, _MIME_BY_EXT.get(ext, "application/octet-stream"))]
+
+    if ext in IMAGE_EXTS:
+        # Letta server 直接 415 拒图片. 早拒避免 admin_api._process_and_upload 把 415
+        # try/except 吞掉返 200 + uploaded=[] (WebUI 显示红条但用户不知道为啥).
+        # 未来要支持图片需要先在前面接 OCR / vision 模型转文字.
+        raise HTTPException(
+            400,
+            f"暂不支持图片格式 (.{ext}). 后端 Letta 只接受 PDF / 文本 / 代码文件; "
+            f"如需让 AI 看图请先 OCR 转文字或粘贴文字描述."
+        )
 
     if ext == "xls":
         logging.info(f"LEGACY_OFFICE_CONVERT ext=.xls filename={filename}")

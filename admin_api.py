@@ -561,6 +561,11 @@ async def _process_and_upload(
     import table_ingest
     from kb.ingest import _target_dir, _insert_project_files_row
 
+    # 某些客户端 (macOS 截屏拖拽 → /var/folders/.../TemporaryItems/...) 把整段路径塞 filename.
+    # os.path.join(dir, "/var/...") 因为右参绝对会抛掉左参, 写盘到 /var/... 必然 fail;
+    # Letta 也拿到带斜杠的怪名. 这里强制 basename 兜底, 空名走 "unnamed".
+    file.filename = os.path.basename(file.filename or "") or "unnamed"
+
     data = await file.read()
     _check_folder_size_bytes(folder_id, len(data), project_id_for_size)
     processed = process_upload(file.filename, data)
@@ -991,6 +996,11 @@ async def upload_with_scope(
       - 200 {status, filename, uploaded, mirrors, scope, scope_id, replaced}
       - 409 {status:"conflict", existing: {display_name, uploaded_by, uploaded_at, size_bytes}}
     """
+    # 见 _process_and_upload 同款注释: 客户端有时把 macOS 临时路径整段当 filename 发上来.
+    # 这里 conflict 检测 (_find_existing_in_letta_folder) 在 _process_and_upload 之前跑,
+    # 所以也要先 normalize, 不然 dedup 用的是带路径的 key 永远命不中.
+    file.filename = os.path.basename(file.filename or "") or "unnamed"
+
     # 1. scope + 权限 + 目标 folder_id 路由
     user_for_mirror_lookup = None
     if scope == "project":
