@@ -174,3 +174,39 @@ def _load_chat_ref_context(
     if len(combined) > max_chars:
         combined = "(...历史更早内容已省略)\n\n" + combined[-max_chars:]
     return combined
+
+
+def _build_ref_handle_text(
+    file_name: str,
+    found_path: str | None,
+    basename: str | None,
+) -> str:
+    """REF_INJECT_MODE=handle 下, 生成一条 # 引用的句柄字符串.
+
+    句柄只包含"文件在哪、怎么读", 不包含原文 —— 这样 Letta recall 里留存的只有几百字,
+    多轮对话不会因附件内容累积膨胀. agent 真需要内容时自己调 read_project_file /
+    grep_project_files.
+
+    Args:
+        file_name: 用户可见文件名 (通常 knowledge_mirrors.display_name, 可能带 [Scope] 前缀)
+        found_path: 盘上绝对路径; None 表示 _find_kb_file_on_disk 没找到
+        basename: 盘上实际 basename (.md 派生后可能变), 传给 agent 用 read_project_file 读
+
+    Returns:
+        句柄文本 (单行, 无换行). 找不到文件时返回"引导 agent 调 list_project_files"的兜底文本.
+    """
+    if not found_path or not basename:
+        return (
+            f"[用户引用了文档「{file_name}」但盘上未找到, "
+            f"请先调 list_project_files 查看有无名字近似的文件, 再 read_project_file]"
+        )
+    try:
+        size_bytes = os.path.getsize(found_path)
+        size_hint = f"（约 {size_bytes} 字节）"
+    except OSError:
+        size_hint = ""
+    return (
+        f"用户挂载了文档「{file_name}」{size_hint}。"
+        f"需要原文请调 read_project_file(file_name=\"{basename}\") 分页读取，"
+        f"或 grep_project_files(pattern=\"...\") 按关键词定位。"
+    )

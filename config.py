@@ -23,3 +23,9 @@ VLLM_API_KEY = os.environ["VLLM_API_KEY"]
 CTX_SAFE_MARGIN = int(os.getenv("CTX_SAFE_MARGIN", "5000"))
 # tool schema / letta 侧 system injection 的常数开销
 CTX_USER_MSG_OVERHEAD = int(os.getenv("CTX_USER_MSG_OVERHEAD", "500"))
+
+# # 引用注入模式:
+#   handle (默认): 只贴「文件名 + 大小 + 调 read_project_file」句柄, 让 agent 按需取原文,
+#                 避免文件内容常驻 Letta recall 导致第二轮 context 膨胀.
+#   inline: 盘上读前 MAX_REF_CHARS 字直接拼进 user_message (2026-04 之前的旧行为, 兜底回滚用).
+REF_INJECT_MODE = os.getenv("REF_INJECT_MODE", "handle").lower()

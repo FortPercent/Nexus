@@ -209,5 +209,78 @@ def test_find_kb_file_not_found(kb_tmp):
     assert base is None
 
 
+# ======================================================================
+# _build_ref_handle_text — REF_INJECT_MODE=handle 句柄生成
+# ======================================================================
+# 目标: handle 模式下 adapter 不把附件原文贴进 user_message, 只给 agent 一个
+# "文件在哪、怎么读"的句柄, 避免 Letta recall 导致多轮对话 context 膨胀.
+# (见 config.REF_INJECT_MODE, main.py chat_completions 处理 # 引用那段)
+
+
+def test_ref_handle_found_file_includes_basename_and_size(tmp_path):
+    """盘上找到文件 → 句柄含 basename (agent 用来调 read_project_file) + 大小提示."""
+    from chat_ref import _build_ref_handle_text
+    p = tmp_path / "foo.md"
+    p.write_text("x" * 1234)
+    text = _build_ref_handle_text("foo.md", str(p), "foo.md")
+    assert "foo.md" in text
+    assert "read_project_file" in text
+    assert "1234 字节" in text, f"expected size hint in: {text}"
+    # 不应该贴原文 — handle 模式的核心承诺
+    assert "xxxx" not in text
+
+
+def test_ref_handle_not_found_returns_guide(tmp_path):
+    """found_path=None → 引导 agent 调 list_project_files 的兜底文本."""
+    from chat_ref import _build_ref_handle_text
+    text = _build_ref_handle_text("ghost.pdf", None, None)
+    assert "ghost.pdf" in text
+    assert "list_project_files" in text
+    assert "盘上未找到" in text
+
+
+def test_ref_handle_basename_missing_falls_back_to_guide(tmp_path):
+    """防御性: found_path 有但 basename=None (理论不该发生) → 兜底, 不生成半成品句柄."""
+    from chat_ref import _build_ref_handle_text
+    p = tmp_path / "foo.md"
+    p.write_text("x")
+    text = _build_ref_handle_text("foo.md", str(p), None)
+    # 既然 basename 缺, 不能让 agent 用空字符串调 read_project_file("")
+    assert "list_project_files" in text
+
+
+def test_ref_handle_getsize_error_drops_size_hint_only(tmp_path):
+    """found_path 指向一个后来消失/权限问题的路径 → 去掉 size_hint, 但其他字段保留."""
+    from chat_ref import _build_ref_handle_text
+    ghost_path = str(tmp_path / "vanished.md")  # 根本没创建
+    text = _build_ref_handle_text("vanished.md", ghost_path, "vanished.md")
+    # 仍应该给 agent 有效句柄, 只是没大小数字
+    assert "vanished.md" in text
+    assert "read_project_file" in text
+    assert "字节" not in text, f"size hint should be dropped, got: {text}"
+
+
+def test_ref_handle_preserves_scope_prefix_in_display_name(tmp_path):
+    """display_name 带 [AI Infra] 前缀应保留在用户可见文本里 (让 agent 能用人话回引), 但 basename 独立给读取用."""
+    from chat_ref import _build_ref_handle_text
+    p = tmp_path / "teleai.pdf.md"
+    p.write_text("content")
+    text = _build_ref_handle_text("[AI Infra] teleai.pdf", str(p), "teleai.pdf.md")
+    assert "[AI Infra] teleai.pdf" in text, "display 名带前缀应原样保留"
+    assert 'read_project_file(file_name="teleai.pdf.md")' in text, "basename 应是盘上实名 (.md 派生)"
+
+
+def test_ref_handle_text_stays_short_regardless_of_file_size(tmp_path):
+    """核心承诺: 即使文件 10MB, 句柄文本本身仍然是几百字量级 —— 这就是 handle 模式不膨胀的原理."""
+    from chat_ref import _build_ref_handle_text
+    p = tmp_path / "huge.md"
+    p.write_text("X" * 10_000_000)  # 10MB
+    text = _build_ref_handle_text("huge.md", str(p), "huge.md")
+    assert len(text) < 500, f"handle 句柄应保持短, 实际 {len(text)}: {text[:200]}"
+    assert "XXXXX" not in text, "10MB 原文不应出现在句柄里"
+    # 大小数字应如实反映 (给 agent 判断要不要分页读)
+    assert "10000000 字节" in text
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

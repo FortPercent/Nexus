@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi.responses import HTMLResponse
-from config import ADAPTER_API_KEY, VLLM_ENDPOINT, VLLM_API_KEY
+from config import ADAPTER_API_KEY, VLLM_ENDPOINT, VLLM_API_KEY, REF_INJECT_MODE
 from db import init_db
 from auth import get_current_user
 from routing import get_or_create_agent, get_or_create_org_resources, sync_org_resources_to_all_agents, letta, letta_async
@@ -612,10 +612,13 @@ async def chat_completions(request: Request):
             scope = mirror.get("scope", "project")
             scope_id = mirror.get("scope_id", "") or ""
 
-            # Phase 1 新路径: 从盘上读文件 (不依赖 Letta folder / passages)
+            # Phase 1 路径: 先在盘上定位文件 (不依赖 Letta folder / passages)
+            # handle 模式 (默认): 只贴句柄让 agent 自己调 read_project_file, 避免 Letta recall 膨胀
+            # inline 模式: 盘上直读前 MAX_REF_CHARS 字 (2026-04 之前旧行为, 兜底)
             from chat_ref import _find_kb_file_on_disk, _fetch_letta_text_and_write_md
             _BINARY_EXTS = (".pdf", ".pptx", ".ppt", ".doc", ".xls")
-            kb_content = None
+            found_path = None
+            basename = None
             try:
                 if scope == "project":
                     base = os.path.join(KB_ROOT, scope_id)
@@ -628,7 +631,7 @@ async def chat_completions(request: Request):
                 if base:
                     found_path, basename = _find_kb_file_on_disk(base, file_name)
                     # 2026-04-21 bug fix: 找到的是 binary (pdf 等) 且 .md 派生缺席 → 同步拉 Letta pg text 写 .md, 再用 .md
-                    # 这样首次引用 binary 的用户不需要等 / 重试, adapter 自己在 15s 内补齐.
+                    # handle 模式下仍需补齐 .md: agent 后续 read_project_file 读的也是盘上文件, 没 .md 照样打不开.
                     if found_path and not found_path.endswith(".md"):
                         ext = os.path.splitext(found_path)[1].lower()
                         if ext in _BINARY_EXTS:
@@ -636,21 +639,34 @@ async def chat_completions(request: Request):
                             letta_fid = mirror.get("letta_file_id", "")
                             if letta_fid and _fetch_letta_text_and_write_md(letta_fid, md_target, timeout_sec=15.0):
                                 found_path, basename = md_target, os.path.basename(md_target)
-                            # 拉不到也继续用 binary (读到的是 PDF header 元数据, 比完全无引用好)
-                    if found_path:
-                        with open(found_path, encoding="utf-8", errors="replace") as rfp:
-                            content = rfp.read()
-                        if len(content) > MAX_REF_CHARS:
-                            kb_content = content[:MAX_REF_CHARS] + (
-                                f"\n...(原文共 {len(content)} 字, 已截前 {MAX_REF_CHARS} 字, "
-                                f"如需后文可调 read_project_file(file_name=\"{basename}\", offset={MAX_REF_CHARS}))"
-                            )
-                        else:
-                            kb_content = content
-                    else:
+                    if not found_path:
                         logging.info(f"# ref {file_name} not on disk under {base}")
             except Exception as e:
-                logging.warning(f"# ref kb read fallback: {e}")
+                logging.warning(f"# ref locate fallback: {e}")
+
+            if REF_INJECT_MODE == "handle":
+                # 句柄模式: 不贴原文, 只告诉 agent 文件在哪、怎么读. Letta recall 只留这几百字.
+                from chat_ref import _build_ref_handle_text
+                ref_context_parts.append(
+                    _build_ref_handle_text(file_name, found_path, basename)
+                )
+                continue
+
+            # --- 以下为 inline 模式 (旧行为) ---
+            kb_content = None
+            if found_path:
+                try:
+                    with open(found_path, encoding="utf-8", errors="replace") as rfp:
+                        content = rfp.read()
+                    if len(content) > MAX_REF_CHARS:
+                        kb_content = content[:MAX_REF_CHARS] + (
+                            f"\n...(原文共 {len(content)} 字, 已截前 {MAX_REF_CHARS} 字, "
+                            f"如需后文可调 read_project_file(file_name=\"{basename}\", offset={MAX_REF_CHARS}))"
+                        )
+                    else:
+                        kb_content = content
+                except Exception as e:
+                    logging.warning(f"# ref kb read: {e}")
 
             if kb_content:
                 ref_context_parts.append(f"=== 引用文档：{file_name} ===\n{kb_content}")
