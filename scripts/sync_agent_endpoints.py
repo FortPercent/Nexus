@@ -10,14 +10,18 @@
 2026-04-24 扩展：vLLM 换模型（Qwen3.5-122B-A10B → Kimi-K2.6）也得同步 model 字段，
   否则 agent 还按旧 model 名请求，新 vLLM 直接 404 NotFoundError。
 
-用法（vLLM endpoint/model 换新时）：
+2026-04-24 再扩展：Kimi-K2.6 vLLM max-model-len=32768（vs Qwen3.5 65536），
+  agent.llm_config.context_window 错配导致 letta 算输出 budget 不准, 也得同步.
+
+用法（vLLM endpoint/model/context_window 换新时）：
   1. 改 .env 的 VLLM_ENDPOINT + VLLM_API_KEY + OPENAI_API_KEY (+ VLLM_MODEL 可选)
   2. `docker compose up -d letta-server adapter`（recreate 才能重载 env）
-  3. `docker exec teleai-adapter python /app/scripts/sync_agent_endpoints.py --model Kimi-K2.6`
+  3. `docker exec teleai-adapter python /app/scripts/sync_agent_endpoints.py \\
+        --model Kimi-K2.6 --context-window 31000`
   4. 立刻打一次 letta-* 聊天验活
 
   干跑（不改数据）：加 --dry-run
-  只改 endpoint 不改 model：不传 --model
+  只改 endpoint 不改 model/window：不传 --model / --context-window
 """
 import argparse
 import os
@@ -34,6 +38,8 @@ def main():
                     help="新 endpoint；默认从 VLLM_ENDPOINT env 读")
     ap.add_argument("--model", default=os.environ.get("VLLM_MODEL"),
                     help="新 model 名（如 Kimi-K2.6）；不传则不改 model")
+    ap.add_argument("--context-window", type=int, default=None,
+                    help="新 context_window（如 31000）；不传则不改")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -41,8 +47,9 @@ def main():
         print("ERROR: 需要 VLLM_ENDPOINT env 或 --endpoint", file=sys.stderr)
         sys.exit(2)
 
-    print(f"target endpoint: {args.endpoint}")
-    print(f"target model:    {args.model or '(unchanged)'}")
+    print(f"target endpoint:       {args.endpoint}")
+    print(f"target model:          {args.model or '(unchanged)'}")
+    print(f"target context_window: {args.context_window if args.context_window is not None else '(unchanged)'}")
     print(f"dry_run: {args.dry_run}\n")
 
     updated = skipped = failed = 0
@@ -57,10 +64,12 @@ def main():
             lc = a.llm_config
             cur_endpoint = getattr(lc, "model_endpoint", None)
             cur_model = getattr(lc, "model", None)
+            cur_window = getattr(lc, "context_window", None)
 
             need_endpoint = cur_endpoint != args.endpoint
             need_model = args.model is not None and cur_model != args.model
-            if not (need_endpoint or need_model):
+            need_window = args.context_window is not None and cur_window != args.context_window
+            if not (need_endpoint or need_model or need_window):
                 skipped += 1
                 continue
 
@@ -69,6 +78,8 @@ def main():
                 changes.append(f"endpoint {cur_endpoint} → {args.endpoint}")
             if need_model:
                 changes.append(f"model {cur_model} → {args.model}")
+            if need_window:
+                changes.append(f"context_window {cur_window} → {args.context_window}")
             print(f"agent {a.id} ({a.name[:40]}): {'; '.join(changes)}")
 
             if args.dry_run:
@@ -81,6 +92,8 @@ def main():
                     new_lc["model_endpoint"] = args.endpoint
                 if need_model:
                     new_lc["model"] = args.model
+                if need_window:
+                    new_lc["context_window"] = args.context_window
                 letta.agents.update(agent_id=a.id, llm_config=new_lc)
                 updated += 1
             except Exception as e:

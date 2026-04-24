@@ -207,7 +207,7 @@ def _create_agent_fresh(user_id: str, project: str) -> str:
                 "model": "Kimi-K2.6",
                 "model_endpoint_type": "openai",
                 "model_endpoint": VLLM_ENDPOINT,
-                "context_window": 60000,
+                "context_window": 31000,
                 "enable_reasoner": True,
             },
             embedding_config={
@@ -312,11 +312,11 @@ def get_or_create_agent(user_id: str, project: str) -> str:
                 "model": "Kimi-K2.6",
                 "model_endpoint_type": "openai",
                 "model_endpoint": VLLM_ENDPOINT,
-                # 临港 vLLM max_model_len=65536, 留 ~5K 余量给 tool/hidden overhead。
-                # 32000 太小: 安全规范类知识密集 project (50+ PDF) 的 system prompt
-                # 轻易超 32K, 实测 biany security-mgmt project system prompt 51K。
-                # 见 2026-04-20 context_window_overflow_in_system_prompt 事故
-                "context_window": 60000,
+                # Kimi-K2.6 临港 vLLM max-model-len=32768, 留 ~1.7K 余量给 chat_template overhead。
+                # 注意: 知识密集 project (cpm/asset-management/security-management) system prompt
+                # 在 60K 时代就常顶满, 32K 下更紧, 可能触发 compact summarizer 失败,
+                # 用户需要在 WebUI "清除对话" 重建 agent.
+                "context_window": 31000,
                 "enable_reasoner": True,
             },
             # embedding_config 显式传 (Letta 存 None 会让某些路径抛异常, 保险做).
