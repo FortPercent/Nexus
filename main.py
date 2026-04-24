@@ -372,7 +372,7 @@ async def stream_from_letta(agent_id: str, message: str, model: str, notice_pref
                 err_type = (getattr(ev, "error_type", "") or "").lower()
                 msg = getattr(ev, "message", "") or ""
                 if "rate_limit" in err_type or "429" in msg:
-                    friendly = "⚠️ AI 模型限流，请稍等几秒重试"
+                    friendly = "⚠️ AI 正在排队中，请稍等几秒重试。当前模型较大、高峰时段可能需要等待"
                 elif "timeout" in err_type:
                     friendly = "⚠️ AI 响应超时，请重试"
                 else:

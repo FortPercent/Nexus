@@ -395,8 +395,8 @@ def _process(filename: str, data: bytes, depth: int = 0, counter=None) -> List[P
         # 未来要支持图片需要先在前面接 OCR / vision 模型转文字.
         raise HTTPException(
             400,
-            f"暂不支持图片格式 (.{ext}). 后端 Letta 只接受 PDF / 文本 / 代码文件; "
-            f"如需让 AI 看图请先 OCR 转文字或粘贴文字描述."
+            f"暂不支持上传图片（.{ext}）。要让 AI 理解图片内容，"
+            f"请把图里的关键文字粘贴或描述给它；图片识别能力我们已在规划中。"
         )
 
     if ext == "xls":
