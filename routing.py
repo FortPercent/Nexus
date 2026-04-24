@@ -198,13 +198,13 @@ def _create_agent_fresh(user_id: str, project: str) -> str:
 
         agent = letta.agents.create(
             name=f"user-{user_id}-{project}",
-            model="openai/Qwen3.5-122B-A10B",
+            model="openai/Kimi-K2.6",
             metadata={"owner": user_id, "project": project},
             tool_ids=custom_tool_ids,
             block_ids=[human_block_id],
             memory_blocks=[{"label": "persona", "value": PERSONA_TEXT}],
             llm_config={
-                "model": "Qwen3.5-122B-A10B",
+                "model": "Kimi-K2.6",
                 "model_endpoint_type": "openai",
                 "model_endpoint": VLLM_ENDPOINT,
                 "context_window": 60000,
@@ -298,7 +298,7 @@ def get_or_create_agent(user_id: str, project: str) -> str:
 
         agent = letta.agents.create(
             name=f"user-{user_id}-{project}",
-            model="openai/Qwen3.5-122B-A10B",
+            model="openai/Kimi-K2.6",
             metadata={"owner": user_id, "project": project},
             tool_ids=custom_tool_ids,
             block_ids=[human_block_id],
@@ -309,7 +309,7 @@ def get_or_create_agent(user_id: str, project: str) -> str:
                 },
             ],
             llm_config={
-                "model": "Qwen3.5-122B-A10B",
+                "model": "Kimi-K2.6",
                 "model_endpoint_type": "openai",
                 "model_endpoint": VLLM_ENDPOINT,
                 # 临港 vLLM max_model_len=65536, 留 ~5K 余量给 tool/hidden overhead。

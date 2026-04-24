@@ -473,7 +473,7 @@ async def chat_completions(request: Request):
 
         _internal_keys = {"files", "_letta_files", "user_id", "user_name", "user_email", "user_role", "user"}
         vllm_body = {k: v for k, v in body.items() if k not in _internal_keys}
-        vllm_body["model"] = "Qwen3.5-122B-A10B"
+        vllm_body["model"] = "Kimi-K2.6"
         vllm_body["chat_template_kwargs"] = {"enable_thinking": True}
 
         if body.get("stream", False):

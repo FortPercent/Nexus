@@ -418,7 +418,7 @@ async def stream_vllm_as_responses(user_msg: str, model: str, enable_thinking: b
         return evs
 
     vllm_body = {
-        "model": "Qwen3.5-122B-A10B",
+        "model": "Kimi-K2.6",
         "messages": [{"role": "user", "content": user_msg}],
         "stream": True,
         "stream_options": {"include_usage": True},
