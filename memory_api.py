@@ -27,6 +27,7 @@ pseudo-project 鉴权:
 - 其他 (真实 project) → 走 require_project_member / require_project_admin
 """
 import json
+import time
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -39,6 +40,7 @@ from auth import (
 )
 from config import ORG_ADMIN_EMAILS
 from db import use_db_async
+from memory_extractor import extract_decisions
 
 router = APIRouter(prefix="/memory/v1")
 
@@ -452,3 +454,93 @@ async def resolve_conflict(
         "strategy": body.strategy,
         "forgotten_memory_ids": forgotten,
     }
+
+
+# ---------- decisions ----------
+
+class InferMessage(BaseModel):
+    role: str = Field(description="user | assistant | system | meeting")
+    content: str
+
+
+class InferDecisionsBody(BaseModel):
+    messages: List[InferMessage] = Field(description="对话 / 纪要消息数组")
+    expected_decisions: int = Field(default=10, description="估计抽取数量, 用来动态算 max_tokens (4-30 合理)")
+    event_id: Optional[str] = Field(default=None, description="幂等键, 不传则后端生成 infer:<auto>")
+
+
+@router.post("/projects/{project_id}/decisions/infer")
+async def infer_decisions(
+    project_id: str,
+    body: InferDecisionsBody,
+    request: Request,
+):
+    """从 messages 抽决策, 写 decisions 表 + memory_history ADD 事件 + audit_log。
+
+    返回创建的 decision id 列表 + 解析出的内容预览。
+    同步实现 (单次 vLLM 调用 2-4 分钟); 量大时未来切异步队列。
+    """
+    user = await auth_project_write(request, project_id)
+    actor = user.get("id", "") if isinstance(user, dict) else ""
+
+    extracted = await extract_decisions(
+        [m.model_dump() for m in body.messages],
+        expected_decisions=body.expected_decisions,
+    )
+    if not extracted:
+        return {"data": [], "message": "no decisions extracted"}
+
+    src_msgs_json = [m.model_dump() for m in body.messages]
+    event_id_base = body.event_id or f"infer:{project_id}:{int(time.time())}"
+
+    created = []
+    async with use_db_async() as db:
+        for d in extracted:
+            cur = await db.execute(
+                """INSERT INTO decisions
+                   (project_id, content, owner, decided_at, deadline, status,
+                    rationale, source_messages, source_event_id, created_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    project_id, d.content, d.owner or "",
+                    d.decided_at, d.deadline, d.status,
+                    d.rationale or "",
+                    json.dumps(src_msgs_json, ensure_ascii=False),
+                    event_id_base,
+                    actor,
+                ),
+            )
+            decision_id = cur.lastrowid
+            mem_id = f"decision:{decision_id}"
+            await _record_memory_event_async(
+                db,
+                memory_id=mem_id,
+                project_id=project_id,
+                event_type="ADD",
+                new_memory=d.content,
+                event_id=f"decision_infer:{decision_id}",
+                source_messages=src_msgs_json,
+                actor_user_id=actor,
+            )
+            created.append({
+                "id": decision_id,
+                "memory_id": mem_id,
+                "content": d.content,
+                "owner": d.owner,
+                "deadline": d.deadline,
+                "status": d.status,
+            })
+
+        await _write_audit(
+            db,
+            user_id=actor,
+            action="memory.decision.infer",
+            scope=project_id,
+            details={
+                "event_id": event_id_base,
+                "created_count": len(created),
+                "created_ids": [c["id"] for c in created],
+            },
+        )
+
+    return {"data": created, "event_id": event_id_base}
