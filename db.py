@@ -354,6 +354,10 @@ def init_db():
             DELETE FROM decisions_fts WHERE rowid = old.id;
         END
     """)
+    # 外部内容 FTS5 (content='decisions') 不会自动 backfill 已有 decisions 行,
+    # 触发器只覆盖未来的 INSERT/UPDATE/DELETE。每次启动跑一次 rebuild 同步 (~ms 级,
+    # 即便 1000+ 行也极快),保证 FTS 索引和 decisions 表一致。
+    db.execute("INSERT INTO decisions_fts(decisions_fts) VALUES('rebuild')")
 
     db.commit()
     db.close()
