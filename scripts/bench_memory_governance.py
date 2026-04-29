@@ -97,12 +97,14 @@ async def main():
     print(f"开始: {time.strftime('%H:%M:%S')}\n")
 
     tiers = [
-        ("T1 list /decisions",       f"/memory/v1/projects/{pid}/decisions",                      100, 20),
-        ("T2 detail /decisions/2",   f"/memory/v1/projects/{pid}/decisions/2",                    50,  20),
-        ("T3 trace /decision:2",     f"/memory/v1/projects/{pid}/memories/decision:2/trace",      50,  20),
-        ("T4 list /conflicts",       f"/memory/v1/projects/{pid}/conflicts",                      100, 20),
-        ("T5 search Kimi",           f"/memory/v1/projects/{pid}/search?q=Kimi",                  100, 20),
-        ("T6 search 推理底座",        f"/memory/v1/projects/{pid}/search?q=" + urllib.parse.quote("推理底座"), 50, 20),
+        ("T1 list /decisions",          f"/memory/v1/projects/{pid}/decisions",                       100, 20),
+        ("T2 detail /decisions/2",      f"/memory/v1/projects/{pid}/decisions/2",                     50,  20),
+        ("T3 trace /decision:2",        f"/memory/v1/projects/{pid}/memories/decision:2/trace",       50,  20),
+        ("T4 list /conflicts",          f"/memory/v1/projects/{pid}/conflicts",                       100, 20),
+        ("T5 search decisions",         f"/memory/v1/projects/{pid}/search?kind=decisions&q=Kimi",    100, 20),
+        ("T6 search memories",          f"/memory/v1/projects/{pid}/search?kind=memories&q=GRPO",     100, 20),
+        ("T7 search all (UNION)",       f"/memory/v1/projects/{pid}/search?q=Kimi",                   100, 20),
+        ("T8 search 推理底座 all",       f"/memory/v1/projects/{pid}/search?q=" + urllib.parse.quote("推理底座"), 50, 20),
     ]
 
     results = []
