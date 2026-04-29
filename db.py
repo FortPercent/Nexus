@@ -321,5 +321,39 @@ def init_db():
     db.execute("CREATE INDEX IF NOT EXISTS idx_decisions_owner ON decisions(owner)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_decisions_parent ON decisions(parent_decision_id)")
 
+    # W4-1: decisions 全文索引 (FTS5)
+    # tokenize='unicode61' 默认能处理中英混合,中文按字符分(粒度细但能用)。
+    # content='decisions' 让 FTS 把数据存在原表,自身只存索引,节省空间。
+    # 对 SQLite 3.20+ 有效, 容器是 3.40+ OK。
+    db.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5(
+            content, rationale, owner,
+            content='decisions',
+            content_rowid='id',
+            tokenize='unicode61 remove_diacritics 2'
+        )
+    """)
+    # 同步触发器: decisions 写入后自动维护 FTS
+    db.execute("""
+        CREATE TRIGGER IF NOT EXISTS decisions_fts_ai AFTER INSERT ON decisions BEGIN
+            INSERT INTO decisions_fts(rowid, content, rationale, owner)
+            VALUES (new.id, new.content, COALESCE(new.rationale, ''), COALESCE(new.owner, ''));
+        END
+    """)
+    db.execute("""
+        CREATE TRIGGER IF NOT EXISTS decisions_fts_au AFTER UPDATE ON decisions BEGIN
+            UPDATE decisions_fts
+               SET content = new.content,
+                   rationale = COALESCE(new.rationale, ''),
+                   owner = COALESCE(new.owner, '')
+             WHERE rowid = new.id;
+        END
+    """)
+    db.execute("""
+        CREATE TRIGGER IF NOT EXISTS decisions_fts_ad AFTER DELETE ON decisions BEGIN
+            DELETE FROM decisions_fts WHERE rowid = old.id;
+        END
+    """)
+
     db.commit()
     db.close()

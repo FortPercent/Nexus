@@ -733,3 +733,91 @@ async def get_decision(project_id: str, decision_id: int, request: Request):
     detail["trace"] = trace
 
     return detail
+
+
+# ---------- search (W4-1: FTS5 over decisions) ----------
+
+# FTS5 special chars that need escaping or trigger query syntax (含 " - * + ^ : / ()).
+# 用户友好做法:把 query 当 phrase 处理 (双引号包起来)。
+# 中文场景下也用 phrase 让多字符术语连续匹配 (unicode61 把每个 CJK 字当 token,
+# 默认 AND 任意位置, phrase 才能保证顺序)。
+import re as _re
+_FTS_BAD_CHARS = _re.compile(r'["\x00]')
+
+
+def _build_fts_query(q: str) -> str:
+    """把用户输入转成 FTS5 安全的 phrase query。
+
+    "vLLM 推理"  → "vLLM 推理" (双引号 phrase, 顺序紧邻)
+    'foo"bar'   → "foo bar" (内部双引号清掉避免破坏 phrase)
+    空白 trim, 太短 / 全空 raise ValueError
+    """
+    cleaned = _FTS_BAD_CHARS.sub(" ", q).strip()
+    if len(cleaned) < 1:
+        raise ValueError("查询词不能为空")
+    return f'"{cleaned}"'
+
+
+@router.get("/projects/{project_id}/search")
+async def search_decisions(
+    project_id: str,
+    request: Request,
+    q: str,
+    limit: int = 20,
+    offset: int = 0,
+    status: Optional[str] = None,
+):
+    """对 decisions.content / rationale / owner 跑 FTS5 全文搜索。
+
+    返回匹配的 decision rows + bm25 rank + snippet 高亮(用 <mark> 包)。
+    Chinese 场景下 unicode61 把每个字当 token, 用 phrase query 保证多字符术语紧邻匹配。
+    """
+    await auth_project_read(request, project_id)
+
+    if limit < 1 or limit > 100:
+        raise HTTPException(400, "limit must be 1-100")
+    if offset < 0:
+        raise HTTPException(400, "offset must be >= 0")
+
+    try:
+        fts_q = _build_fts_query(q)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    where = ["decisions_fts MATCH ?", "d.project_id = ?"]
+    params: list = [fts_q, project_id]
+    if status:
+        where.append("d.status = ?")
+        params.append(status)
+
+    sql = f"""
+        SELECT d.id, d.project_id, d.content, d.owner, d.decided_at, d.deadline,
+               d.status, d.rationale, d.parent_decision_id, d.source_event_id,
+               d.created_by, d.created_at, d.updated_at,
+               snippet(decisions_fts, 0, '<mark>', '</mark>', '…', 24) AS snippet,
+               bm25(decisions_fts) AS rank
+        FROM decisions_fts
+        JOIN decisions d ON d.id = decisions_fts.rowid
+        WHERE {' AND '.join(where)}
+        ORDER BY rank
+        LIMIT ? OFFSET ?
+    """
+
+    async with use_db_async() as db:
+        try:
+            async with db.execute(sql, [*params, limit, offset]) as cur:
+                rows = await cur.fetchall()
+        except Exception as e:
+            raise HTTPException(400, f"FTS query 错误: {str(e)[:120]}")
+
+    return {
+        "data": [
+            {**_row_to_decision(r).model_dump(),
+             "snippet": r["snippet"],
+             "rank": float(r["rank"])}
+            for r in rows
+        ],
+        "q": q,
+        "limit": limit,
+        "offset": offset,
+    }
