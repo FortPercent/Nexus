@@ -1,32 +1,32 @@
-"""Memory trace + conflict + protection APIs (MemoryLake-inspired, /memory/v1/*)
+"""Memory trace + conflict + protection + decision + search APIs (MemoryLake-inspired, /memory/v1/*)
 
-设计参考 docs.memorylake.ai。当前提供的端点:
-- GET  /projects/{pid}/memories/{mid}/trace
-- GET  /projects/{pid}/conflicts                    (only_unresolved 默认 true)
-- GET  /projects/{pid}/conflicts/{cid}
-- POST /projects/{pid}/conflicts/{cid}/resolve     (项目 admin)
-- GET  /projects/{pid}/memories/{mid}/protection
-- PUT  /projects/{pid}/memories/{mid}/protection   (项目 admin)
+设计参考 docs.memorylake.ai。10 个端点:
+  GET  /projects/{pid}/memories/{mid}/trace
+  GET  /projects/{pid}/memories/{mid}/protection
+  PUT  /projects/{pid}/memories/{mid}/protection       项目 admin
+  GET  /projects/{pid}/conflicts
+  GET  /projects/{pid}/conflicts/{cid}
+  POST /projects/{pid}/conflicts/{cid}/resolve        项目 admin
+  POST /projects/{pid}/decisions/infer                项目 admin
+  GET  /projects/{pid}/decisions
+  GET  /projects/{pid}/decisions/{id}
+  GET  /projects/{pid}/search                         FTS5
 
 设计要点:
-- trace 返回当前 memory + 完整变更链, 每次变更附触发对话 (source_messages),
+- trace 返当前 memory + 完整变更链, 每次变更附触发对话 (source_messages),
   回答 "为什么这条 memory 现在长这样"
-- 冲突解决采用 4 策略人工决策:
-    keep_memory     保留指定一条, 其余 forget
-    trust_memory    冲突视为误报, memory 全留
-    trust_document  丢冲突的 memory, 以文档为准
-    dismiss         不处理 (误报标记)
-- 治理动作 (resolve / set protection) 同时写 audit_log, 留追责痕迹
+- 冲突 4 策略人工决策:keep_memory / trust_memory / trust_document / dismiss
+- Safety Memory enforce:read_only 拒 UPDATE/DELETE, append_only 拒 DELETE
+  规则源:memory_helpers.protection_blocks (sync/async 共用)
+- 治理动作 (resolve / set_protection / decision.infer) 都写 audit_log
 
-⚠️ Safety Memory 当前是 advisory only:protection_level 字段已存,但写路径
-   (file 上传 / decision 写入) 还没强制检查。enforce 的实现见 task #8。
-
-pseudo-project 鉴权:
+pseudo-project 鉴权 (auth_project_read / auth_project_write):
 - "org"            → 任意登录用户可读, ORG_ADMIN_EMAILS 可写
 - "personal:<uid>" → 仅 uid 本人可读写
 - 其他 (真实 project) → 走 require_project_member / require_project_admin
 """
 import json
+import re
 import time
 from typing import List, Optional
 
@@ -41,6 +41,7 @@ from auth import (
 from config import ORG_ADMIN_EMAILS
 from db import use_db_async
 from memory_extractor import extract_decisions
+from memory_helpers import protection_blocks
 
 router = APIRouter(prefix="/memory/v1")
 
@@ -83,30 +84,20 @@ async def auth_project_write(request: Request, project_id: str) -> dict:
 # ---------- helpers ----------
 
 async def _enforce_protection_async(db, memory_id: str, event_type: str) -> None:
-    """async 版 protection 检查。
+    """async 版 protection 检查 (规则共享 memory_helpers.protection_blocks)。
 
-    raise HTTPException(403) 拒绝(给 API 调用方一个明确的 4xx 响应);
-    返回 None 表示放行。
+    raise HTTPException(403) 拒绝;返回 None 表示放行。
     """
     async with db.execute(
         "SELECT protection_level FROM memory_protection WHERE memory_id = ?",
         (memory_id,),
     ) as cur:
         row = await cur.fetchone()
-    if not row:
-        return  # 默认 mutable
-    level = row["protection_level"]
-    if level == "mutable":
-        return
-    if level == "read_only" and event_type in ("UPDATE", "DELETE"):
+    level = row["protection_level"] if row else None
+    if protection_blocks(level, event_type):
         raise HTTPException(
             status_code=403,
-            detail=f"memory_id={memory_id} 是 read_only, 拒绝 {event_type}",
-        )
-    if level == "append_only" and event_type == "DELETE":
-        raise HTTPException(
-            status_code=403,
-            detail=f"memory_id={memory_id} 是 append_only, 拒绝 DELETE",
+            detail=f"memory_id={memory_id} 是 {level}, 拒绝 {event_type}",
         )
 
 
@@ -120,13 +111,15 @@ async def _record_memory_event_async(
     event_id: str = "",
     source_messages: Optional[list] = None,
     actor_user_id: str = "",
-) -> int:
-    """写一条 memory 变更记录(在传入的 async db 连接里, 共用调用方 transaction)。
+) -> Optional[int]:
+    """写一条 memory_history (在传入的 async db 连接里, 共用调用方 transaction)。
 
-    sync 版在 memory_helpers.record_memory_event,带幂等检查;
-    async 版本在 transaction 里走原 INSERT,依赖 uq_mh_memory_event 部分索引兜底。
-    Safety Memory: 写入前调 _enforce_protection_async, 拒绝直接 raise 403,
-    上层 transaction 自动 rollback。
+    幂等:同 (memory_id, event_id) 已存在 (uq_mh_memory_event 部分索引)
+    会被 ON CONFLICT DO NOTHING 静默跳过, 返 None。
+
+    Safety Memory:写入前 enforce, 拒绝 raise 403 (上层 transaction 自动 rollback)。
+
+    返:history_id 或 None (幂等跳过)。
     """
     if event_type not in ("ADD", "UPDATE", "DELETE"):
         raise ValueError(f"invalid event_type: {event_type}")
@@ -135,10 +128,11 @@ async def _record_memory_event_async(
     cur = await db.execute(
         """INSERT INTO memory_history
            (memory_id, project_id, event_type, new_memory, event_id, source_messages, actor_user_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(memory_id, event_id) DO NOTHING""",
         (memory_id, project_id, event_type, new_memory, event_id, msgs_json, actor_user_id),
     )
-    return cur.lastrowid
+    return cur.lastrowid if cur.rowcount > 0 else None
 
 
 async def _write_audit(db, *, user_id: str, action: str, scope: str, details: dict) -> None:
@@ -366,7 +360,7 @@ async def set_protection(
             detail=f"protection_level must be one of {sorted(VALID_PROTECTION_LEVELS)}",
         )
 
-    actor = user.get("id", "") if isinstance(user, dict) else ""
+    actor = user.get("id", "")  # auth_project_* 总返 dict
 
     async with use_db_async() as db:
         await db.execute(
@@ -416,7 +410,7 @@ async def resolve_conflict(
             detail="keep_memory_id is required when strategy=keep_memory",
         )
 
-    actor = user.get("id", "") if isinstance(user, dict) else ""
+    actor = user.get("id", "")  # auth_project_* 总返 dict
 
     async with use_db_async() as db:
         # 1. 读 memory_ids 算 forgotten (read-only, race OK; gate 在下一步)
@@ -515,7 +509,7 @@ async def infer_decisions(
     同步实现 (单次 vLLM 调用 2-4 分钟); 量大时未来切异步队列。
     """
     user = await auth_project_write(request, project_id)
-    actor = user.get("id", "") if isinstance(user, dict) else ""
+    actor = user.get("id", "")  # auth_project_* 总返 dict
 
     extracted = await extract_decisions(
         [m.model_dump() for m in body.messages],
@@ -737,12 +731,10 @@ async def get_decision(project_id: str, decision_id: int, request: Request):
 
 # ---------- search (W4-1: FTS5 over decisions) ----------
 
-# FTS5 special chars that need escaping or trigger query syntax (含 " - * + ^ : / ()).
-# 用户友好做法:把 query 当 phrase 处理 (双引号包起来)。
-# 中文场景下也用 phrase 让多字符术语连续匹配 (unicode61 把每个 CJK 字当 token,
-# 默认 AND 任意位置, phrase 才能保证顺序)。
-import re as _re
-_FTS_BAD_CHARS = _re.compile(r'["\x00]')
+# 用户输入用 phrase 包裹防 FTS5 把 token 解析成 operator (NOT/AND/OR/*/...)。
+# 中文场景下也包 phrase 让单 chunk 连续匹配 (trigram 索引 3 字符滑窗)。
+# 多 chunk 拆开各自 phrase, 隐式 AND, 顺序无关。
+_FTS_BAD_CHARS = re.compile(r'["\x00]')
 
 
 def _build_fts_query(q: str) -> str:

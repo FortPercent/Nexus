@@ -40,6 +40,23 @@ class ProtectionViolation(Exception):
         )
 
 
+def protection_blocks(level: Optional[str], event_type: str) -> bool:
+    """pure 规则函数:protection_level 是否拒绝该 event_type。
+
+    单一定义, sync 和 async 调用方共用 (避免规则漂移)。
+      mutable / 空 / 未知:不拒绝
+      read_only:拒绝 UPDATE / DELETE
+      append_only:拒绝 DELETE
+    """
+    if not level or level == "mutable":
+        return False
+    if level == "read_only":
+        return event_type in ("UPDATE", "DELETE")
+    if level == "append_only":
+        return event_type == "DELETE"
+    return False  # 未知 level → 当 mutable 处理 (defensive)
+
+
 def _enforce_protection_sync(db, memory_id: str, event_type: str) -> None:
     """sync 版 protection 检查。共用调用方的 db 连接。
 
@@ -49,14 +66,8 @@ def _enforce_protection_sync(db, memory_id: str, event_type: str) -> None:
         "SELECT protection_level FROM memory_protection WHERE memory_id = ?",
         (memory_id,),
     ).fetchone()
-    if not row:
-        return  # 默认 mutable
-    level = row["protection_level"]
-    if level == "mutable":
-        return
-    if level == "read_only" and event_type in ("UPDATE", "DELETE"):
-        raise ProtectionViolation(memory_id, level, event_type)
-    if level == "append_only" and event_type == "DELETE":
+    level = row["protection_level"] if row else None
+    if protection_blocks(level, event_type):
         raise ProtectionViolation(memory_id, level, event_type)
 
 
@@ -231,11 +242,19 @@ def detect_and_record_conflict(
 
 
 def scope_to_project_id(scope: str, scope_id: str, owner_id: str = "") -> str:
-    """统一 scope/scope_id → project_id 维度,跟 backfill 脚本一致。"""
+    """统一 scope/scope_id → project_id 维度,跟 backfill 脚本一致。
+
+    未知 scope 直接 raise, 不返垃圾值 (e.g. "unknown") 污染 project_id 列。
+    """
     if scope == "project":
-        return scope_id or owner_id or ""
+        if not scope_id:
+            raise ValueError("scope=project 必须提供 scope_id")
+        return scope_id
     if scope == "personal":
-        return f"personal:{scope_id or owner_id}"
+        owner = scope_id or owner_id
+        if not owner:
+            raise ValueError("scope=personal 必须提供 scope_id 或 owner_id")
+        return f"personal:{owner}"
     if scope == "org":
         return "org"
-    return scope_id or owner_id or "unknown"
+    raise ValueError(f"未知 scope: {scope!r}")
