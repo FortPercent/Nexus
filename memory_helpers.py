@@ -1,4 +1,4 @@
-"""Sync helpers for memory_history / memory_conflicts.
+"""Sync helpers for memory_history / memory_conflicts / Safety Memory enforce.
 
 供 knowledge_mirror / webui_hook 等同步路径调用。memory_api.py 是 async,
 两边公用的写入逻辑放在这里避免循环导入。
@@ -8,6 +8,14 @@
     - file:<letta_file_id>   ← 一个逻辑文件
     - passage:<passage_id>   ← 将来扩
     - decision:<decision_id> ← 将来扩
+
+Safety Memory protection_level 语义 (此处 enforce):
+  - mutable    (默认): 任何 ADD/UPDATE/DELETE 放行
+  - append_only:       允许 ADD/UPDATE, 拒绝 DELETE
+  - read_only:         允许 ADD (新建用), 但拒绝 UPDATE/DELETE
+                       ADD 不拦截是因为我们 INSERT OR IGNORE 模式下
+                       新事件如果 (memory_id, event_id) 已存在自然跳过,
+                       重复 ADD 实际上不会真写入 (uq_mh_memory_event 兜底)
 """
 from __future__ import annotations
 
@@ -18,6 +26,56 @@ from typing import Optional
 from db import use_db
 
 logger = logging.getLogger(__name__)
+
+
+class ProtectionViolation(Exception):
+    """memory protection_level 拒绝写动作。caller 应捕获并决定降级行为。"""
+
+    def __init__(self, memory_id: str, level: str, event_type: str):
+        self.memory_id = memory_id
+        self.level = level
+        self.event_type = event_type
+        super().__init__(
+            f"memory_id={memory_id} 设置为 {level}, 拒绝 {event_type}"
+        )
+
+
+def _enforce_protection_sync(db, memory_id: str, event_type: str) -> None:
+    """sync 版 protection 检查。共用调用方的 db 连接。
+
+    raise ProtectionViolation 表示拒绝;返回 None 表示放行。
+    """
+    row = db.execute(
+        "SELECT protection_level FROM memory_protection WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()
+    if not row:
+        return  # 默认 mutable
+    level = row["protection_level"]
+    if level == "mutable":
+        return
+    if level == "read_only" and event_type in ("UPDATE", "DELETE"):
+        raise ProtectionViolation(memory_id, level, event_type)
+    if level == "append_only" and event_type == "DELETE":
+        raise ProtectionViolation(memory_id, level, event_type)
+
+
+def _audit_protection_block_sync(
+    db, *, memory_id: str, level: str, event_type: str, actor_user_id: str
+) -> None:
+    """拒绝事件写 audit_log 留痕。"""
+    db.execute(
+        "INSERT INTO audit_log (user_id, action, scope, details) VALUES (?, ?, ?, ?)",
+        (
+            actor_user_id or "",
+            "memory.protection.block",
+            "",
+            json.dumps(
+                {"memory_id": memory_id, "protection_level": level, "blocked_event": event_type},
+                ensure_ascii=False,
+            ),
+        ),
+    )
 
 
 def record_memory_event(
@@ -32,19 +90,42 @@ def record_memory_event(
 ) -> Optional[int]:
     """写一条 memory_history。同 (memory_id, event_id) 已存在则跳过(幂等)。
 
-    返回 history_id 或 None(已存在)。
+    Safety Memory: 写入前检查 protection_level, 拒绝时:
+      - 写一条 memory.protection.block audit
+      - raise ProtectionViolation, caller 决定降级行为(skip / propagate)
+
+    返回 history_id;已存在返 None;被拒绝 raise ProtectionViolation。
     """
     if event_type not in ("ADD", "UPDATE", "DELETE"):
         raise ValueError(f"invalid event_type: {event_type}")
 
     msgs_json = json.dumps(source_messages or [], ensure_ascii=False)
     with use_db() as db:
+        # 幂等:同 (memory_id, event_id) 已写过则跳过
         existing = db.execute(
             "SELECT history_id FROM memory_history WHERE memory_id = ? AND event_id = ?",
             (memory_id, event_id),
         ).fetchone()
         if existing:
             return None
+
+        # Safety Memory enforce
+        try:
+            _enforce_protection_sync(db, memory_id, event_type)
+        except ProtectionViolation as exc:
+            _audit_protection_block_sync(
+                db,
+                memory_id=memory_id,
+                level=exc.level,
+                event_type=event_type,
+                actor_user_id=actor_user_id,
+            )
+            logger.warning(
+                f"[memory] protection block: memory_id={memory_id} level={exc.level} "
+                f"event_type={event_type} actor={actor_user_id}"
+            )
+            raise
+
         cur = db.execute(
             """INSERT INTO memory_history
                (memory_id, project_id, event_type, new_memory, event_id,

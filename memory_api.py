@@ -82,6 +82,34 @@ async def auth_project_write(request: Request, project_id: str) -> dict:
 
 # ---------- helpers ----------
 
+async def _enforce_protection_async(db, memory_id: str, event_type: str) -> None:
+    """async 版 protection 检查。
+
+    raise HTTPException(403) 拒绝(给 API 调用方一个明确的 4xx 响应);
+    返回 None 表示放行。
+    """
+    async with db.execute(
+        "SELECT protection_level FROM memory_protection WHERE memory_id = ?",
+        (memory_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if not row:
+        return  # 默认 mutable
+    level = row["protection_level"]
+    if level == "mutable":
+        return
+    if level == "read_only" and event_type in ("UPDATE", "DELETE"):
+        raise HTTPException(
+            status_code=403,
+            detail=f"memory_id={memory_id} 是 read_only, 拒绝 {event_type}",
+        )
+    if level == "append_only" and event_type == "DELETE":
+        raise HTTPException(
+            status_code=403,
+            detail=f"memory_id={memory_id} 是 append_only, 拒绝 DELETE",
+        )
+
+
 async def _record_memory_event_async(
     db,
     *,
@@ -97,9 +125,12 @@ async def _record_memory_event_async(
 
     sync 版在 memory_helpers.record_memory_event,带幂等检查;
     async 版本在 transaction 里走原 INSERT,依赖 uq_mh_memory_event 部分索引兜底。
+    Safety Memory: 写入前调 _enforce_protection_async, 拒绝直接 raise 403,
+    上层 transaction 自动 rollback。
     """
     if event_type not in ("ADD", "UPDATE", "DELETE"):
         raise ValueError(f"invalid event_type: {event_type}")
+    await _enforce_protection_async(db, memory_id, event_type)
     msgs_json = json.dumps(source_messages or [], ensure_ascii=False)
     cur = await db.execute(
         """INSERT INTO memory_history
