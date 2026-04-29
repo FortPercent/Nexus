@@ -544,3 +544,158 @@ async def infer_decisions(
         )
 
     return {"data": created, "event_id": event_id_base}
+
+
+# ---------- decision list / detail ----------
+
+class DecisionRow(BaseModel):
+    id: int
+    project_id: str
+    memory_id: str  # 派生 "decision:<id>"
+    content: str
+    owner: str = ""
+    decided_at: Optional[str] = None
+    deadline: Optional[str] = None
+    status: str
+    rationale: str = ""
+    parent_decision_id: Optional[int] = None
+    source_event_id: str = ""
+    created_by: str = ""
+    created_at: str
+    updated_at: str
+
+
+def _row_to_decision(r) -> DecisionRow:
+    return DecisionRow(
+        id=r["id"],
+        project_id=r["project_id"],
+        memory_id=f"decision:{r['id']}",
+        content=r["content"],
+        owner=r["owner"] or "",
+        decided_at=str(r["decided_at"]) if r["decided_at"] else None,
+        deadline=str(r["deadline"]) if r["deadline"] else None,
+        status=r["status"],
+        rationale=r["rationale"] or "",
+        parent_decision_id=r["parent_decision_id"],
+        source_event_id=r["source_event_id"] or "",
+        created_by=r["created_by"] or "",
+        created_at=str(r["created_at"]),
+        updated_at=str(r["updated_at"]),
+    )
+
+
+@router.get("/projects/{project_id}/decisions")
+async def list_decisions(
+    project_id: str,
+    request: Request,
+    owner: Optional[str] = None,
+    status: Optional[str] = None,
+    decided_from: Optional[str] = None,   # YYYY-MM-DD 包含
+    decided_to: Optional[str] = None,     # YYYY-MM-DD 包含
+    limit: int = 50,
+    offset: int = 0,
+):
+    await auth_project_read(request, project_id)
+
+    if limit < 1 or limit > 500:
+        raise HTTPException(400, "limit must be 1-500")
+    if offset < 0:
+        raise HTTPException(400, "offset must be >= 0")
+
+    where = ["project_id = ?"]
+    params: list = [project_id]
+    if owner:
+        where.append("owner = ?")
+        params.append(owner)
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    if decided_from:
+        where.append("decided_at >= ?")
+        params.append(decided_from)
+    if decided_to:
+        where.append("decided_at <= ?")
+        params.append(decided_to)
+
+    sql_count = f"SELECT COUNT(*) AS n FROM decisions WHERE {' AND '.join(where)}"
+    sql_list = (
+        f"SELECT * FROM decisions WHERE {' AND '.join(where)} "
+        "ORDER BY decided_at DESC NULLS LAST, id DESC LIMIT ? OFFSET ?"
+    )
+
+    async with use_db_async() as db:
+        async with db.execute(sql_count, params) as cur:
+            total = (await cur.fetchone())["n"]
+        async with db.execute(sql_list, [*params, limit, offset]) as cur:
+            rows = await cur.fetchall()
+
+    return {
+        "data": [_row_to_decision(r).model_dump() for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.get("/projects/{project_id}/decisions/{decision_id}")
+async def get_decision(project_id: str, decision_id: int, request: Request):
+    """决策详情 + 上游(被取代的)+ 下游(取代它的)+ 完整 trace。"""
+    await auth_project_read(request, project_id)
+
+    async with use_db_async() as db:
+        async with db.execute(
+            "SELECT * FROM decisions WHERE id = ? AND project_id = ?",
+            (decision_id, project_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            raise HTTPException(404, "decision not found")
+
+        parent = None
+        if row["parent_decision_id"]:
+            async with db.execute(
+                "SELECT * FROM decisions WHERE id = ?", (row["parent_decision_id"],),
+            ) as cur:
+                p = await cur.fetchone()
+                if p:
+                    parent = _row_to_decision(p).model_dump()
+
+        async with db.execute(
+            "SELECT * FROM decisions WHERE parent_decision_id = ? ORDER BY id ASC",
+            (decision_id,),
+        ) as cur:
+            children = [_row_to_decision(r).model_dump() for r in await cur.fetchall()]
+
+        # 复用 trace 查询逻辑(直接 inline,避免 endpoint 间互调)
+        memory_id = f"decision:{decision_id}"
+        async with db.execute(
+            """SELECT history_id, event_type, new_memory, expired, event_id,
+                      source_messages, actor_user_id, changed_at
+               FROM memory_history
+               WHERE project_id = ? AND memory_id = ?
+               ORDER BY changed_at ASC, history_id ASC""",
+            (project_id, memory_id),
+        ) as cur:
+            trace_rows = await cur.fetchall()
+
+    trace = [
+        {
+            "history_id": r["history_id"],
+            "event_type": r["event_type"],
+            "new_memory": r["new_memory"],
+            "expired": bool(r["expired"]),
+            "changed_at": str(r["changed_at"]),
+            "event_id": r["event_id"] or "",
+            "source_messages": json.loads(r["source_messages"] or "[]"),
+            "actor_user_id": r["actor_user_id"] or "",
+        }
+        for r in trace_rows
+    ]
+
+    detail = _row_to_decision(row).model_dump()
+    detail["source_messages"] = json.loads(row["source_messages"] or "[]")
+    detail["parent"] = parent
+    detail["children"] = children
+    detail["trace"] = trace
+
+    return detail
