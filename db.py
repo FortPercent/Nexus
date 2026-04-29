@@ -234,5 +234,58 @@ def init_db():
     db.execute("CREATE INDEX IF NOT EXISTS idx_pfiles_source ON project_files(source)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_pfiles_webui ON project_files(webui_file_id)")
 
+    # MemoryLake-inspired: 记忆变更链 (每次 ADD/UPDATE/DELETE 留痕,带触发对话)
+    # memory_id 对应 Letta archival passage_id 或自定义 memory cell id
+    # source_messages JSON 数组,记触发这次变更的对话片段,可回答"为什么这条 memory 长这样"
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS memory_history (
+            history_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id       TEXT NOT NULL,
+            project_id      TEXT NOT NULL,
+            event_type      TEXT NOT NULL,
+            new_memory      TEXT NOT NULL,
+            expired         INTEGER DEFAULT 0,
+            event_id        TEXT DEFAULT '',
+            source_messages TEXT DEFAULT '[]',
+            actor_user_id   TEXT DEFAULT '',
+            changed_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_mh_memory ON memory_history(memory_id, changed_at DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_mh_project ON memory_history(project_id, changed_at DESC)")
+
+    # MemoryLake-inspired: 冲突检测 + 4 策略人工解决
+    # strategy 枚举: keep_memory / trust_memory / trust_document / dismiss
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS memory_conflicts (
+            conflict_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id       TEXT NOT NULL,
+            memory_ids       TEXT NOT NULL,
+            detected_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            detection_reason TEXT DEFAULT '',
+            resolved_at      TIMESTAMP,
+            resolved_by      TEXT DEFAULT '',
+            strategy         TEXT DEFAULT '',
+            kept_memory_id   TEXT DEFAULT '',
+            forgotten_ids    TEXT DEFAULT '[]'
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_mc_project_unresolved ON memory_conflicts(project_id, resolved_at)")
+
+    # MemoryLake "Safety Memory" 启发: 制度类 / 法规类 memory 应该 write-protected
+    # protection_level: read_only(只读) / append_only(只能加新版本不能改旧) / mutable(默认可改)
+    # 仅项目 admin / org admin 可改 protection_level 本身
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS memory_protection (
+            memory_id        TEXT PRIMARY KEY,
+            project_id       TEXT NOT NULL,
+            protection_level TEXT NOT NULL DEFAULT 'mutable',
+            set_by           TEXT DEFAULT '',
+            set_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reason           TEXT DEFAULT ''
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_mp_project ON memory_protection(project_id)")
+
     db.commit()
     db.close()

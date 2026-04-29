@@ -777,3 +777,7 @@ app.include_router(kb_router)
 # Phase 5c: WebUI 原生 knowledge/add 兜底 hook (nginx mirror 转发到这)
 from webui_hook import router as webui_hook_router
 app.include_router(webui_hook_router)
+
+# Nexus 2.0: 记忆治理 API (trace + conflict)
+from memory_api import router as memory_router
+app.include_router(memory_router)
