@@ -746,16 +746,20 @@ _FTS_BAD_CHARS = _re.compile(r'["\x00]')
 
 
 def _build_fts_query(q: str) -> str:
-    """把用户输入转成 FTS5 安全的 phrase query。
+    """把用户输入转成 FTS5 安全的查询。
 
-    "vLLM 推理"  → "vLLM 推理" (双引号 phrase, 顺序紧邻)
-    'foo"bar'   → "foo bar" (内部双引号清掉避免破坏 phrase)
-    空白 trim, 太短 / 全空 raise ValueError
+    单词 → phrase 包起来(防 token 被解析成操作符):"Kimi" 形成单 phrase
+    多词 → 各 chunk phrase 包,默认 AND 语义:"Nexus" "治理模块" 都要出现(任意位置)
+
+    内部双引号清掉避免破坏 phrase 嵌套。空 / 全空白 raise ValueError。
     """
     cleaned = _FTS_BAD_CHARS.sub(" ", q).strip()
-    if len(cleaned) < 1:
+    if not cleaned:
         raise ValueError("查询词不能为空")
-    return f'"{cleaned}"'
+    chunks = cleaned.split()
+    if len(chunks) == 1:
+        return f'"{chunks[0]}"'
+    return " ".join(f'"{c}"' for c in chunks)
 
 
 @router.get("/projects/{project_id}/search")
