@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "nexus": {
+      "command": "python3",
+      "args": ["/path/to/nexus_mcp_stdio.py"],
+      "env": {
+        "NEXUS_URL": "http://192.168.151.46:9800",
+        "NEXUS_TOKEN": "<paste your Open WebUI JWT here>"
+      }
+    }
+  }
+}
