@@ -762,19 +762,26 @@ def _build_fts_query(q: str) -> str:
     return " ".join(f'"{c}"' for c in chunks)
 
 
+VALID_SEARCH_KINDS = {"decisions", "memories", "all"}
+
+
 @router.get("/projects/{project_id}/search")
-async def search_decisions(
+async def search_memory(
     project_id: str,
     request: Request,
     q: str,
+    kind: str = "all",       # decisions | memories | all
     limit: int = 20,
     offset: int = 0,
-    status: Optional[str] = None,
+    status: Optional[str] = None,  # 仅 kind=decisions / all 生效
 ):
-    """对 decisions.content / rationale / owner 跑 FTS5 全文搜索。
+    """跨 decisions 和 memory_history 的 FTS5 检索。
 
-    返回匹配的 decision rows + bm25 rank + snippet 高亮(用 <mark> 包)。
-    Chinese 场景下 unicode61 把每个字当 token, 用 phrase query 保证多字符术语紧邻匹配。
+    kind=decisions:  搜 decisions(content/rationale/owner)
+    kind=memories:   搜 memory_history(new_memory)
+    kind=all (默认): UNION ALL 两表, ORDER BY rank
+    每条结果带 kind 字段区分;decision 命中含 owner / status / decided_at 等业务字段,
+    memory 命中含 memory_id / event_type / changed_at。
     """
     await auth_project_read(request, project_id)
 
@@ -782,46 +789,89 @@ async def search_decisions(
         raise HTTPException(400, "limit must be 1-100")
     if offset < 0:
         raise HTTPException(400, "offset must be >= 0")
+    if kind not in VALID_SEARCH_KINDS:
+        raise HTTPException(400, f"kind must be one of {sorted(VALID_SEARCH_KINDS)}")
 
     try:
         fts_q = _build_fts_query(q)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    where = ["decisions_fts MATCH ?", "d.project_id = ?"]
-    params: list = [fts_q, project_id]
-    if status:
-        where.append("d.status = ?")
-        params.append(status)
-
-    sql = f"""
-        SELECT d.id, d.project_id, d.content, d.owner, d.decided_at, d.deadline,
-               d.status, d.rationale, d.parent_decision_id, d.source_event_id,
-               d.created_by, d.created_at, d.updated_at,
+    decisions_sql = f"""
+        SELECT 'decision' AS kind, d.id AS pk, d.project_id, d.content,
+               d.owner, d.decided_at, d.deadline, d.status, d.rationale,
+               d.parent_decision_id, d.source_event_id, d.created_by,
+               d.created_at, d.updated_at,
+               NULL AS memory_id_out, NULL AS event_type, NULL AS changed_at,
                snippet(decisions_fts, 0, '<mark>', '</mark>', '…', 24) AS snippet,
                bm25(decisions_fts) AS rank
         FROM decisions_fts
         JOIN decisions d ON d.id = decisions_fts.rowid
-        WHERE {' AND '.join(where)}
-        ORDER BY rank
-        LIMIT ? OFFSET ?
+        WHERE decisions_fts MATCH ? AND d.project_id = ?
+              {"AND d.status = ?" if status else ""}
     """
+
+    memories_sql = """
+        SELECT 'memory' AS kind, mh.history_id AS pk, mh.project_id, mh.new_memory AS content,
+               NULL AS owner, NULL AS decided_at, NULL AS deadline, NULL AS status,
+               NULL AS rationale, NULL AS parent_decision_id, NULL AS source_event_id,
+               mh.actor_user_id AS created_by, mh.changed_at AS created_at, mh.changed_at AS updated_at,
+               mh.memory_id AS memory_id_out, mh.event_type, mh.changed_at,
+               snippet(memory_history_fts, 0, '<mark>', '</mark>', '…', 24) AS snippet,
+               bm25(memory_history_fts) AS rank
+        FROM memory_history_fts
+        JOIN memory_history mh ON mh.history_id = memory_history_fts.rowid
+        WHERE memory_history_fts MATCH ? AND mh.project_id = ?
+    """
+
+    if kind == "decisions":
+        sql = decisions_sql + " ORDER BY rank LIMIT ? OFFSET ?"
+        params = [fts_q, project_id]
+        if status:
+            params.append(status)
+        params += [limit, offset]
+    elif kind == "memories":
+        sql = memories_sql + " ORDER BY rank LIMIT ? OFFSET ?"
+        params = [fts_q, project_id, limit, offset]
+    else:  # all
+        sql = f"{decisions_sql} UNION ALL {memories_sql} ORDER BY rank LIMIT ? OFFSET ?"
+        params = [fts_q, project_id]
+        if status:
+            params.append(status)
+        params += [fts_q, project_id, limit, offset]
 
     async with use_db_async() as db:
         try:
-            async with db.execute(sql, [*params, limit, offset]) as cur:
+            async with db.execute(sql, params) as cur:
                 rows = await cur.fetchall()
         except Exception as e:
             raise HTTPException(400, f"FTS query 错误: {str(e)[:120]}")
 
-    return {
-        "data": [
-            {**_row_to_decision(r).model_dump(),
-             "snippet": r["snippet"],
-             "rank": float(r["rank"])}
-            for r in rows
-        ],
-        "q": q,
-        "limit": limit,
-        "offset": offset,
-    }
+    data = []
+    for r in rows:
+        item = {
+            "kind": r["kind"],
+            "rank": float(r["rank"]),
+            "snippet": r["snippet"],
+            "content": r["content"],
+            "project_id": r["project_id"],
+        }
+        if r["kind"] == "decision":
+            item.update({
+                "id": r["pk"],
+                "memory_id": f"decision:{r['pk']}",
+                "owner": r["owner"] or "",
+                "status": r["status"],
+                "decided_at": str(r["decided_at"]) if r["decided_at"] else None,
+                "deadline": str(r["deadline"]) if r["deadline"] else None,
+            })
+        else:  # memory
+            item.update({
+                "history_id": r["pk"],
+                "memory_id": r["memory_id_out"],
+                "event_type": r["event_type"],
+                "changed_at": str(r["changed_at"]) if r["changed_at"] else None,
+            })
+        data.append(item)
+
+    return {"data": data, "q": q, "kind": kind, "limit": limit, "offset": offset}

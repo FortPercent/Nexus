@@ -370,5 +370,43 @@ def init_db():
     # 即便 1000+ 行也极快),保证 FTS 索引和 decisions 表一致。
     db.execute("INSERT INTO decisions_fts(decisions_fts) VALUES('rebuild')")
 
+    # W4-2: memory_history 全文索引 (同样 trigram tokenizer)
+    # 索引 new_memory 字段, 是事件流的内容摘要 (e.g. "[文件] xxx.pdf" / 决策内容)
+    # 1180+ 行 startup rebuild 也在 ms 级
+    mh_existing = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_history_fts'"
+    ).fetchone()
+    if mh_existing and "trigram" not in (mh_existing[0] or "").lower():
+        for trig in ("memory_history_fts_ai", "memory_history_fts_au", "memory_history_fts_ad"):
+            db.execute(f"DROP TRIGGER IF EXISTS {trig}")
+        db.execute("DROP TABLE IF EXISTS memory_history_fts")
+
+    db.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_history_fts USING fts5(
+            new_memory,
+            content='memory_history',
+            content_rowid='history_id',
+            tokenize='trigram'
+        )
+    """)
+    db.execute("""
+        CREATE TRIGGER IF NOT EXISTS memory_history_fts_ai AFTER INSERT ON memory_history BEGIN
+            INSERT INTO memory_history_fts(rowid, new_memory)
+            VALUES (new.history_id, new.new_memory);
+        END
+    """)
+    db.execute("""
+        CREATE TRIGGER IF NOT EXISTS memory_history_fts_au AFTER UPDATE ON memory_history BEGIN
+            UPDATE memory_history_fts SET new_memory = new.new_memory
+             WHERE rowid = new.history_id;
+        END
+    """)
+    db.execute("""
+        CREATE TRIGGER IF NOT EXISTS memory_history_fts_ad AFTER DELETE ON memory_history BEGIN
+            DELETE FROM memory_history_fts WHERE rowid = old.history_id;
+        END
+    """)
+    db.execute("INSERT INTO memory_history_fts(memory_history_fts) VALUES('rebuild')")
+
     db.commit()
     db.close()
