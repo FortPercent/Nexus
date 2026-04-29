@@ -125,11 +125,14 @@ async def _record_memory_event_async(
         raise ValueError(f"invalid event_type: {event_type}")
     await _enforce_protection_async(db, memory_id, event_type)
     msgs_json = json.dumps(source_messages or [], ensure_ascii=False)
+    # INSERT OR IGNORE 而不是 ON CONFLICT(...) DO NOTHING:
+    # uq_mh_memory_event 是部分索引 (WHERE event_id != ''), SQLite ON CONFLICT 的
+    # 显式 target 不接受部分索引。INSERT OR IGNORE 触发任何 constraint violation 都
+    # silently 跳, 对本表只有 uq 索引能 trip, 行为等价。
     cur = await db.execute(
-        """INSERT INTO memory_history
+        """INSERT OR IGNORE INTO memory_history
            (memory_id, project_id, event_type, new_memory, event_id, source_messages, actor_user_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(memory_id, event_id) DO NOTHING""",
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (memory_id, project_id, event_type, new_memory, event_id, msgs_json, actor_user_id),
     )
     return cur.lastrowid if cur.rowcount > 0 else None
