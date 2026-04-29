@@ -293,5 +293,33 @@ def init_db():
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_mp_project ON memory_protection(project_id)")
 
+    # W3 决策追溯主表
+    # 每行是一条决策,memory_id 隐式 = "decision:<id>",memory_history 引用
+    # parent_decision_id 表示"被取代的上游决策"(版本演进 / 反悔)
+    # status: proposed / approved / executing / done / reverted
+    # source_messages JSON: 抽取这条决策的原始对话/纪要片段, 跟 memory_history.source_messages 重叠存
+    #   (这里是结构化字段,trace 时直接用;memory_history 是事件流, 字段语义是触发本次变更的对话)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS decisions (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id         TEXT NOT NULL,
+            content            TEXT NOT NULL,
+            owner              TEXT DEFAULT '',
+            decided_at         DATE,
+            deadline           DATE,
+            status             TEXT DEFAULT 'proposed',
+            rationale          TEXT DEFAULT '',
+            parent_decision_id INTEGER REFERENCES decisions(id),
+            source_messages    TEXT DEFAULT '[]',
+            source_event_id    TEXT DEFAULT '',
+            created_by         TEXT DEFAULT '',
+            created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_decisions_project_status ON decisions(project_id, status)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_decisions_owner ON decisions(owner)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_decisions_parent ON decisions(parent_decision_id)")
+
     db.commit()
     db.close()
