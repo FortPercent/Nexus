@@ -23,6 +23,7 @@ import os
 import statistics
 import sys
 import time
+import urllib.parse
 from collections import Counter
 
 import httpx
@@ -100,6 +101,8 @@ async def main():
         ("T2 detail /decisions/2",   f"/memory/v1/projects/{pid}/decisions/2",                    50,  20),
         ("T3 trace /decision:2",     f"/memory/v1/projects/{pid}/memories/decision:2/trace",      50,  20),
         ("T4 list /conflicts",       f"/memory/v1/projects/{pid}/conflicts",                      100, 20),
+        ("T5 search Kimi",           f"/memory/v1/projects/{pid}/search?q=Kimi",                  100, 20),
+        ("T6 search 推理底座",        f"/memory/v1/projects/{pid}/search?q=" + urllib.parse.quote("推理底座"), 50, 20),
     ]
 
     results = []
