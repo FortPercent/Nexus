@@ -78,6 +78,25 @@ def _audit_protection_block_sync(
     )
 
 
+def check_protection_for_delete(memory_id: str) -> Optional[str]:
+    """上游入口用:DELETE 操作发起前检查 protection。
+
+    返回 protection_level (read_only / append_only) 表示 block;None 表示允许。
+
+    设计意图:让 admin_api 的 file delete 端点能在调 Letta 删除前判断 protection,
+    而不是等到事后 record_memory_event 拒绝时已经无法回滚 Letta 状态。
+    """
+    with use_db() as db:
+        row = db.execute(
+            "SELECT protection_level FROM memory_protection WHERE memory_id = ?",
+            (memory_id,),
+        ).fetchone()
+    if not row:
+        return None
+    level = row["protection_level"]
+    return level if level in ("read_only", "append_only") else None
+
+
 def record_memory_event(
     *,
     memory_id: str,

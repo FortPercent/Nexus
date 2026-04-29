@@ -733,6 +733,11 @@ async def upload_project_file(project_id: str, request: Request, file: UploadFil
 @router.delete("/project/{project_id}/files/{file_id}")
 async def delete_project_file(project_id: str, file_id: str, request: Request):
     await require_project_admin(request, project_id)
+    # Safety Memory: 在调 Letta 删除前检查 protection (不能事后 catch, 那时已不可回滚)
+    from memory_helpers import check_protection_for_delete
+    blocked = check_protection_for_delete(f"file:{file_id}")
+    if blocked:
+        raise HTTPException(403, f"该文件 (memory_id=file:{file_id}) 设置为 {blocked}, 不允许删除")
     with use_db() as db:
         row = db.execute(
             "SELECT project_folder_id FROM projects WHERE project_id = ?", (project_id,)
@@ -855,6 +860,10 @@ async def upload_org_file(request: Request, file: UploadFile = File(...)):
 @router.delete("/org/files/{file_id}")
 async def delete_org_file(file_id: str, request: Request):
     await require_org_admin(request)
+    from memory_helpers import check_protection_for_delete
+    blocked = check_protection_for_delete(f"file:{file_id}")
+    if blocked:
+        raise HTTPException(403, f"该文件 (memory_id=file:{file_id}) 设置为 {blocked}, 不允许删除")
     resources = get_or_create_org_resources()
     letta.folders.files.delete(folder_id=resources["folder_id"], file_id=file_id)
     try:
@@ -888,6 +897,10 @@ async def upload_personal_file(request: Request, file: UploadFile = File(...)):
 @router.delete("/personal/files/{file_id}")
 async def delete_personal_file(file_id: str, request: Request):
     user = await extract_user_from_admin(request)
+    from memory_helpers import check_protection_for_delete
+    blocked = check_protection_for_delete(f"file:{file_id}")
+    if blocked:
+        raise HTTPException(403, f"该文件 (memory_id=file:{file_id}) 设置为 {blocked}, 不允许删除")
     folder_id = get_or_create_personal_folder(user["id"])
     letta.folders.files.delete(folder_id=folder_id, file_id=file_id)
     try:
@@ -951,10 +964,19 @@ async def _atomic_replace_old(old_files: list, scope: str, scope_id: str, owner_
     失败只 log (best-effort). 失败最坏结果: Letta folder 留个重复 entry, 用户在
     Knowledge UI 看到双份 - 下次 replace 或 reconcile 兜底清.
     """
+    from memory_helpers import check_protection_for_delete
     for old in old_files:
         fid = getattr(old, "id", None)
         if not fid:
             continue
+        # Safety Memory: replace 等于 delete + insert, 老文件受 protection 时不允许
+        blocked = check_protection_for_delete(f"file:{fid}")
+        if blocked:
+            raise HTTPException(
+                403,
+                f"无法替换:旧文件 (memory_id=file:{fid}) 设置为 {blocked}, "
+                f"先解除 protection 再上传同名新版本",
+            )
         # 删 Letta folder file (reuse knowledge_mirrors 查 folder_id, 因为 Letta Python
         # SDK 的 FileMetadata.source 未必填 folder_id)
         try:

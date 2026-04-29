@@ -151,30 +151,24 @@ def mirror_file(letta_file_id, letta_folder_id, filename, scope, scope_id="", ow
         db.close()
 
     # Nexus 2.0 W2: 记 memory_history ADD + 自动冲突检测
-    # 失败不影响 mirror 主流程, 仅 warn
+    # protection 检查由 admin_api 上游入口拦 (delete 类) / mirror ADD 是新建场景没历史,
+    # record_memory_event 内部 enforce 是 defense-in-depth, 真触发说明数据漂移, 让它 propagate
     try:
         from memory_helpers import (
             record_memory_event,
             detect_and_record_conflict,
             scope_to_project_id,
-            ProtectionViolation,
         )
         project_id = scope_to_project_id(scope, scope_id, owner_id)
         memory_id = f"file:{letta_file_id}"
-        try:
-            record_memory_event(
-                memory_id=memory_id,
-                project_id=project_id,
-                event_type="ADD",
-                new_memory=f"[文件] {filename}",
-                event_id=f"upload:{letta_file_id}",
-                actor_user_id=owner_id or "",
-            )
-        except ProtectionViolation as pv:
-            # 这条 memory_id 受 protection (read_only / append_only)。
-            # 文件已经 mirror 了, 这是事实, 但治理意图是"不允许变更",
-            # 此处只 log + 走 audit; 真正阻断要在 admin_api 上传入口拦 (V2)。
-            logger.warning(f"[memory] protection blocked ADD: {pv}")
+        record_memory_event(
+            memory_id=memory_id,
+            project_id=project_id,
+            event_type="ADD",
+            new_memory=f"[文件] {filename}",
+            event_id=f"upload:{letta_file_id}",
+            actor_user_id=owner_id or "",
+        )
         detect_and_record_conflict(
             project_id=project_id,
             new_memory_id=memory_id,
@@ -211,23 +205,19 @@ def unmirror_file(letta_file_id):
         db.close()
 
     # Nexus 2.0 W2: 记 DELETE 事件,trace 能回放"曾经存在过"
+    # protection 检查在 admin_api 上游入口完成 (read_only/append_only 文件根本走不到这步)
     if deleted_meta:
         try:
-            from memory_helpers import record_memory_event, scope_to_project_id, ProtectionViolation
+            from memory_helpers import record_memory_event, scope_to_project_id
             scope, scope_id, owner_id, display_name = deleted_meta
-            try:
-                record_memory_event(
-                    memory_id=f"file:{letta_file_id}",
-                    project_id=scope_to_project_id(scope, scope_id, owner_id),
-                    event_type="DELETE",
-                    new_memory="",
-                    event_id=f"unmirror:{letta_file_id}",
-                    actor_user_id=owner_id or "",
-                )
-            except ProtectionViolation as pv:
-                # protection 阻止 DELETE 事件入 history; 文件已 unmirror, 是事实。
-                # 同 ADD 场景, 真正阻断 unmirror 操作要在更早入口拦 (V2)。
-                logger.warning(f"[memory] protection blocked DELETE: {pv}")
+            record_memory_event(
+                memory_id=f"file:{letta_file_id}",
+                project_id=scope_to_project_id(scope, scope_id, owner_id),
+                event_type="DELETE",
+                new_memory="",
+                event_id=f"unmirror:{letta_file_id}",
+                actor_user_id=owner_id or "",
+            )
         except Exception as e:
             logger.warning(f"[memory] DELETE hook failed for {letta_file_id}: {e}")
 
