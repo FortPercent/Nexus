@@ -26,22 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from db import get_db, _ensure_wal
-
-
-def _scope_to_project_id(scope: str, scope_id: str, owner_id: str) -> str:
-    """把 scope/scope_id 映射回 project_id 用作 history.project_id 维度。
-
-    - scope='project' → scope_id 即 project_id
-    - scope='personal' → 'personal:' + user_id
-    - scope='org' → 'org'
-    """
-    if scope == "project":
-        return scope_id or owner_id or ""
-    if scope == "personal":
-        return f"personal:{scope_id or owner_id}"
-    if scope == "org":
-        return "org"
-    return scope_id or owner_id or "unknown"
+from memory_helpers import scope_to_project_id  # 单一定义,避免双份漂移
 
 
 def backfill(apply: bool = False, reset: bool = False) -> dict:
@@ -74,7 +59,7 @@ def backfill(apply: bool = False, reset: bool = False) -> dict:
     plan = []
     for m in mirrors:
         memory_id = f"file:{m['letta_file_id']}"
-        project_id = _scope_to_project_id(m["scope"], m["scope_id"] or "", m["owner_id"] or "")
+        project_id = scope_to_project_id(m["scope"], m["scope_id"] or "", m["owner_id"] or "")
         event_id = f"backfill:{m['letta_file_id']}"
 
         # 已存在则跳过

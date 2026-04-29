@@ -253,6 +253,12 @@ def init_db():
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_mh_memory ON memory_history(memory_id, changed_at DESC)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_mh_project ON memory_history(project_id, changed_at DESC)")
+    # 幂等约束:同 (memory_id, event_id) 不应重复, 防 SELECT-then-INSERT 下 TOCTOU 竞态
+    # event_id 为空的事件不约束(保留"无幂等键的纯事件"语义,例如批量 raw 写入)
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_mh_memory_event "
+        "ON memory_history(memory_id, event_id) WHERE event_id != ''"
+    )
 
     # MemoryLake-inspired: 冲突检测 + 4 策略人工解决
     # strategy 枚举: keep_memory / trust_memory / trust_document / dismiss

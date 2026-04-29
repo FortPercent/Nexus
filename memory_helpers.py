@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Iterable, Optional
+from typing import Optional
 
 from db import use_db
 

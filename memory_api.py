@@ -1,22 +1,32 @@
-"""Memory trace + conflict APIs (MemoryLake-inspired, /memory/v1/*)
+"""Memory trace + conflict + protection APIs (MemoryLake-inspired, /memory/v1/*)
 
-设计参考 docs.memorylake.ai:
-- GET  /memory/v1/projects/{pid}/memories/{mid}/trace
-- GET  /memory/v1/projects/{pid}/conflicts
-- GET  /memory/v1/projects/{pid}/conflicts/{cid}
-- POST /memory/v1/projects/{pid}/conflicts/{cid}/resolve
+设计参考 docs.memorylake.ai。当前提供的端点:
+- GET  /projects/{pid}/memories/{mid}/trace
+- GET  /projects/{pid}/conflicts                    (only_unresolved 默认 true)
+- GET  /projects/{pid}/conflicts/{cid}
+- POST /projects/{pid}/conflicts/{cid}/resolve     (项目 admin)
+- GET  /projects/{pid}/memories/{mid}/protection
+- PUT  /projects/{pid}/memories/{mid}/protection   (项目 admin)
 
-trace 返回当前 memory + 完整变更链,每次变更附触发对话(source_messages),
-回答"为什么这条 memory 现在长这样"。
+设计要点:
+- trace 返回当前 memory + 完整变更链, 每次变更附触发对话 (source_messages),
+  回答 "为什么这条 memory 现在长这样"
+- 冲突解决采用 4 策略人工决策:
+    keep_memory     保留指定一条, 其余 forget
+    trust_memory    冲突视为误报, memory 全留
+    trust_document  丢冲突的 memory, 以文档为准
+    dismiss         不处理 (误报标记)
+- 治理动作 (resolve / set protection) 同时写 audit_log, 留追责痕迹
 
-冲突解决采用 4 策略人工决策模式:
-- keep_memory:     保留指定一条,其余 forget
-- trust_memory:    冲突视为误报,memory 全留
-- trust_document:  丢冲突的 memory,以文档为准
-- dismiss:         不处理(误报标记)
+⚠️ Safety Memory 当前是 advisory only:protection_level 字段已存,但写路径
+   (file 上传 / decision 写入) 还没强制检查。enforce 的实现见 task #8。
+
+pseudo-project 鉴权:
+- "org"            → 任意登录用户可读, ORG_ADMIN_EMAILS 可写
+- "personal:<uid>" → 仅 uid 本人可读写
+- 其他 (真实 project) → 走 require_project_member / require_project_admin
 """
 import json
-import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -31,8 +41,6 @@ from config import ORG_ADMIN_EMAILS
 from db import use_db_async
 
 router = APIRouter(prefix="/memory/v1")
-
-logger = logging.getLogger(__name__)
 
 
 # ---------- pseudo-project aware auth ----------
@@ -72,7 +80,7 @@ async def auth_project_write(request: Request, project_id: str) -> dict:
 
 # ---------- helpers ----------
 
-async def record_memory_event(
+async def _record_memory_event_async(
     db,
     *,
     memory_id: str,
@@ -83,9 +91,10 @@ async def record_memory_event(
     source_messages: Optional[list] = None,
     actor_user_id: str = "",
 ) -> int:
-    """写一条 memory 变更记录。供 routing.py / chat 流程调用。
+    """写一条 memory 变更记录(在传入的 async db 连接里, 共用调用方 transaction)。
 
-    传入 db 连接(已开启 async transaction);返回 history_id。
+    sync 版在 memory_helpers.record_memory_event,带幂等检查;
+    async 版本在 transaction 里走原 INSERT,依赖 uq_mh_memory_event 部分索引兜底。
     """
     if event_type not in ("ADD", "UPDATE", "DELETE"):
         raise ValueError(f"invalid event_type: {event_type}")
@@ -97,6 +106,14 @@ async def record_memory_event(
         (memory_id, project_id, event_type, new_memory, event_id, msgs_json, actor_user_id),
     )
     return cur.lastrowid
+
+
+async def _write_audit(db, *, user_id: str, action: str, scope: str, details: dict) -> None:
+    """治理动作写 audit_log,共用调用方 transaction。"""
+    await db.execute(
+        "INSERT INTO audit_log (user_id, action, scope, details) VALUES (?, ?, ?, ?)",
+        (user_id, action, scope, json.dumps(details, ensure_ascii=False)),
+    )
 
 
 # ---------- response models ----------
@@ -330,6 +347,17 @@ async def set_protection(
                  reason           = excluded.reason""",
             (memory_id, project_id, body.protection_level, actor, body.reason or ""),
         )
+        await _write_audit(
+            db,
+            user_id=actor,
+            action="memory.protection.set",
+            scope=project_id,
+            details={
+                "memory_id": memory_id,
+                "protection_level": body.protection_level,
+                "reason": body.reason or "",
+            },
+        )
 
     return await get_protection(project_id, memory_id, request)
 
@@ -395,7 +423,7 @@ async def resolve_conflict(
 
         # 给被 forget 的 memory 写一条 DELETE history (可由 chat 流程后续真正同步到 Letta)
         for mid in forgotten:
-            await record_memory_event(
+            await _record_memory_event_async(
                 db,
                 memory_id=mid,
                 project_id=project_id,
@@ -404,6 +432,19 @@ async def resolve_conflict(
                 event_id=f"conflict_resolve:{conflict_id}",
                 actor_user_id=actor,
             )
+
+        await _write_audit(
+            db,
+            user_id=actor,
+            action="memory.conflict.resolve",
+            scope=project_id,
+            details={
+                "conflict_id": conflict_id,
+                "strategy": body.strategy,
+                "kept_memory_id": body.keep_memory_id or "",
+                "forgotten_memory_ids": forgotten,
+            },
+        )
 
     return {
         "conflict_id": conflict_id,
