@@ -150,17 +150,50 @@ def mirror_file(letta_file_id, letta_folder_id, filename, scope, scope_id="", ow
     finally:
         db.close()
 
+    # Nexus 2.0 W2: 记 memory_history ADD + 自动冲突检测
+    # 失败不影响 mirror 主流程, 仅 warn
+    try:
+        from memory_helpers import (
+            record_memory_event,
+            detect_and_record_conflict,
+            scope_to_project_id,
+        )
+        project_id = scope_to_project_id(scope, scope_id, owner_id)
+        memory_id = f"file:{letta_file_id}"
+        record_memory_event(
+            memory_id=memory_id,
+            project_id=project_id,
+            event_type="ADD",
+            new_memory=f"[文件] {filename}",
+            event_id=f"upload:{letta_file_id}",
+            actor_user_id=owner_id or "",
+        )
+        detect_and_record_conflict(
+            project_id=project_id,
+            new_memory_id=memory_id,
+            display_name=filename,
+        )
+    except Exception as e:
+        logger.warning(f"[memory] hook failed for {letta_file_id}: {e}")
+
     logger.info(f"mirrored {filename} ({scope})")
 
 
 def unmirror_file(letta_file_id):
     """删除某个文件的所有镜像"""
     db = get_db()
+    deleted_meta = None
     try:
         rows = db.execute(
-            "SELECT knowledge_id, for_user_id FROM knowledge_mirrors WHERE letta_file_id = ?",
+            "SELECT knowledge_id, for_user_id, scope, scope_id, owner_id, display_name "
+            "FROM knowledge_mirrors WHERE letta_file_id = ?",
             (letta_file_id,),
         ).fetchall()
+        if rows:
+            r0 = rows[0]
+            deleted_meta = (
+                r0["scope"], r0["scope_id"] or "", r0["owner_id"] or "", r0["display_name"] or "",
+            )
         admin_token = _get_admin_token()
         for row in rows:
             _api("DELETE", f"/api/v1/knowledge/{row['knowledge_id']}/delete", token=admin_token)
@@ -169,6 +202,22 @@ def unmirror_file(letta_file_id):
         logger.info(f"unmirrored {letta_file_id} ({len(rows)} copies)")
     finally:
         db.close()
+
+    # Nexus 2.0 W2: 记 DELETE 事件,trace 能回放"曾经存在过"
+    if deleted_meta:
+        try:
+            from memory_helpers import record_memory_event, scope_to_project_id
+            scope, scope_id, owner_id, display_name = deleted_meta
+            record_memory_event(
+                memory_id=f"file:{letta_file_id}",
+                project_id=scope_to_project_id(scope, scope_id, owner_id),
+                event_type="DELETE",
+                new_memory="",
+                event_id=f"unmirror:{letta_file_id}",
+                actor_user_id=owner_id or "",
+            )
+        except Exception as e:
+            logger.warning(f"[memory] DELETE hook failed for {letta_file_id}: {e}")
 
 
 def get_letta_file_id_by_knowledge(knowledge_id):
