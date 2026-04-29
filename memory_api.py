@@ -22,12 +22,52 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from auth import require_project_member, require_project_admin
+from auth import (
+    require_project_member,
+    require_project_admin,
+    extract_user_from_admin,
+)
+from config import ORG_ADMIN_EMAILS
 from db import use_db_async
 
 router = APIRouter(prefix="/memory/v1")
 
 logger = logging.getLogger(__name__)
+
+
+# ---------- pseudo-project aware auth ----------
+# project_id 有 3 种来源:
+#   - 真实 project (project_members 有行) → 走 require_project_*
+#   - "org"            → 任意登录用户可读, ORG_ADMIN_EMAILS 可写
+#   - "personal:<uid>" → 仅 uid 本人可读写
+# 写动作(resolve / set protection)总是更严格
+
+async def auth_project_read(request: Request, project_id: str) -> dict:
+    """读权限: 项目成员 / org 任意登录 / personal 仅本人。"""
+    user = await extract_user_from_admin(request)
+    if project_id == "org":
+        return user
+    if project_id.startswith("personal:"):
+        owner = project_id.split(":", 1)[1]
+        if user["id"] != owner:
+            raise HTTPException(403, "personal scope 仅文件所有者可访问")
+        return user
+    return await require_project_member(request, project_id)
+
+
+async def auth_project_write(request: Request, project_id: str) -> dict:
+    """写权限: 项目 admin / ORG_ADMIN_EMAILS / personal 仅本人。"""
+    user = await extract_user_from_admin(request)
+    if project_id == "org":
+        if user.get("email") not in ORG_ADMIN_EMAILS:
+            raise HTTPException(403, "org scope 写动作需要 ORG_ADMIN_EMAILS 权限")
+        return user
+    if project_id.startswith("personal:"):
+        owner = project_id.split(":", 1)[1]
+        if user["id"] != owner:
+            raise HTTPException(403, "personal scope 写动作仅文件所有者可执行")
+        return user
+    return await require_project_admin(request, project_id)
 
 
 # ---------- helpers ----------
@@ -97,7 +137,7 @@ class ResolveBody(BaseModel):
 
 @router.get("/projects/{project_id}/memories/{memory_id}/trace", response_model=TraceResponse)
 async def get_memory_trace(project_id: str, memory_id: str, request: Request):
-    await require_project_member(request, project_id)
+    await auth_project_read(request, project_id)
 
     async with use_db_async() as db:
         async with db.execute(
@@ -143,7 +183,7 @@ async def get_memory_trace(project_id: str, memory_id: str, request: Request):
 
 @router.get("/projects/{project_id}/conflicts")
 async def list_conflicts(project_id: str, request: Request, only_unresolved: bool = True):
-    await require_project_member(request, project_id)
+    await auth_project_read(request, project_id)
 
     sql = """SELECT conflict_id, project_id, memory_ids, detected_at, detection_reason,
                     resolved_at, strategy
@@ -176,7 +216,7 @@ async def list_conflicts(project_id: str, request: Request, only_unresolved: boo
 
 @router.get("/projects/{project_id}/conflicts/{conflict_id}")
 async def get_conflict(project_id: str, conflict_id: int, request: Request):
-    await require_project_member(request, project_id)
+    await auth_project_read(request, project_id)
 
     async with use_db_async() as db:
         async with db.execute(
@@ -229,7 +269,7 @@ class SetProtectionBody(BaseModel):
     response_model=ProtectionResponse,
 )
 async def get_protection(project_id: str, memory_id: str, request: Request):
-    await require_project_member(request, project_id)
+    await auth_project_read(request, project_id)
 
     async with use_db_async() as db:
         async with db.execute(
@@ -268,7 +308,7 @@ async def set_protection(
     request: Request,
 ):
     # 改 protection_level 是治理动作,仅项目 admin
-    user = await require_project_admin(request, project_id)
+    user = await auth_project_write(request, project_id)
 
     if body.protection_level not in VALID_PROTECTION_LEVELS:
         raise HTTPException(
@@ -302,7 +342,7 @@ async def resolve_conflict(
     request: Request,
 ):
     # 治理责任要明确,resolve 仅项目 admin 可操作
-    user = await require_project_admin(request, project_id)
+    user = await auth_project_write(request, project_id)
 
     if body.strategy not in VALID_STRATEGIES:
         raise HTTPException(
