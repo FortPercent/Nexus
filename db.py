@@ -321,16 +321,27 @@ def init_db():
     db.execute("CREATE INDEX IF NOT EXISTS idx_decisions_owner ON decisions(owner)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_decisions_parent ON decisions(parent_decision_id)")
 
-    # W4-1: decisions 全文索引 (FTS5)
-    # tokenize='unicode61' 默认能处理中英混合,中文按字符分(粒度细但能用)。
-    # content='decisions' 让 FTS 把数据存在原表,自身只存索引,节省空间。
-    # 对 SQLite 3.20+ 有效, 容器是 3.40+ OK。
+    # W4-1: decisions 全文索引 (FTS5 + trigram tokenizer)
+    # 经测试:unicode61 把连续 CJK 当 1 个 token, 'Qwen2.5' / '推理底座' 都搜不到。
+    # trigram (SQLite 3.34+) 索引 3 字符滑窗,中英混合 / 中文短语匹配都正常。
+    # 限制:2 字符查询不能直接命中,需要 3+ 字符 (实际不影响,大部分有意义查询都 3+)。
+    #
+    # 迁移:如果存量是 unicode61 schema, 先 DROP 老的 FTS 表 + 触发器, 重建为 trigram。
+    existing = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='decisions_fts'"
+    ).fetchone()
+    if existing and "trigram" not in (existing[0] or "").lower():
+        # 先删触发器, 再删 FTS 表 (反过来会 cascade 报错)
+        for trig in ("decisions_fts_ai", "decisions_fts_au", "decisions_fts_ad"):
+            db.execute(f"DROP TRIGGER IF EXISTS {trig}")
+        db.execute("DROP TABLE IF EXISTS decisions_fts")
+
     db.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5(
             content, rationale, owner,
             content='decisions',
             content_rowid='id',
-            tokenize='unicode61 remove_diacritics 2'
+            tokenize='trigram'
         )
     """)
     # 同步触发器: decisions 写入后自动维护 FTS
