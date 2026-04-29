@@ -385,17 +385,17 @@ async def resolve_conflict(
             detail="keep_memory_id is required when strategy=keep_memory",
         )
 
+    actor = user.get("id", "") if isinstance(user, dict) else ""
+
     async with use_db_async() as db:
+        # 1. 读 memory_ids 算 forgotten (read-only, race OK; gate 在下一步)
         async with db.execute(
-            "SELECT memory_ids, resolved_at FROM memory_conflicts "
-            "WHERE project_id = ? AND conflict_id = ?",
+            "SELECT memory_ids FROM memory_conflicts WHERE project_id = ? AND conflict_id = ?",
             (project_id, conflict_id),
         ) as cur:
             row = await cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="conflict not found")
-        if row["resolved_at"]:
-            raise HTTPException(status_code=409, detail="conflict already resolved")
 
         memory_ids = json.loads(row["memory_ids"] or "[]")
         forgotten: list[str] = []
@@ -405,15 +405,16 @@ async def resolve_conflict(
             forgotten = list(memory_ids)
         # trust_memory / dismiss → forgotten 空
 
-        actor = user.get("id", "") if isinstance(user, dict) else ""
-        await db.execute(
+        # 2. 原子 gate:WHERE resolved_at IS NULL,只有第一个 winner 能 UPDATE 到行
+        # 防 5 并发同时 SELECT 都看到 NULL → 都 UPDATE → 重复写 history + audit
+        update_cur = await db.execute(
             """UPDATE memory_conflicts
                SET resolved_at = CURRENT_TIMESTAMP,
                    resolved_by = ?,
                    strategy = ?,
                    kept_memory_id = ?,
                    forgotten_ids = ?
-               WHERE conflict_id = ?""",
+               WHERE conflict_id = ? AND resolved_at IS NULL""",
             (
                 actor,
                 body.strategy,
@@ -422,6 +423,8 @@ async def resolve_conflict(
                 conflict_id,
             ),
         )
+        if update_cur.rowcount == 0:
+            raise HTTPException(status_code=409, detail="conflict already resolved")
 
         # 给被 forget 的 memory 写一条 DELETE history (可由 chat 流程后续真正同步到 Letta)
         for mid in forgotten:
