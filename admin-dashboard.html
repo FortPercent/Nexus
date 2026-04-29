@@ -30,6 +30,19 @@ async function api(path, opts = {}) {
   if (!resp.ok) { const e = await resp.text(); throw new Error(e); }
   return resp.json();
 }
+// memory/v1 治理 API (trace / conflicts / decisions / protection)
+async function mapi(path, opts = {}) {
+  const token = getToken();
+  const headers = { "Authorization": `Bearer ${token}`, ...opts.headers };
+  if (opts.body && !(opts.body instanceof FormData)) {
+    headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(opts.body);
+  }
+  const resp = await fetch(`/memory/v1${path}`, { ...opts, headers });
+  if (resp.status === 401) { window.location.href = "/"; return null; }
+  if (!resp.ok) { const e = await resp.text(); throw new Error(e); }
+  return resp.json();
+}
 
 // ===== 样式常量 =====
 // Open WebUI 浅色风格
@@ -224,6 +237,7 @@ function ProjPage({ pid, initialTab, back, user }) {
     {id:"files",label:`文档 · ${files.length}`},
     {id:"members",label:`成员 · ${members.length}`},
     {id:"todos",label:`TODO · ${openTodoCount}${pendingTodoCount>0?` (${pendingTodoCount}待处理)`:""}`},
+    {id:"governance",label:"治理"},
   ];
   if(isA) tabs.push({id:"settings",label:"设置"});
 
@@ -283,6 +297,8 @@ function ProjPage({ pid, initialTab, back, user }) {
     </Card>}
 
     {tab==="todos" && <TodoTab pid={pid} isA={isA} user={user} members={members} todos={todos} setTodos={setTodos} approvalMode={todoMode}/>}
+
+    {tab==="governance" && <GovernanceTab projectId={pid} isAdmin={isA}/>}
 
     {tab==="settings" && isA && <Card delay={120}><SH sub="项目设置">设置</SH>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}><span style={{fontSize:13,color:C.slateL}}>存储限额: {proj.quota_mb||1024} MB · 已用: {proj.used_mb||0} MB</span></div>
@@ -485,6 +501,223 @@ function TodoTab({ pid, isA, user, members, todos, setTodos, approvalMode }) {
 }
 
 // ===== MEMORY PAGE =====
+// ===== 治理 =====
+// 决策列表 / 详情 / 冲突 4 策略 resolve, 复用 ProjPage 上下文 (pid + isAdmin)。
+// org / personal:<uid> 调用同一组件 (project_id 直接传过来)。
+const STATUS_TAGS = {
+  proposed: { label: "提议", color: "#92400E", bg: "#FEF3C7" },
+  approved: { label: "已通过", color: "#065F46", bg: "#D1FAE5" },
+  executing: { label: "执行中", color: "#1E40AF", bg: "#DBEAFE" },
+  done: { label: "已完成", color: "#374151", bg: "#E5E7EB" },
+  reverted: { label: "已反悔", color: "#991B1B", bg: "#FEE2E2" },
+};
+function StatusTag({ status }) {
+  const c = STATUS_TAGS[status] || STATUS_TAGS.proposed;
+  return <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:5,background:c.bg,color:c.color,fontFamily:"var(--ft)"}}>{c.label}</span>;
+}
+
+function GovernanceTab({ projectId, isAdmin }) {
+  const [view, setView] = useState("decisions"); // decisions | conflicts
+  return <div>
+    <Anim delay={40}><div style={{display:"flex",gap:6,marginBottom:18}}>
+      <TabBtn active={view==="decisions"} onClick={()=>setView("decisions")}>决策追溯</TabBtn>
+      <TabBtn active={view==="conflicts"} onClick={()=>setView("conflicts")}>冲突治理</TabBtn>
+    </div></Anim>
+    {view==="decisions" && <DecisionListView projectId={projectId} isAdmin={isAdmin}/>}
+    {view==="conflicts" && <ConflictListView projectId={projectId} isAdmin={isAdmin}/>}
+  </div>;
+}
+
+function DecisionListView({ projectId, isAdmin }) {
+  const [items, setItems] = useState(null); // null = loading, [] = empty
+  const [total, setTotal] = useState(0);
+  const [filter, setFilter] = useState({ status: "", owner: "" });
+  const [openId, setOpenId] = useState(null);
+  const reload = useCallback(()=>{
+    setItems(null);
+    const q = new URLSearchParams();
+    if(filter.status) q.set("status", filter.status);
+    if(filter.owner) q.set("owner", filter.owner);
+    q.set("limit", "100");
+    mapi(`/projects/${encodeURIComponent(projectId)}/decisions?${q}`).then(r=>{
+      if(!r) return;
+      setItems(r.data || []);
+      setTotal(r.total || 0);
+    }).catch(e=>{ alert(e.message); setItems([]); });
+  }, [projectId, filter.status, filter.owner]);
+  useEffect(reload, [reload]);
+
+  if(openId !== null) return <DecisionDetail projectId={projectId} id={openId} onBack={()=>{ setOpenId(null); reload(); }}/>;
+  if(items === null) return <Loading/>;
+
+  return <div>
+    <Card delay={60}><SH sub={`共 ${total} 条决策`}>决策列表</SH>
+      <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+        <select value={filter.status} onChange={e=>setFilter(f=>({...f,status:e.target.value}))} style={{fontSize:12,padding:"6px 10px",borderRadius:8,border:`1px solid ${C.bdrL}`,background:"#fff",color:C.slate}}>
+          <option value="">全部状态</option>
+          {Object.entries(STATUS_TAGS).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+        </select>
+        <input placeholder="负责人" value={filter.owner} onChange={e=>setFilter(f=>({...f,owner:e.target.value}))} style={{fontSize:12,padding:"6px 10px",borderRadius:8,border:`1px solid ${C.bdrL}`,background:"#fff",color:C.slate,width:140}}/>
+        {(filter.status||filter.owner) && <Btn v="ghost" onClick={()=>setFilter({status:"",owner:""})} style={{fontSize:11,padding:"5px 10px"}}>清除</Btn>}
+      </div>
+      {items.length === 0 ? <div style={{textAlign:"center",padding:"30px 0",color:C.sand,fontSize:13}}>暂无决策。可通过 <code>POST /memory/v1/projects/{projectId}/decisions/infer</code> 上传纪要抽取。</div> :
+        items.map((d,i)=><div key={d.id} onClick={()=>setOpenId(d.id)} style={{padding:"12px 4px",borderBottom:i<items.length-1?`1px solid ${C.bdrL}`:"none",cursor:"pointer",transition:"background 0.15s"}} onMouseEnter={e=>e.currentTarget.style.background="#FAFAFA"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginBottom:4}}>
+            <span style={{fontSize:13,fontWeight:600,color:C.slate,flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{d.content}</span>
+            <StatusTag status={d.status}/>
+          </div>
+          <div style={{display:"flex",gap:14,fontSize:11,color:C.slateL,fontFamily:"var(--fn)"}}>
+            <span>👤 {d.owner||"未指定"}</span>
+            {d.decided_at && <span>📅 {d.decided_at}</span>}
+            {d.deadline && <span>⏰ {d.deadline}</span>}
+            {d.parent_decision_id && <span style={{color:C.terra}}>↩ 取代 #{d.parent_decision_id}</span>}
+          </div>
+        </div>)
+      }
+    </Card>
+  </div>;
+}
+
+function DecisionDetail({ projectId, id, onBack }) {
+  const [d, setD] = useState(null);
+  useEffect(()=>{
+    mapi(`/projects/${encodeURIComponent(projectId)}/decisions/${id}`).then(r=>r&&setD(r)).catch(e=>{ alert(e.message); onBack(); });
+  }, [projectId, id]);
+  if(!d) return <Loading/>;
+  return <div>
+    <Back onClick={onBack}/>
+    <Anim delay={40}><div style={{marginBottom:18}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:6}}>
+        <h3 style={{fontSize:18,fontWeight:600,margin:0,color:C.slate,flex:1}}>决策 #{d.id}</h3>
+        <StatusTag status={d.status}/>
+      </div>
+      <div style={{fontSize:14,color:C.slate,lineHeight:1.6,marginBottom:8}}>{d.content}</div>
+      <div style={{display:"flex",gap:14,flexWrap:"wrap",fontSize:11,color:C.slateL,fontFamily:"var(--fn)"}}>
+        <span>👤 {d.owner||"未指定"}</span>
+        {d.decided_at && <span>📅 {d.decided_at}</span>}
+        {d.deadline && <span>⏰ deadline {d.deadline}</span>}
+        <span>📦 memory_id: {d.memory_id}</span>
+      </div>
+      {d.rationale && <div style={{marginTop:10,padding:"8px 12px",background:"#FEF7E0",borderLeft:`3px solid #F59E0B`,fontSize:12,color:C.slateL,borderRadius:4}}>💡 {d.rationale}</div>}
+    </div></Anim>
+
+    {d.parent && <Card delay={80} style={{borderLeft:`3px solid ${C.terra}`}}>
+      <SH sub="本决策取代了它">↩ 上游决策</SH>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}>
+        <span style={{fontSize:13,color:C.slate,flex:1}}>#{d.parent.id} {d.parent.content}</span>
+        <StatusTag status={d.parent.status}/>
+      </div>
+    </Card>}
+
+    {d.children && d.children.length>0 && <Card delay={120} style={{borderLeft:`3px solid ${C.teal}`}}>
+      <SH sub={`${d.children.length} 条决策取代了本决策`}>↪ 下游决策</SH>
+      {d.children.map(c=><div key={c.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"6px 0",borderBottom:`1px solid ${C.bdrL}`}}>
+        <span style={{fontSize:13,color:C.slate,flex:1}}>#{c.id} {c.content}</span>
+        <StatusTag status={c.status}/>
+      </div>)}
+    </Card>}
+
+    <Card delay={160}>
+      <SH sub={`${d.trace.length} 条事件`}>变更链 (Trace)</SH>
+      {d.trace.map((t,i)=><div key={t.history_id} style={{padding:"8px 0",borderBottom:i<d.trace.length-1?`1px solid ${C.bdrL}`:"none"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+          <span style={{fontSize:10,fontWeight:700,padding:"2px 6px",borderRadius:4,background:t.event_type==="DELETE"?"#FEE2E2":t.event_type==="UPDATE"?"#DBEAFE":"#D1FAE5",color:t.event_type==="DELETE"?"#991B1B":t.event_type==="UPDATE"?"#1E40AF":"#065F46"}}>{t.event_type}</span>
+          <span style={{fontSize:11,color:C.sand,fontFamily:"var(--fn)"}}>{t.changed_at}</span>
+          {t.event_id && <span style={{fontSize:10,color:C.slateXL,fontFamily:"var(--fn)"}}>· {t.event_id}</span>}
+        </div>
+        {t.new_memory && <div style={{fontSize:12,color:C.slateL,paddingLeft:6}}>{t.new_memory}</div>}
+        {t.source_messages && t.source_messages.length>0 && <details style={{marginTop:4,paddingLeft:6}}>
+          <summary style={{fontSize:10,color:C.sand,cursor:"pointer",fontFamily:"var(--ft)"}}>触发对话 ({t.source_messages.length} 条)</summary>
+          <div style={{marginTop:4,padding:"6px 8px",background:"#F9FAFB",borderRadius:4,fontSize:11,color:C.slateL,whiteSpace:"pre-wrap",maxHeight:240,overflow:"auto"}}>
+            {t.source_messages.map((m,j)=><div key={j} style={{marginBottom:4}}><b>[{m.role||"?"}]</b> {(m.content||"").slice(0,200)}{(m.content||"").length>200?"…":""}</div>)}
+          </div>
+        </details>}
+      </div>)}
+    </Card>
+  </div>;
+}
+
+function ConflictListView({ projectId, isAdmin }) {
+  const [items, setItems] = useState(null);
+  const [resolving, setResolving] = useState(null); // 当前点开 resolve 的 conflict
+  const reload = useCallback(()=>{
+    setItems(null);
+    mapi(`/projects/${encodeURIComponent(projectId)}/conflicts`).then(r=>r&&setItems(r.data||[])).catch(e=>{ alert(e.message); setItems([]); });
+  }, [projectId]);
+  useEffect(reload, [reload]);
+
+  if(items === null) return <Loading/>;
+  return <div>
+    <Card delay={60}><SH sub={items.length===0?"项目内目前无未解决冲突":`${items.length} 条未解决冲突`}>冲突工单</SH>
+      {items.length === 0 ? <div style={{textAlign:"center",padding:"30px 0",color:C.sand,fontSize:13}}>没有冲突 ✓</div> :
+        items.map((c,i)=><div key={c.conflict_id} style={{padding:"12px 4px",borderBottom:i<items.length-1?`1px solid ${C.bdrL}`:"none"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginBottom:6}}>
+            <span style={{fontSize:13,fontWeight:600,color:C.slate}}>工单 #{c.conflict_id}</span>
+            <span style={{fontSize:11,color:C.slateL,fontFamily:"var(--fn)"}}>{c.detected_at}</span>
+          </div>
+          <div style={{fontSize:11,color:C.slateL,marginBottom:6,fontFamily:"var(--fn)"}}>{c.detection_reason}</div>
+          <div style={{fontSize:11,color:C.sand,marginBottom:8}}>涉及 {c.memory_ids.length} 个 memory_id:</div>
+          <ul style={{margin:0,paddingLeft:18,fontSize:11,color:C.slateL,fontFamily:"var(--fn)",lineHeight:1.7}}>
+            {c.memory_ids.map(m=><li key={m}>{m}</li>)}
+          </ul>
+          {isAdmin ? <Btn v="primary" onClick={()=>setResolving(c)} style={{marginTop:10,fontSize:11,padding:"6px 14px"}}>解决</Btn> :
+            <Hint>需项目管理员权限才能解决冲突</Hint>}
+        </div>)
+      }
+    </Card>
+    {resolving && <ConflictResolveModal projectId={projectId} conflict={resolving} onClose={()=>setResolving(null)} onResolved={()=>{ setResolving(null); reload(); }}/>}
+  </div>;
+}
+
+const STRATEGY_META = {
+  keep_memory:    { label: "保留指定一条", desc: "选一条 memory 保留, 其余 forget", needsKeep: true },
+  trust_memory:   { label: "相信 memory", desc: "memory 全留, 文档侧分歧视为已解决", needsKeep: false },
+  trust_document: { label: "相信文档", desc: "丢冲突的 memory, 以文档为准", needsKeep: false },
+  dismiss:        { label: "误报关闭", desc: "标记为误报, 不动任何 memory", needsKeep: false },
+};
+
+function ConflictResolveModal({ projectId, conflict, onClose, onResolved }) {
+  const [strategy, setStrategy] = useState("dismiss");
+  const [keepId, setKeepId] = useState(conflict.memory_ids[0]);
+  const [busy, setBusy] = useState(false);
+  const submit = ()=>{
+    setBusy(true);
+    const body = { strategy };
+    if(STRATEGY_META[strategy].needsKeep) body.keep_memory_id = keepId;
+    mapi(`/projects/${encodeURIComponent(projectId)}/conflicts/${conflict.conflict_id}/resolve`, {method:"POST", body})
+      .then(r=>{ if(r) onResolved(); })
+      .catch(e=>{ alert(e.message); setBusy(false); });
+  };
+  return <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.4)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:20}}>
+    <div onClick={e=>e.stopPropagation()} style={{background:"#fff",borderRadius:14,maxWidth:560,width:"100%",padding:24,maxHeight:"90vh",overflow:"auto"}}>
+      <h3 style={{fontSize:16,fontWeight:600,margin:"0 0 4px",color:C.slate}}>解决冲突 #{conflict.conflict_id}</h3>
+      <div style={{fontSize:11,color:C.slateL,marginBottom:14,fontFamily:"var(--fn)"}}>{conflict.detection_reason}</div>
+
+      <div style={{display:"grid",gap:8,marginBottom:16}}>
+        {Object.entries(STRATEGY_META).map(([k,m])=><label key={k} style={{display:"flex",alignItems:"flex-start",gap:8,padding:"10px 12px",border:`1px solid ${strategy===k?C.slate:C.bdrL}`,borderRadius:10,cursor:"pointer",background:strategy===k?"#F9FAFB":"#fff",transition:"all 0.15s"}}>
+          <input type="radio" name="strategy" checked={strategy===k} onChange={()=>setStrategy(k)} style={{marginTop:3}}/>
+          <div style={{flex:1}}>
+            <div style={{fontSize:13,fontWeight:600,color:C.slate}}>{m.label} <span style={{fontSize:10,color:C.sand,fontFamily:"var(--fn)",fontWeight:400}}>({k})</span></div>
+            <div style={{fontSize:11,color:C.slateL,marginTop:2}}>{m.desc}</div>
+          </div>
+        </label>)}
+      </div>
+
+      {STRATEGY_META[strategy].needsKeep && <div style={{marginBottom:16}}>
+        <div style={{fontSize:11,fontWeight:600,color:C.slate,marginBottom:6}}>选保留的 memory:</div>
+        <select value={keepId} onChange={e=>setKeepId(e.target.value)} style={{width:"100%",fontSize:12,padding:"8px 10px",borderRadius:8,border:`1px solid ${C.bdrL}`,background:"#fff",color:C.slate,fontFamily:"var(--fn)"}}>
+          {conflict.memory_ids.map(m=><option key={m} value={m}>{m}</option>)}
+        </select>
+      </div>}
+
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+        <Btn v="ghost" onClick={onClose}>取消</Btn>
+        <Btn v="primary" onClick={submit} style={{opacity:busy?0.5:1,pointerEvents:busy?"none":"auto"}}>{busy?"提交中...":"确认"}</Btn>
+      </div>
+    </div>
+  </div>;
+}
+
 // 两个 tab：核心身份（跨项目共享）+ 对话记忆（按项目）
 function MemoryPage({ back }) {
   const [tab, setTab] = useState("identity");
