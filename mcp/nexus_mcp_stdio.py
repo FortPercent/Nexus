@@ -10,14 +10,23 @@ Cursor / Claude Desktop 通过 MCP 协议(JSONRPC 2.0 over stdio)调本脚本,
   NEXUS_TOKEN  Open WebUI JWT。获取方式:登录 Open WebUI 后,浏览器 F12
                → Application → Local Storage → 拷 token 字段值
 
-本 V1 提供工具:
+提供的工具 (V2,7 个 read-only):
   search_memory(project_id, query, kind?, limit?)
-    跨 decisions 和 memory_history 全文搜,trigram FTS5 backend,
-    返带 snippet 高亮和 bm25 rank 的混合结果
+    跨 decisions 和 memory_history 全文搜
+  list_decisions(project_id, owner?, status?, decided_from?, decided_to?, limit?)
+    按条件列项目的决策
+  get_decision(project_id, decision_id)
+    决策详情 + parent + children + 完整 trace
+  get_trace(project_id, memory_id)
+    任意 memory 的完整事件链, 含触发对话
+  list_conflicts(project_id, only_unresolved?)
+    项目内冲突工单
+  get_conflict(project_id, conflict_id)
+    单个冲突详情 (memory_ids / detection_reason / 解决状态)
+  get_protection(project_id, memory_id)
+    Safety Memory 设置 (read_only / append_only / mutable)
 
-未来 V2 / V3 会扩 get_decision / get_trace / list_conflicts 等。
-
-使用方式参见同目录 README.md。
+未来 V3 会加长效 API key + 限流。使用方式参见同目录 README.md。
 """
 from __future__ import annotations
 
@@ -39,38 +48,119 @@ SERVER_VERSION = "0.1.0"
 
 # ---------- tool definitions ----------
 
+# Tool schema 公共片段
+_PROJECT_ID_FIELD = {
+    "type": "string",
+    "description": "项目 ID, 如 'ai-infra' / 'org' / 'personal:<user_id>'",
+}
+_MEMORY_ID_FIELD = {
+    "type": "string",
+    "description": "memory_id, 如 'file:<letta_file_id>' 或 'decision:<id>'",
+}
+
 TOOLS = [
     {
         "name": "search_memory",
         "description": (
-            "在 Nexus 项目里全文搜索决策(decisions)和记忆事件(memory_history)。"
-            "支持中英文混合查询,FTS5 trigram 索引,返回带 <mark> 高亮 snippet "
-            "+ bm25 rank 的混合结果。kind=decisions 仅搜决策,kind=memories "
-            "仅搜事件,kind=all (默认)两者并查。"
+            "全文搜决策 + 事件流。FTS5 trigram, 中英混合, 返带 <mark> 高亮 snippet "
+            "+ bm25 rank。kind=decisions / memories / all (默认)。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project_id": {
-                    "type": "string",
-                    "description": "项目 ID,如 'ai-infra' / 'org' / 'personal:<user_id>'",
-                },
-                "query": {"type": "string", "description": "搜索词,3+ 字符效果最好"},
-                "kind": {
-                    "type": "string",
-                    "enum": ["decisions", "memories", "all"],
-                    "default": "all",
-                },
-                "limit": {
-                    "type": "integer",
-                    "default": 20,
-                    "minimum": 1,
-                    "maximum": 100,
-                },
+                "project_id": _PROJECT_ID_FIELD,
+                "query": {"type": "string", "description": "搜索词, 3+ 字符效果最好"},
+                "kind": {"type": "string", "enum": ["decisions", "memories", "all"], "default": "all"},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
             },
             "required": ["project_id", "query"],
         },
-    }
+    },
+    {
+        "name": "list_decisions",
+        "description": "列项目的决策, 支持 owner / status / 决策日期范围筛选。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_FIELD,
+                "owner": {"type": "string"},
+                "status": {
+                    "type": "string",
+                    "enum": ["proposed", "approved", "executing", "done", "reverted"],
+                },
+                "decided_from": {"type": "string", "description": "YYYY-MM-DD"},
+                "decided_to": {"type": "string", "description": "YYYY-MM-DD"},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "get_decision",
+        "description": "决策详情 + parent (取代的上游) + children (取代它的下游) + 完整 trace 事件链。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_FIELD,
+                "decision_id": {"type": "integer"},
+            },
+            "required": ["project_id", "decision_id"],
+        },
+    },
+    {
+        "name": "get_trace",
+        "description": (
+            "取任意 memory 的完整事件链 (ADD/UPDATE/DELETE), 每条带触发对话原文。"
+            "可回答'这条 memory 为什么长这样'。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_FIELD,
+                "memory_id": _MEMORY_ID_FIELD,
+            },
+            "required": ["project_id", "memory_id"],
+        },
+    },
+    {
+        "name": "list_conflicts",
+        "description": "项目内冲突工单 (同名 memory 的版本冲突等)。only_unresolved=true (默认) 只返未解决的。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_FIELD,
+                "only_unresolved": {"type": "boolean", "default": True},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "get_conflict",
+        "description": "单个冲突详情:涉及的 memory_ids / 检测原因 / 是否解决 / 解决策略。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_FIELD,
+                "conflict_id": {"type": "integer"},
+            },
+            "required": ["project_id", "conflict_id"],
+        },
+    },
+    {
+        "name": "get_protection",
+        "description": (
+            "查 memory 的 Safety 保护级别 (read_only / append_only / mutable)。"
+            "未显式设过返默认 mutable。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID_FIELD,
+                "memory_id": _MEMORY_ID_FIELD,
+            },
+            "required": ["project_id", "memory_id"],
+        },
+    },
 ]
 
 
@@ -94,22 +184,89 @@ def _call_nexus(path: str, params: dict | None = None) -> dict:
         return {"error": str(e)}
 
 
+def _q(s: str) -> str:
+    """URL-quote 一个 path segment (e.g. project_id)。"""
+    return urllib.parse.quote(s, safe="")
+
+
+def _project_path(project_id: str, suffix: str) -> str:
+    return f"/memory/v1/projects/{_q(project_id)}{suffix}"
+
+
 def tool_search_memory(args: dict) -> dict:
-    project_id = args.get("project_id") or ""
-    query = args.get("query") or ""
-    if not project_id or not query:
+    pid = args.get("project_id") or ""
+    q = args.get("query") or ""
+    if not pid or not q:
         return {"error": "project_id 和 query 必填"}
+    params = {"q": q, "kind": args.get("kind") or "all", "limit": args.get("limit") or 20}
+    return _call_nexus(_project_path(pid, "/search"), params)
+
+
+def tool_list_decisions(args: dict) -> dict:
+    pid = args.get("project_id") or ""
+    if not pid:
+        return {"error": "project_id 必填"}
+    params: dict = {"limit": args.get("limit") or 50}
+    for k in ("owner", "status", "decided_from", "decided_to"):
+        if args.get(k):
+            params[k] = args[k]
+    return _call_nexus(_project_path(pid, "/decisions"), params)
+
+
+def tool_get_decision(args: dict) -> dict:
+    pid = args.get("project_id") or ""
+    did = args.get("decision_id")
+    if not pid or did is None:
+        return {"error": "project_id 和 decision_id 必填"}
+    return _call_nexus(_project_path(pid, f"/decisions/{int(did)}"))
+
+
+def tool_get_trace(args: dict) -> dict:
+    pid = args.get("project_id") or ""
+    mid = args.get("memory_id") or ""
+    if not pid or not mid:
+        return {"error": "project_id 和 memory_id 必填"}
+    return _call_nexus(_project_path(pid, f"/memories/{_q(mid)}/trace"))
+
+
+def tool_list_conflicts(args: dict) -> dict:
+    pid = args.get("project_id") or ""
+    if not pid:
+        return {"error": "project_id 必填"}
+    only_unresolved = args.get("only_unresolved")
+    if only_unresolved is None:
+        only_unresolved = True
     return _call_nexus(
-        f"/memory/v1/projects/{urllib.parse.quote(project_id, safe='')}/search",
-        {
-            "q": query,
-            "kind": args.get("kind") or "all",
-            "limit": args.get("limit") or 20,
-        },
+        _project_path(pid, "/conflicts"),
+        {"only_unresolved": "true" if only_unresolved else "false"},
     )
 
 
-TOOL_HANDLERS = {"search_memory": tool_search_memory}
+def tool_get_conflict(args: dict) -> dict:
+    pid = args.get("project_id") or ""
+    cid = args.get("conflict_id")
+    if not pid or cid is None:
+        return {"error": "project_id 和 conflict_id 必填"}
+    return _call_nexus(_project_path(pid, f"/conflicts/{int(cid)}"))
+
+
+def tool_get_protection(args: dict) -> dict:
+    pid = args.get("project_id") or ""
+    mid = args.get("memory_id") or ""
+    if not pid or not mid:
+        return {"error": "project_id 和 memory_id 必填"}
+    return _call_nexus(_project_path(pid, f"/memories/{_q(mid)}/protection"))
+
+
+TOOL_HANDLERS = {
+    "search_memory": tool_search_memory,
+    "list_decisions": tool_list_decisions,
+    "get_decision": tool_get_decision,
+    "get_trace": tool_get_trace,
+    "list_conflicts": tool_list_conflicts,
+    "get_conflict": tool_get_conflict,
+    "get_protection": tool_get_protection,
+}
 
 
 # ---------- MCP JSONRPC handlers ----------

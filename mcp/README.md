@@ -59,13 +59,19 @@ JWT 默认有效期由 Open WebUI 决定(通常较长,可用数天)。
 
 Cursor 会调 search_memory(project_id="ai-infra", query="Kimi-K2.6 推理"),返带高亮 snippet 的结果。
 
-## 可用工具(V1)
+## 可用工具(V2,7 个 read-only)
 
 | 工具 | 用途 |
 |---|---|
-| `search_memory(project_id, query, kind?, limit?)` | 跨决策 + 记忆事件 FTS5 搜索 |
+| `search_memory(project_id, query, kind?, limit?)` | FTS5 全文搜决策 + 事件流 |
+| `list_decisions(project_id, owner?, status?, decided_from?, decided_to?, limit?)` | 列项目的决策(支持筛选) |
+| `get_decision(project_id, decision_id)` | 决策详情 + 上游/下游/trace 完整链 |
+| `get_trace(project_id, memory_id)` | 任意 memory 的事件链 + 触发对话 |
+| `list_conflicts(project_id, only_unresolved?)` | 冲突工单列表 |
+| `get_conflict(project_id, conflict_id)` | 冲突详情 |
+| `get_protection(project_id, memory_id)` | Safety 保护级别(read_only/append_only/mutable) |
 
-V2 会加 `get_decision` / `get_trace` / `list_conflicts` / `get_protection` 4 个 read-only 工具。
+V3 会加长效 API key + 限流(替代 JWT 过期问题)。
 
 ## 网络要求
 
