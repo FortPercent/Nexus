@@ -1311,13 +1311,25 @@ function OperationsPage({ back }) {
 }
 
 function LB({title, rows, unit}) {
+  // 优先显示 display_name (user → 姓名 / project → 项目名), fallback 到原 UUID/code (uuid 截短)
+  const fmtValue = (r) => {
+    if (r.display_name) return r.display_name;
+    const v = r.value || "(空)";
+    // UUID 长度 36, 截到前 8 字 + "…" 防超宽
+    return v.length > 24 ? v.slice(0, 8) + "…" : v;
+  };
+  const fmtSub = (r) => r.display_email || (r.display_name && r.value !== r.display_name ? r.value.slice(0, 8) : "");
+
   return <div style={{padding:"14px 16px",background:"#fff",borderRadius:10,border:"1px solid "+C.bdrL}}>
     <div style={{fontSize:12,fontWeight:600,color:C.slate,marginBottom:10}}>{title}</div>
     {(!rows || rows.length===0) ? <div style={{fontSize:11,color:C.slateL,padding:"12px 0"}}>暂无数据</div> : <div>
       {rows.map((r, i) => (
-        <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 0",borderBottom: i < rows.length-1 ? "1px solid #f3f4f6" : "none"}}>
-          <div style={{fontSize:11,color:C.slate,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1,maxWidth:200}}>{r.value || "(空)"}</div>
-          <div style={{fontSize:11,color:C.slateL,fontFamily:"var(--fn)",marginLeft:8}}>{r.count} {unit}</div>
+        <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 0",borderBottom: i < rows.length-1 ? "1px solid #f3f4f6" : "none"}} title={r.value || ""}>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:11,color:C.slate,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",fontWeight:r.display_name?500:400}}>{fmtValue(r)}</div>
+            {fmtSub(r) && <div style={{fontSize:9,color:C.slateL,fontFamily:"var(--fn)",marginTop:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{fmtSub(r)}</div>}
+          </div>
+          <div style={{fontSize:11,color:C.slateL,fontFamily:"var(--fn)",marginLeft:8,whiteSpace:"nowrap"}}>{r.count} {unit}</div>
         </div>
       ))}
     </div>}

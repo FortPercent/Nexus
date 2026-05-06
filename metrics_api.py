@@ -185,19 +185,32 @@ async def metrics_leaderboard(
         "tokens": "(tokens_in + tokens_out) DESC",
     }[metric]
 
+    # 按维度 join 友好显示名 (user_id → user_cache.name/email; project_id → projects.name)
+    if dim == "user_id":
+        join_clause = "LEFT JOIN user_cache uc ON uc.user_id = m.user_id"
+        display_select = "uc.name AS display_name, uc.email AS display_email"
+    elif dim == "project_id":
+        join_clause = "LEFT JOIN projects p ON p.project_id = m.project_id"
+        display_select = "p.name AS display_name, NULL AS display_email"
+    else:
+        join_clause = ""
+        display_select = "NULL AS display_name, NULL AS display_email"
+
     sql = f"""
         SELECT
-            {dim} AS dim_value,
+            m.{dim} AS dim_value,
+            {display_select},
             COUNT(*) AS count,
-            COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
-            COALESCE(MAX(latency_ms), 0) AS max_latency_ms,
-            SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS err_rate,
-            COALESCE(SUM(tokens_in), 0) AS tokens_in,
-            COALESCE(SUM(tokens_out), 0) AS tokens_out
-        FROM metrics
-        WHERE ts_unix >= ?
-        GROUP BY dim_value
-        HAVING dim_value IS NOT NULL AND dim_value != ''
+            COALESCE(AVG(m.latency_ms), 0) AS avg_latency_ms,
+            COALESCE(MAX(m.latency_ms), 0) AS max_latency_ms,
+            SUM(CASE WHEN m.status >= 400 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS err_rate,
+            COALESCE(SUM(m.tokens_in), 0) AS tokens_in,
+            COALESCE(SUM(m.tokens_out), 0) AS tokens_out
+        FROM metrics m
+        {join_clause}
+        WHERE m.ts_unix >= ?
+        GROUP BY m.{dim}
+        HAVING m.{dim} IS NOT NULL AND m.{dim} != ''
         ORDER BY {order_clause}
         LIMIT ?
     """
@@ -212,6 +225,8 @@ async def metrics_leaderboard(
         "rows": [
             {
                 "value": r["dim_value"],
+                "display_name": r["display_name"],
+                "display_email": r["display_email"],
                 "count": r["count"],
                 "avg_latency_ms": round(r["avg_latency_ms"], 1),
                 "max_latency_ms": r["max_latency_ms"],

@@ -77,6 +77,10 @@ def isolated_app(tmp_path, monkeypatch):
         "INSERT INTO user_cache (user_id, name, email) VALUES (?, ?, ?)",
         ("regular-id", "Regular User", "regular@example.com"),
     )
+    c.execute(
+        "INSERT INTO projects (project_id, name, created_by) VALUES (?, ?, ?)",
+        ("proj-1", "Project 1", "admin-id"),
+    )
     c.commit()
     c.close()
 
@@ -231,6 +235,53 @@ def test_t6_leaderboard_count_desc(isolated_app):
     body = r.json()
     assert [r["value"] for r in body["rows"]] == ["alice", "bob", "carol"]
     assert [r["count"] for r in body["rows"]] == [5, 3, 1]
+
+
+def test_t6b_leaderboard_user_id_resolves_display_name(isolated_app):
+    """user_id 维度 join user_cache 拿姓名 / 邮箱; 没记录时 display_name=None."""
+    app, db_path = isolated_app
+    # admin-id 在 user_cache 已预置 (Admin / admin@example.com)
+    _seed(db_path, [
+        {"user_id": "admin-id", "latency_ms": 100, "status": 200},
+        {"user_id": "admin-id", "latency_ms": 100, "status": 200},
+        {"user_id": "ghost-uuid", "latency_ms": 100, "status": 200},  # 不在 user_cache
+    ])
+    from fastapi.testclient import TestClient
+    c = TestClient(app)
+    r = c.get("/admin/api/metrics/leaderboard?dim=user_id&metric=count", headers=_admin_headers())
+    rows = r.json()["rows"]
+    by_value = {row["value"]: row for row in rows}
+    assert by_value["admin-id"]["display_name"] == "Admin"
+    assert by_value["admin-id"]["display_email"] == "admin@example.com"
+    assert by_value["ghost-uuid"]["display_name"] is None  # 不在 user_cache → 空
+
+
+def test_t6c_leaderboard_project_id_resolves_name(isolated_app):
+    """project_id 维度 join projects 拿名称."""
+    app, db_path = isolated_app
+    # proj-1 已预置 (name='Project 1')
+    _seed(db_path, [
+        {"project_id": "proj-1", "latency_ms": 100, "status": 200},
+        {"project_id": "proj-1", "latency_ms": 100, "status": 200},
+    ])
+    from fastapi.testclient import TestClient
+    c = TestClient(app)
+    r = c.get("/admin/api/metrics/leaderboard?dim=project_id&metric=count", headers=_admin_headers())
+    rows = r.json()["rows"]
+    assert rows[0]["value"] == "proj-1"
+    assert rows[0]["display_name"] == "Project 1"
+
+
+def test_t6d_leaderboard_endpoint_has_no_display_name(isolated_app):
+    """endpoint / model 维度本身就是字符串, display_name=None 避免误显示."""
+    app, db_path = isolated_app
+    _seed(db_path, [{"endpoint": "/v1/chat/completions", "latency_ms": 100, "status": 200}] * 3)
+    from fastapi.testclient import TestClient
+    c = TestClient(app)
+    r = c.get("/admin/api/metrics/leaderboard?dim=endpoint&metric=count", headers=_admin_headers())
+    rows = r.json()["rows"]
+    assert rows[0]["value"] == "/v1/chat/completions"
+    assert rows[0]["display_name"] is None
 
 
 def test_t7_leaderboard_err_rate(isolated_app):
