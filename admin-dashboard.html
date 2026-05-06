@@ -7,12 +7,13 @@
   <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/echarts@5.5.0/dist/echarts.min.js"></script>
   <style>body { margin: 0; padding: 0; background: #f9fafb; min-height: 100vh; }</style>
 </head>
 <body>
   <div id="root"></div>
   <script type="text/babel">
-const { useState, useEffect, useCallback } = React;
+const { useState, useEffect, useCallback, useRef, useMemo } = React;
 
 // ===== API 工具 =====
 function getToken() {
@@ -904,6 +905,425 @@ function NewProjectPage({ back, go }) {
   </div>;
 }
 
+// ===== ORG MANAGEMENT PAGE (Issue #14 Day 4) =====
+// 组织树管理: 建 org / 编辑 / 树形展示 / 成员 / 挂 project / 绑 letta_block_id
+function OrgPage_Admin({ back }) {
+  const [orgs, setOrgs] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const r = await api("/orgs");
+    setOrgs(r?.orgs || []);
+    setLoading(false);
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  // 扁平 → 树
+  const tree = useMemo(() => {
+    const byParent = {};
+    orgs.forEach(o => {
+      const k = o.parent_id || "__root__";
+      (byParent[k] = byParent[k] || []).push(o);
+    });
+    return byParent;
+  }, [orgs]);
+
+  const showMsg = (m) => { setMsg(m); setTimeout(()=>setMsg(""), 2500); };
+
+  return <div>
+    <Anim><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
+      <div>
+        <button onClick={back} style={{background:"none",border:"none",fontSize:11,color:C.slateL,cursor:"pointer",padding:0,marginBottom:4}}>← 返回</button>
+        <div style={{fontSize:20,fontWeight:700,color:C.slate}}>组织树管理</div>
+        <div style={{fontSize:11,color:C.slateL}}>部门 / 成员 / 项目共享 / Letta block 绑定</div>
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <Btn onClick={load}>{loading?"加载中...":"刷新"}</Btn>
+        <Btn v="primary" onClick={()=>setShowCreate(true)}>+ 创建 org</Btn>
+      </div>
+    </div></Anim>
+
+    {msg && <Anim><div style={{padding:"8px 12px",background:"#FEF3C7",border:"1px solid #FCD34D",borderRadius:8,fontSize:11,marginBottom:12,color:"#92400E"}}>{msg}</div></Anim>}
+
+    <Anim delay={50}><div style={{display:"grid",gridTemplateColumns:"320px 1fr",gap:12}}>
+      {/* 左: 树 */}
+      <div style={{padding:"12px 14px",background:"#fff",borderRadius:10,border:"1px solid "+C.bdrL,maxHeight:600,overflowY:"auto"}}>
+        <div style={{fontSize:11,fontWeight:600,color:C.slateL,marginBottom:8,textTransform:"uppercase"}}>组织树</div>
+        {(tree["__root__"]||[]).map(o => <OrgTreeNode key={o.id} node={o} tree={tree} depth={0} selected={selected} setSelected={setSelected}/>)}
+        {orgs.length === 0 && !loading && <div style={{fontSize:11,color:C.slateL,padding:"12px 0"}}>暂无组织</div>}
+      </div>
+
+      {/* 右: 选中详情 */}
+      <div>
+        {selected ? <OrgDetailPanel orgId={selected} orgs={orgs} onChanged={(m)=>{showMsg(m); load();}}/> :
+          <div style={{padding:"24px",background:"#fff",borderRadius:10,border:"1px solid "+C.bdrL,fontSize:12,color:C.slateL,textAlign:"center"}}>← 选一个组织查看详情</div>}
+      </div>
+    </div></Anim>
+
+    {showCreate && <CreateOrgModal orgs={orgs} onClose={()=>setShowCreate(false)} onCreated={(m)=>{showMsg(m); load(); setShowCreate(false);}}/>}
+  </div>;
+}
+
+function OrgTreeNode({ node, tree, depth, selected, setSelected }) {
+  const children = tree[node.id] || [];
+  const isSel = selected === node.id;
+  return <div>
+    <div onClick={()=>setSelected(node.id)} style={{padding:"6px 8px",borderRadius:6,cursor:"pointer",background:isSel?"#EFF6FF":"transparent",marginLeft:depth*14,fontSize:12}}>
+      <span style={{fontWeight:isSel?600:500,color:isSel?"#1D4ED8":C.slate}}>{node.name}</span>
+      <span style={{fontSize:10,color:C.slateL,marginLeft:6,fontFamily:"var(--fn)"}}>{node.code}</span>
+      <span style={{fontSize:10,color:C.slateL,marginLeft:8}}>👥 {node.member_count}</span>
+      {node.project_count>0 && <span style={{fontSize:10,color:C.slateL,marginLeft:6}}>📁 {node.project_count}</span>}
+      {node.letta_block_id && <span style={{fontSize:10,color:"#10B981",marginLeft:6}} title={node.letta_block_id}>● block</span>}
+    </div>
+    {children.map(c => <OrgTreeNode key={c.id} node={c} tree={tree} depth={depth+1} selected={selected} setSelected={setSelected}/>)}
+  </div>;
+}
+
+function OrgDetailPanel({ orgId, orgs, onChanged }) {
+  const node = orgs.find(o => o.id === orgId);
+  const [members, setMembers] = useState([]);
+  const [orgProjects, setOrgProjects] = useState([]);  // Day 5: org 关联的 project (反向 endpoint)
+  const [editName, setEditName] = useState("");
+  const [editBlock, setEditBlock] = useState("");
+  const [newMemberId, setNewMemberId] = useState("");
+  const [newMemberRole, setNewMemberRole] = useState("member");
+  const [newProjId, setNewProjId] = useState("");
+  const [newProjAccess, setNewProjAccess] = useState("shared_read");
+
+  const reloadProjects = useCallback(async () => {
+    const r = await api(`/orgs/${orgId}/projects`);
+    setOrgProjects(r?.projects || []);
+  }, [orgId]);
+
+  useEffect(() => {
+    if (!node) return;
+    setEditName(node.name);
+    setEditBlock(node.letta_block_id || "");
+    api(`/orgs/${orgId}/members`).then(r => setMembers(r?.members || []));
+    reloadProjects();
+  }, [orgId, node, reloadProjects]);
+
+  if (!node) return <div style={{padding:24,fontSize:12,color:C.slateL}}>org 未找到</div>;
+
+  const saveProfile = async () => {
+    const body = {};
+    if (editName !== node.name) body.name = editName;
+    if (editBlock !== (node.letta_block_id||"")) body.letta_block_id = editBlock;
+    if (Object.keys(body).length === 0) return;
+    try { await api(`/orgs/${orgId}`, {method:"PATCH", body}); onChanged("已保存"); }
+    catch(e) { onChanged("保存失败: "+e.message.slice(0,80)); }
+  };
+
+  const addMember = async () => {
+    if (!newMemberId) return;
+    try {
+      await api(`/orgs/${orgId}/members`, {method:"POST", body:{user_id:newMemberId, role:newMemberRole}});
+      setNewMemberId("");
+      const m = await api(`/orgs/${orgId}/members`); setMembers(m?.members||[]);
+      onChanged("已加成员");
+    } catch(e) { onChanged("失败: "+e.message.slice(0,80)); }
+  };
+
+  const delMember = async (uid) => {
+    try {
+      await api(`/orgs/${orgId}/members/${uid}`, {method:"DELETE"});
+      const m = await api(`/orgs/${orgId}/members`); setMembers(m?.members||[]);
+      onChanged("已移除");
+    } catch(e) { onChanged("失败: "+e.message.slice(0,80)); }
+  };
+
+  const delOrg = async () => {
+    if (!confirm(`确认删除 "${node.name}" ?\n\n删除前提: 无子节点 / 无成员 / 无 project 挂载. 不满足后端会拒.`)) return;
+    try { await api(`/orgs/${orgId}`, {method:"DELETE"}); onChanged("已删除"); }
+    catch(e) { onChanged("失败: "+e.message.slice(0,80)); }
+  };
+
+  const attachProject = async () => {
+    if (!newProjId.trim()) return;
+    try {
+      await api(`/projects/${newProjId.trim()}/orgs`,
+                {method:"POST", body:{org_id: orgId, access_level: newProjAccess}});
+      setNewProjId("");
+      await reloadProjects();
+      onChanged("已挂载");
+    } catch(e) { onChanged("失败: "+e.message.slice(0,80)); }
+  };
+
+  const detachProject = async (pid) => {
+    try {
+      await api(`/projects/${pid}/orgs/${orgId}`, {method:"DELETE"});
+      await reloadProjects();
+      onChanged("已解绑");
+    } catch(e) { onChanged("失败: "+e.message.slice(0,80)); }
+  };
+
+  return <div style={{padding:"16px 18px",background:"#fff",borderRadius:10,border:"1px solid "+C.bdrL}}>
+    {/* 基本信息 */}
+    <div style={{marginBottom:18}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+        <div style={{fontSize:14,fontWeight:700,color:C.slate}}>{node.name}</div>
+        <div style={{fontSize:10,color:C.slateL,fontFamily:"var(--fn)"}}>{node.code} · {node.org_type} · {node.id}</div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"100px 1fr",gap:8,fontSize:12,alignItems:"center"}}>
+        <span style={{color:C.slateL}}>名称</span>
+        <input value={editName} onChange={e=>setEditName(e.target.value)} style={{padding:"4px 8px",fontSize:12,borderRadius:6,border:"1px solid "+C.bdrL}}/>
+        <span style={{color:C.slateL}}>Letta block</span>
+        <input value={editBlock} onChange={e=>setEditBlock(e.target.value)} placeholder="block-xxx (可选, 解绑留空)" style={{padding:"4px 8px",fontSize:11,fontFamily:"var(--fn)",borderRadius:6,border:"1px solid "+C.bdrL}}/>
+      </div>
+      <div style={{marginTop:10,display:"flex",gap:8}}>
+        <Btn v="primary" onClick={saveProfile}>保存</Btn>
+        <Btn onClick={delOrg} style={{background:"#FEE2E2",color:"#991B1B"}}>删除 org</Btn>
+      </div>
+    </div>
+
+    {/* 成员 */}
+    <div style={{marginBottom:18}}>
+      <div style={{fontSize:11,fontWeight:600,color:C.slateL,textTransform:"uppercase",marginBottom:8}}>成员 ({members.length})</div>
+      <div style={{maxHeight:240,overflowY:"auto",marginBottom:10}}>
+        {members.map(m => <div key={m.user_id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"4px 8px",borderBottom:"1px solid #f3f4f6",fontSize:11}}>
+          <div>
+            <span style={{fontWeight:500,color:C.slate}}>{m.name||m.user_id}</span>
+            <span style={{color:C.slateL,marginLeft:6}}>{m.email}</span>
+            <span style={{fontSize:9,marginLeft:6,padding:"1px 5px",background:m.role==="admin"?"#DBEAFE":"#F3F4F6",borderRadius:4,color:m.role==="admin"?"#1E40AF":C.slateL}}>{m.role}</span>
+          </div>
+          <button onClick={()=>delMember(m.user_id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:10,color:"#DC2626"}}>移除</button>
+        </div>)}
+        {members.length === 0 && <div style={{fontSize:11,color:C.slateL,padding:8}}>暂无成员</div>}
+      </div>
+      <div style={{display:"flex",gap:6}}>
+        <input value={newMemberId} onChange={e=>setNewMemberId(e.target.value)} placeholder="user_id" style={{flex:1,padding:"4px 8px",fontSize:11,fontFamily:"var(--fn)",borderRadius:6,border:"1px solid "+C.bdrL}}/>
+        <select value={newMemberRole} onChange={e=>setNewMemberRole(e.target.value)} style={{padding:"4px 8px",fontSize:11,borderRadius:6,border:"1px solid "+C.bdrL}}>
+          <option value="member">member</option>
+          <option value="admin">admin</option>
+        </select>
+        <Btn onClick={addMember}>加入</Btn>
+      </div>
+    </div>
+
+    {/* 关联项目 (Day 5) */}
+    <div>
+      <div style={{fontSize:11,fontWeight:600,color:C.slateL,textTransform:"uppercase",marginBottom:8}}>关联项目 ({orgProjects.length})</div>
+      <div style={{maxHeight:200,overflowY:"auto",marginBottom:10}}>
+        {orgProjects.map(p => <div key={p.project_id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"4px 8px",borderBottom:"1px solid #f3f4f6",fontSize:11}}>
+          <div>
+            <span style={{fontWeight:500,color:C.slate}}>{p.name}</span>
+            <span style={{fontFamily:"var(--fn)",color:C.slateL,marginLeft:6,fontSize:10}}>{p.project_id}</span>
+            <span style={{fontSize:9,marginLeft:6,padding:"1px 5px",borderRadius:4,background:p.access_level==="owner"?"#FEE2E2":p.access_level==="shared_write"?"#DBEAFE":"#F3F4F6",color:p.access_level==="owner"?"#991B1B":p.access_level==="shared_write"?"#1E40AF":C.slateL}}>{p.access_level}</span>
+          </div>
+          <button onClick={()=>detachProject(p.project_id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:10,color:"#DC2626"}}>解绑</button>
+        </div>)}
+        {orgProjects.length === 0 && <div style={{fontSize:11,color:C.slateL,padding:8}}>暂无关联项目</div>}
+      </div>
+      <div style={{display:"flex",gap:6}}>
+        <input value={newProjId} onChange={e=>setNewProjId(e.target.value)} placeholder="project_id" style={{flex:1,padding:"4px 8px",fontSize:11,fontFamily:"var(--fn)",borderRadius:6,border:"1px solid "+C.bdrL}}/>
+        <select value={newProjAccess} onChange={e=>setNewProjAccess(e.target.value)} style={{padding:"4px 8px",fontSize:11,borderRadius:6,border:"1px solid "+C.bdrL}}>
+          <option value="shared_read">shared_read</option>
+          <option value="shared_write">shared_write</option>
+          <option value="owner">owner</option>
+        </select>
+        <Btn onClick={attachProject}>挂载</Btn>
+      </div>
+    </div>
+  </div>;
+}
+
+function CreateOrgModal({ orgs, onClose, onCreated }) {
+  const [name, setName] = useState("");
+  const [code, setCode] = useState("");
+  const [parentId, setParentId] = useState("");
+  const [orgType, setOrgType] = useState("department");
+  const [err, setErr] = useState("");
+
+  const submit = async () => {
+    setErr("");
+    const body = {name, code, org_type: orgType};
+    if (parentId) body.parent_id = parentId;
+    try { await api("/orgs", {method:"POST", body}); onCreated("已创建 "+name); }
+    catch(e) { setErr(e.message.slice(0,200)); }
+  };
+
+  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:100,display:"flex",alignItems:"center",justifyContent:"center"}}>
+    <div style={{background:"#fff",borderRadius:12,padding:24,width:420,maxWidth:"90vw"}}>
+      <div style={{fontSize:16,fontWeight:700,color:C.slate,marginBottom:16}}>创建组织</div>
+      <div style={{display:"grid",gridTemplateColumns:"80px 1fr",gap:10,fontSize:12,alignItems:"center"}}>
+        <span>名称</span>
+        <input value={name} onChange={e=>setName(e.target.value)} style={{padding:"6px 10px",fontSize:12,borderRadius:6,border:"1px solid "+C.bdrL}}/>
+        <span>code</span>
+        <input value={code} onChange={e=>setCode(e.target.value.toLowerCase())} placeholder="lowercase-with-hyphens" style={{padding:"6px 10px",fontSize:11,fontFamily:"var(--fn)",borderRadius:6,border:"1px solid "+C.bdrL}}/>
+        <span>类型</span>
+        <select value={orgType} onChange={e=>setOrgType(e.target.value)} style={{padding:"6px 10px",fontSize:12,borderRadius:6,border:"1px solid "+C.bdrL}}>
+          <option value="bureau">bureau (委办局/局)</option>
+          <option value="department">department (处/部门)</option>
+          <option value="division">division (科/分支)</option>
+        </select>
+        <span>父节点</span>
+        <select value={parentId} onChange={e=>setParentId(e.target.value)} style={{padding:"6px 10px",fontSize:12,borderRadius:6,border:"1px solid "+C.bdrL}}>
+          <option value="">(顶层)</option>
+          {orgs.map(o => <option key={o.id} value={o.id}>{o.name} · {o.code}</option>)}
+        </select>
+      </div>
+      {err && <div style={{padding:"6px 10px",background:"#FEE2E2",color:"#991B1B",fontSize:11,borderRadius:6,marginTop:10}}>{err}</div>}
+      <div style={{marginTop:18,display:"flex",justifyContent:"flex-end",gap:8}}>
+        <Btn onClick={onClose}>取消</Btn>
+        <Btn v="primary" onClick={submit}>创建</Btn>
+      </div>
+    </div>
+  </div>;
+}
+
+
+// ===== OPERATIONS PAGE (Issue #13 Day 4) =====
+// 运营驾驶舱: 调用量 / 时延 / 错误率 / 维度排行
+function OperationsPage({ back }) {
+  const [hours, setHours] = useState(24);
+  const [bucket, setBucket] = useState("hour");
+  const [groupBy, setGroupBy] = useState("");
+  const [summary, setSummary] = useState(null);
+  const [series, setSeries] = useState([]);
+  const [boards, setBoards] = useState({user_id:[],project_id:[],endpoint:[]});
+  const [loading, setLoading] = useState(false);
+  const chartRef = useRef(null);
+  const chartInst = useRef(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const qs = `hours=${hours}`;
+      const [s, ts, lb_user, lb_proj, lb_ep] = await Promise.all([
+        api(`/metrics/summary?${qs}`),
+        api(`/metrics/timeseries?${qs}&bucket=${bucket}${groupBy?`&group_by=${groupBy}`:""}`),
+        api(`/metrics/leaderboard?dim=user_id&metric=count&${qs}&top=10`),
+        api(`/metrics/leaderboard?dim=project_id&metric=count&${qs}&top=10`),
+        api(`/metrics/leaderboard?dim=endpoint&metric=count&${qs}&top=10`),
+      ]);
+      setSummary(s);
+      setSeries(ts?.series || []);
+      setBoards({
+        user_id: lb_user?.rows || [],
+        project_id: lb_proj?.rows || [],
+        endpoint: lb_ep?.rows || [],
+      });
+    } finally { setLoading(false); }
+  }, [hours, bucket, groupBy]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // 渲染折线图
+  useEffect(() => {
+    if (!chartRef.current || !window.echarts) return;
+    if (!chartInst.current) chartInst.current = window.echarts.init(chartRef.current);
+    // 按 group 分组成多条线
+    const grouped = {};
+    series.forEach(p => {
+      const k = p.group || "全部";
+      if (!grouped[k]) grouped[k] = [];
+      grouped[k].push([p.bucket, p.count]);
+    });
+    const allBuckets = Array.from(new Set(series.map(p => p.bucket))).sort();
+    const lineSeries = Object.entries(grouped).map(([name, pts]) => ({
+      name, type: "line", smooth: true, symbol: "circle", symbolSize: 4,
+      data: allBuckets.map(b => {
+        const hit = pts.find(p => p[0] === b);
+        return hit ? hit[1] : 0;
+      })
+    }));
+    chartInst.current.setOption({
+      tooltip: { trigger: "axis" },
+      legend: lineSeries.length > 1 ? { top: 0, type: "scroll" } : undefined,
+      grid: { left: 50, right: 20, top: lineSeries.length > 1 ? 30 : 10, bottom: 30 },
+      xAxis: { type: "category", data: allBuckets, axisLabel: { fontSize: 10 } },
+      yAxis: { type: "value", name: "请求数", nameTextStyle: { fontSize: 10 } },
+      series: lineSeries,
+    }, true);
+    chartInst.current.resize();
+  }, [series]);
+
+  useEffect(() => {
+    const onResize = () => chartInst.current && chartInst.current.resize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const SC = ({label, value, sub}) => (
+    <div style={{flex:1,minWidth:140,padding:"14px 16px",background:"#fff",borderRadius:10,border:"1px solid "+C.bdrL}}>
+      <div style={{fontSize:11,color:C.slateL,fontWeight:500}}>{label}</div>
+      <div style={{fontSize:22,color:C.slate,fontWeight:700,marginTop:4,fontFamily:"var(--fn)"}}>{value}</div>
+      {sub && <div style={{fontSize:10,color:C.slateL,marginTop:2}}>{sub}</div>}
+    </div>
+  );
+
+  return <div>
+    <Anim><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
+      <div>
+        <button onClick={back} style={{background:"none",border:"none",fontSize:11,color:C.slateL,cursor:"pointer",padding:0,marginBottom:4}}>← 返回</button>
+        <div style={{fontSize:20,fontWeight:700,color:C.slate}}>运营驾驶舱</div>
+        <div style={{fontSize:11,color:C.slateL}}>请求量 / 时延 / 错误率 / 维度排行</div>
+      </div>
+      <div style={{display:"flex",gap:8,alignItems:"center"}}>
+        <select value={hours} onChange={e=>setHours(parseInt(e.target.value))} style={{padding:"5px 10px",fontSize:11,borderRadius:6,border:"1px solid "+C.bdrL}}>
+          <option value={1}>最近 1 小时</option>
+          <option value={6}>最近 6 小时</option>
+          <option value={24}>最近 24 小时</option>
+          <option value={168}>最近 7 天</option>
+          <option value={720}>最近 30 天</option>
+        </select>
+        <select value={bucket} onChange={e=>setBucket(e.target.value)} style={{padding:"5px 10px",fontSize:11,borderRadius:6,border:"1px solid "+C.bdrL}}>
+          <option value="minute">分钟</option>
+          <option value="hour">小时</option>
+          <option value="day">天</option>
+        </select>
+        <select value={groupBy} onChange={e=>setGroupBy(e.target.value)} style={{padding:"5px 10px",fontSize:11,borderRadius:6,border:"1px solid "+C.bdrL}}>
+          <option value="">不分组</option>
+          <option value="model">按模型</option>
+          <option value="project_id">按项目</option>
+          <option value="endpoint">按端点</option>
+          <option value="status">按状态码</option>
+        </select>
+        <Btn onClick={load}>{loading?"加载中...":"刷新"}</Btn>
+      </div>
+    </div></Anim>
+
+    {/* summary cards */}
+    <Anim delay={50}><div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:16}}>
+      <SC label="总请求" value={summary?.total ?? "-"} sub={summary ? `${summary.unique_users} 用户 / ${summary.unique_projects} 项目` : ""}/>
+      <SC label="平均时延" value={summary ? `${summary.avg_latency_ms} ms` : "-"} sub={summary ? `最大 ${summary.max_latency_ms} ms` : ""}/>
+      <SC label="错误率" value={summary ? `${(summary.err_rate*100).toFixed(2)}%` : "-"} sub={summary ? `5xx ${summary.err_5xx} / 4xx ${summary.err_4xx}` : ""}/>
+      <SC label="Token 总量" value={summary ? `${(summary.tokens_in+summary.tokens_out).toLocaleString()}` : "-"} sub={summary ? `in ${summary.tokens_in.toLocaleString()} / out ${summary.tokens_out.toLocaleString()}` : ""}/>
+    </div></Anim>
+
+    {/* timeseries */}
+    <Anim delay={100}><div style={{padding:"16px 18px",background:"#fff",borderRadius:10,border:"1px solid "+C.bdrL,marginBottom:16}}>
+      <div style={{fontSize:12,fontWeight:600,color:C.slate,marginBottom:8}}>请求量趋势</div>
+      <div ref={chartRef} style={{width:"100%",height:300}}/>
+    </div></Anim>
+
+    {/* leaderboards */}
+    <Anim delay={150}><div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:12}}>
+      <LB title="用户排行" rows={boards.user_id} unit="次"/>
+      <LB title="项目排行" rows={boards.project_id} unit="次"/>
+      <LB title="端点排行" rows={boards.endpoint} unit="次"/>
+    </div></Anim>
+  </div>;
+}
+
+function LB({title, rows, unit}) {
+  return <div style={{padding:"14px 16px",background:"#fff",borderRadius:10,border:"1px solid "+C.bdrL}}>
+    <div style={{fontSize:12,fontWeight:600,color:C.slate,marginBottom:10}}>{title}</div>
+    {(!rows || rows.length===0) ? <div style={{fontSize:11,color:C.slateL,padding:"12px 0"}}>暂无数据</div> : <div>
+      {rows.map((r, i) => (
+        <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 0",borderBottom: i < rows.length-1 ? "1px solid #f3f4f6" : "none"}}>
+          <div style={{fontSize:11,color:C.slate,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1,maxWidth:200}}>{r.value || "(空)"}</div>
+          <div style={{fontSize:11,color:C.slateL,fontFamily:"var(--fn)",marginLeft:8}}>{r.count} {unit}</div>
+        </div>
+      ))}
+    </div>}
+  </div>;
+}
+
 // ===== APP =====
 // "我的 API 访问" 面板 (04-20 新增): 用户点 header 的 "API" 按钮弹出
 // 解决 "怎么拿 user_id 调 API" 的反复问题, 一键复制 + 现成 curl 示例
@@ -1046,6 +1466,8 @@ function App() {
           <div style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer"}} onClick={()=>go("home")}><div style={{width:28,height:28,borderRadius:7,background:"#111827",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:12,fontWeight:700}}>T</div><div><div style={{fontSize:14,fontWeight:700,color:"#111827"}}>TeleAI Nexus</div><div style={{fontSize:10,color:"#9ca3af",fontWeight:500}}>知识管理</div></div></div>
           <div style={{display:"flex",alignItems:"center",gap:10}}>
             {user.is_org_admin ? <Btn onClick={()=>go("org")} style={{fontSize:11,padding:"5px 12px"}}>中国电信人工智能研究院</Btn> : <span style={{fontSize:11,padding:"5px 12px",background:C.warmBg,borderRadius:8,color:C.slateL}}>中国电信人工智能研究院</span>}
+            {user.is_org_admin && <Btn onClick={()=>go("ops")} style={{fontSize:11,padding:"5px 12px"}}>📊 运营</Btn>}
+            {user.is_org_admin && <Btn onClick={()=>go("orgtree")} style={{fontSize:11,padding:"5px 12px"}}>🌳 组织</Btn>}
             <Btn onClick={()=>setShowApi(true)} style={{fontSize:11,padding:"5px 12px"}}>🔑 API</Btn>
             <Av name={user.name||"?"} size={26}/>
             <span style={{fontSize:12,color:"#4b5563",fontWeight:500}}>{user.name||user.email}</span>
@@ -1059,6 +1481,8 @@ function App() {
         {page === "memory" && <MemoryPage back={()=>go("home")}/>}
         {page === "personal" && <PersonalPage back={()=>go("home")}/>}
         {page === "new-project" && <NewProjectPage back={()=>go("home")} go={go}/>}
+        {page === "ops" && <OperationsPage back={()=>go("home")}/>}
+        {page === "orgtree" && <OrgPage_Admin back={()=>go("home")}/>}
       </div>
     </div>
   );

@@ -196,12 +196,22 @@ def _create_agent_fresh(user_id: str, project: str) -> str:
 
         human_block_id = get_or_create_personal_human_block(user_id)
 
+        # Issue #14 Day 5: 注入用户所在 org 的 letta block chain (root → leaf 顺序).
+        # admin 通过 admin UI 给 org 绑 block_id 后这里读出来; 没绑的 org 在 SQL
+        # 里跳过, 用户没挂 org 时返空 list. 不影响现有 agent (只挂 human / persona).
+        try:
+            from org_tree import get_user_org_block_chain_sync
+            org_block_chain = get_user_org_block_chain_sync(user_id)
+        except Exception as e:
+            logging.warning(f"failed to load org block chain for {user_id}: {e}")
+            org_block_chain = []
+
         agent = letta.agents.create(
             name=f"user-{user_id}-{project}",
             model="openai/Kimi-K2.6",
             metadata={"owner": user_id, "project": project},
             tool_ids=custom_tool_ids,
-            block_ids=[human_block_id],
+            block_ids=[human_block_id, *org_block_chain],
             memory_blocks=[{"label": "persona", "value": PERSONA_TEXT}],
             llm_config={
                 "model": "Kimi-K2.6",
@@ -296,12 +306,20 @@ def get_or_create_agent(user_id: str, project: str) -> str:
         # 这样 Letta 系统提示编译时能拿到 block value。
         human_block_id = get_or_create_personal_human_block(user_id)
 
+        # Issue #14 Day 5: org_block chain 同上 (二条 create 路径都要接).
+        try:
+            from org_tree import get_user_org_block_chain_sync
+            org_block_chain = get_user_org_block_chain_sync(user_id)
+        except Exception as e:
+            logging.warning(f"failed to load org block chain for {user_id}: {e}")
+            org_block_chain = []
+
         agent = letta.agents.create(
             name=f"user-{user_id}-{project}",
             model="openai/Kimi-K2.6",
             metadata={"owner": user_id, "project": project},
             tool_ids=custom_tool_ids,
-            block_ids=[human_block_id],
+            block_ids=[human_block_id, *org_block_chain],
             memory_blocks=[
                 {
                     "label": "persona",

@@ -156,29 +156,54 @@ async def get_current_user(request: Request, body: dict = None) -> dict:
         raise HTTPException(404)
 
 
+# Issue #14 Day 2 (2026-05-05): 鉴权走 org_tree.can_user_access_project_async,
+# 自动覆盖 project_members 直接授权 + project_orgs 跨组织/递归继承授权.
+# 旧 SQL 直查 project_members 路径作 fallback (避免 org_tree 模块循环 import / 启动竞态).
+_ADMIN_LEVELS = {"admin", "owner"}
+_WRITE_LEVELS = {"admin", "owner", "shared_write", "member"}
+_READ_LEVELS = {"admin", "owner", "shared_write", "shared_read", "member"}
+
+
+async def _get_user_project_access(user_id: str, project_id: str):
+    """返 access_level 字符串 or None. 复用 org_tree LRU cache."""
+    try:
+        from org_tree import can_user_access_project_async
+        return await can_user_access_project_async(user_id, project_id)
+    except ImportError:
+        # fallback: org_tree 没装 → 走老逻辑直查 project_members
+        async with use_db_async() as db:
+            async with db.execute(
+                "SELECT role FROM project_members WHERE user_id = ? AND project_id = ?",
+                (user_id, project_id),
+            ) as cur:
+                row = await cur.fetchone()
+        return row["role"] if row else None
+
+
 async def require_project_member(request: Request, project_id: str) -> dict:
+    """读权限. 命中 project_members / project_orgs (递归祖先 org) 任一即可."""
     user = await extract_user_from_admin(request)
-    async with use_db_async() as db:
-        async with db.execute(
-            "SELECT role FROM project_members WHERE user_id = ? AND project_id = ?",
-            (user["id"], project_id),
-        ) as cur:
-            row = await cur.fetchone()
-    if not row:
+    lvl = await _get_user_project_access(user["id"], project_id)
+    if lvl not in _READ_LEVELS:
         raise HTTPException(403, "你不是该项目的成员")
     return user
 
 
 async def require_project_admin(request: Request, project_id: str) -> dict:
+    """admin 权限. project_members.role='admin' / project_orgs.access_level in (admin/owner) 任一即可."""
     user = await extract_user_from_admin(request)
-    async with use_db_async() as db:
-        async with db.execute(
-            "SELECT role FROM project_members WHERE user_id = ? AND project_id = ? AND role = 'admin'",
-            (user["id"], project_id),
-        ) as cur:
-            row = await cur.fetchone()
-    if not row:
+    lvl = await _get_user_project_access(user["id"], project_id)
+    if lvl not in _ADMIN_LEVELS:
         raise HTTPException(403, "需要项目管理员权限")
+    return user
+
+
+async def require_project_write(request: Request, project_id: str) -> dict:
+    """写权限. project_orgs shared_write 也算 (Day 2 新增, 现有代码可不用)."""
+    user = await extract_user_from_admin(request)
+    lvl = await _get_user_project_access(user["id"], project_id)
+    if lvl not in _WRITE_LEVELS:
+        raise HTTPException(403, "需要项目写入权限")
     return user
 
 

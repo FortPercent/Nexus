@@ -408,5 +408,77 @@ def init_db():
     """)
     db.execute("INSERT INTO memory_history_fts(memory_history_fts) VALUES('rebuild')")
 
+    # ------------------------------------------------------------------
+    # Issue #14 多组织树 (2026-05-05) — 见 docs/multi-org-tree-design.md
+    # 一刀切迁移策略 (decision A): root org "AI 研究院" + 所有 project/user 挂 root.
+    # 现有 project_members 平面表保留 (跟 project_orgs 是并集授权).
+    # ------------------------------------------------------------------
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS organizations (
+            id TEXT PRIMARY KEY,
+            parent_id TEXT,                                 -- 自引用, 根 org NULL
+            name TEXT NOT NULL,
+            code TEXT NOT NULL UNIQUE,                      -- 'sh-chengyun' / 'sh-chengyun-yunyingchu'
+            org_type TEXT DEFAULT 'department',             -- 'bureau'/'department'/'division'
+            letta_block_id TEXT,                            -- 共享 Letta block, 子部门递归继承 (Day 4 接入)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (parent_id) REFERENCES organizations(id)
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_org_parent ON organizations(parent_id)")
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS org_members (
+            org_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            role TEXT DEFAULT 'member',                     -- 'admin'/'member'
+            PRIMARY KEY (org_id, user_id)
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_orgmem_user ON org_members(user_id)")
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS project_orgs (
+            project_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            access_level TEXT DEFAULT 'shared_read',        -- 'owner'/'shared_read'/'shared_write'
+            PRIMARY KEY (project_id, org_id)
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_projorg_org ON project_orgs(org_id)")
+
+    # ------------------------------------------------------------------
+    # Issue #13 metrics 数据底座 (2026-05-05)
+    # 见 docs/operating-dashboard-design.md + adapter/middleware_metrics.py
+    # 每个被白名单匹配的 HTTP 请求落一行, 异步 fire-and-forget 写入.
+    # ------------------------------------------------------------------
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL,
+            ts_unix REAL NOT NULL,                  -- 请求开始时间 (秒, 含小数 ms 精度)
+            user_id TEXT NOT NULL DEFAULT '',
+            project_id TEXT,                        -- letta-* 路径才有
+            agent_id TEXT,                          -- letta-* 路径才有
+            model TEXT,                             -- letta-cpm / qwen-no-mem 等
+            endpoint TEXT NOT NULL,
+            method TEXT NOT NULL DEFAULT 'POST',
+            status INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            ttft_ms INTEGER,                        -- streaming 才有 (Day 2 回填)
+            tokens_in INTEGER DEFAULT 0,
+            tokens_out INTEGER DEFAULT 0,
+            cost_micro_cny INTEGER DEFAULT 0,       -- 1/1000000 元, 政务客户内部不计费, 留口子
+            variant_id TEXT,                        -- A/B 实验分桶 (V2)
+            feedback_score INTEGER,                 -- 1=👍 / -1=👎, 反馈 worker 同步后回填 (V2)
+            err_class TEXT                          -- 错误分类
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts_unix)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_metrics_user_ts ON metrics(user_id, ts_unix DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_metrics_project_ts ON metrics(project_id, ts_unix DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_metrics_request_id ON metrics(request_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_metrics_endpoint_ts ON metrics(endpoint, ts_unix DESC)")
+
     db.commit()
     db.close()

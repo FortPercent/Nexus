@@ -37,6 +37,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Issue #13 metrics 数据底座 — 见 middleware_metrics.py + docs/operating-dashboard-design.md
+# 拦白名单前缀, 落 metrics 表 (fire-and-forget). 不阻塞业务路径.
+from middleware_metrics import metrics_middleware
+app.middleware("http")(metrics_middleware)
+
 
 # 多 worker 下的 singleton leader 选举 —— 只让一个 worker 跑对账/资源初始化
 # fcntl.flock 是进程级锁，进程退出自动释放；首个 worker 拿到锁成为 leader
@@ -76,6 +81,13 @@ def startup():
         sync_org_resources_to_all_agents()
     except Exception as e:
         logging.error(f"startup org resource init failed: {e}")
+    # Issue #14 Day 1 (2026-05-05): 一刀切迁移 — 建 root org + 所有 project/user 挂 root.
+    # 幂等, 重启重跑无副作用. leader-only 防多 worker 并发迁移.
+    try:
+        from org_tree import ensure_root_org_migration
+        ensure_root_org_migration()
+    except Exception as e:
+        logging.error(f"startup org tree migration failed: {e}")
     # 启动时全量对账
     try:
         reconcile_all()
@@ -195,13 +207,21 @@ def _extract_letta_response(response) -> str:
     return header + assistant_content
 
 
-async def non_stream_response(agent_id: str, message: str, model: str, notice_prefix: str | None = None):
+async def non_stream_response(agent_id: str, message: str, model: str, notice_prefix: str | None = None, *, metrics_sink=None):
     response = letta.agents.messages.create(
         agent_id=agent_id, messages=[{"role": "user", "content": message}]
     )
     assistant_content = _extract_letta_response(response)
     if notice_prefix:
         assistant_content = f"{notice_prefix}\n\n{assistant_content}"
+
+    # Day 2: 把 letta 的 usage 字段回填给 metrics middleware (Issue #13)
+    usage = getattr(response, "usage", None)
+    pt = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
+    ct = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
+    if metrics_sink is not None:
+        metrics_sink.metrics_tokens_in = pt
+        metrics_sink.metrics_tokens_out = ct
 
     return {
         "id": f"chatcmpl-{agent_id[:8]}",
@@ -214,7 +234,7 @@ async def non_stream_response(agent_id: str, message: str, model: str, notice_pr
                 "finish_reason": "stop",
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
     }
 
 
@@ -287,11 +307,28 @@ def _assistant_delta_text(content) -> str:
     return ""
 
 
-async def stream_from_letta(agent_id: str, message: str, model: str, notice_prefix: str | None = None):
+async def stream_from_letta(agent_id: str, message: str, model: str, notice_prefix: str | None = None, *, metrics_sink=None):
     """真流式：边调 Letta 边转发 token。reasoning 片段用 <think></think> 包裹。
 
     notice_prefix: 若非空 (比如 preflight rebuild 后的 '对话已重置' 提示),
-    作为首个 SSE content chunk 发出, 再开始 Letta stream."""
+    作为首个 SSE content chunk 发出, 再开始 Letta stream.
+
+    metrics_sink (Day 2 #13): 任何带 SimpleNamespace 风格的对象 (e.g. request.state).
+    记 first non-empty chunk 时间为 metrics_ttft_ms; 收到 letta usage_statistics
+    event 时回填 metrics_tokens_in / out. 不提供则不采.
+    """
+    import time as _time
+    _stream_started_perf = _time.perf_counter()
+    _ttft_recorded = False
+
+    def _record_ttft_once():
+        nonlocal _ttft_recorded
+        if _ttft_recorded or metrics_sink is None:
+            return
+        ms = int((_time.perf_counter() - _stream_started_perf) * 1000)
+        metrics_sink.metrics_ttft_ms = ms
+        _ttft_recorded = True
+
     chunk_id = f"chatcmpl-{agent_id[:8]}"
 
     def _sse(delta: dict, finish_reason=None) -> str:
@@ -304,6 +341,7 @@ async def stream_from_letta(agent_id: str, message: str, model: str, notice_pref
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     if notice_prefix:
+        _record_ttft_once()  # notice_prefix 也算"用户感受到的第一字节"
         yield _sse({"role": "assistant", "content": notice_prefix + "\n\n"})
 
     in_thinking = False
@@ -331,6 +369,7 @@ async def stream_from_letta(agent_id: str, message: str, model: str, notice_pref
                 text = getattr(ev, "reasoning", "") or ""
                 if not text:
                     continue
+                _record_ttft_once()  # Day 2 #13: 第一个非空 reasoning chunk 算 TTFT
                 if not in_thinking:
                     if not text.strip():
                         continue
@@ -341,6 +380,7 @@ async def stream_from_letta(agent_id: str, message: str, model: str, notice_pref
                 text = _assistant_delta_text(getattr(ev, "content", ""))
                 if not text:
                     continue
+                _record_ttft_once()  # Day 2 #13: 直出 assistant 也算 TTFT
                 # 先 flush 任何未结束的 tool_call
                 pending = flush_tool_call()
                 if pending:
@@ -396,7 +436,14 @@ async def stream_from_letta(agent_id: str, message: str, model: str, notice_pref
                     prefix = "</think>\n" if in_thinking else "\n"
                     in_thinking = False
                     yield _sse({"content": prefix + friendly + "\n"})
-            # ping/usage_statistics 等继续忽略
+            elif mtype == "usage_statistics":
+                # Day 2 #13: letta 流末 usage event, 回填 metrics middleware 的 token 字段
+                if metrics_sink is not None:
+                    pt = int(getattr(ev, "prompt_tokens", 0) or 0)
+                    ct = int(getattr(ev, "completion_tokens", 0) or 0)
+                    metrics_sink.metrics_tokens_in = pt
+                    metrics_sink.metrics_tokens_out = ct
+            # ping 等继续忽略
 
         # 流结束，flush 残留 tool_call
         pending = flush_tool_call()
@@ -469,6 +516,8 @@ async def chat_completions(request: Request):
 
     # qwen-no-mem: 直接透传给 vLLM，不走 Letta
     if model == "qwen-no-mem":
+        # Day 2 #13: 标 metrics 行 model 字段 (这条路径无 letta agent / project, user 也不验)
+        request.state.metrics_model = model
         import httpx
 
         _internal_keys = {"files", "_letta_files", "user_id", "user_name", "user_email", "user_role", "user"}
@@ -750,14 +799,21 @@ async def chat_completions(request: Request):
             detail="会话正在清理/重建, 请稍后重试",
         )
 
+    # Day 2 #13: 把 request.state 当 metrics sink 传下去, 让 stream/non-stream
+    # 内部回填 TTFT/tokens. middleware finally 阶段读这些字段写入 metrics 表.
+    request.state.metrics_user_id = user["id"]
+    request.state.metrics_project_id = project
+    request.state.metrics_agent_id = agent_id
+    request.state.metrics_model = model
+
     # 流式：调 Letta 的 streaming API 边收边转发
     if body.get("stream", False):
         return StreamingResponse(
-            stream_from_letta(agent_id, user_message, model, notice_prefix=notice_prefix),
+            stream_from_letta(agent_id, user_message, model, notice_prefix=notice_prefix, metrics_sink=request.state),
             media_type="text/event-stream",
         )
     else:
-        return await non_stream_response(agent_id, user_message, model, notice_prefix=notice_prefix)
+        return await non_stream_response(agent_id, user_message, model, notice_prefix=notice_prefix, metrics_sink=request.state)
 
 
 # ===== 挂载管理 API =====
@@ -781,3 +837,11 @@ app.include_router(webui_hook_router)
 # Nexus 2.0: 记忆治理 API (trace + conflict)
 from memory_api import router as memory_router
 app.include_router(memory_router)
+
+# Issue #13: 运营 metrics 聚合 API (timeseries / leaderboard / summary)
+from metrics_api import router as metrics_router
+app.include_router(metrics_router)
+
+# Issue #14 Day 4: 组织树管理 API
+from admin_orgs_api import router as admin_orgs_router
+app.include_router(admin_orgs_router)
