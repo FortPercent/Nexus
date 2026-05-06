@@ -1,0 +1,46 @@
+services:
+  pg:
+    image: pgvector/pgvector:pg15
+    container_name: spike-pg
+    environment:
+      POSTGRES_USER: letta
+      POSTGRES_PASSWORD: spike
+      POSTGRES_DB: letta
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./pg-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "sh", "-c", "pg_isready -U letta && psql -U letta -d letta -c 'SELECT 1 FROM pg_extension WHERE extname=\\'vector\\'' | grep -q '1 row'"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  mock-vllm:
+    build: ./mock-vllm
+    container_name: spike-mock-vllm
+    ports:
+      - "18000:8000"
+    volumes:
+      - ./logs:/logs
+    environment:
+      # 留空 = mock 模式 (返假响应); 填上 = proxy 模式 (转发到真上游, dump+真回答)
+      PROXY_TARGET: ${PROXY_TARGET:-}
+      PROXY_API_KEY: ${PROXY_API_KEY:-}
+      PROXY_MODEL: ${PROXY_MODEL:-}
+
+  letta:
+    image: letta/letta:latest
+    container_name: spike-letta
+    platform: linux/amd64
+    depends_on:
+      pg:
+        condition: service_healthy
+      mock-vllm:
+        condition: service_started
+    environment:
+      LETTA_PG_URI: postgresql://letta:spike@pg:5432/letta
+      OPENAI_API_KEY: dummy-spike-key
+      OPENAI_API_BASE: http://mock-vllm:8000/v1
+    ports:
+      - "8283:8283"
