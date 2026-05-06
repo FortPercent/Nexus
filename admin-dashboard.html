@@ -1184,7 +1184,7 @@ function OperationsPage({ back }) {
   const [groupBy, setGroupBy] = useState("");
   const [summary, setSummary] = useState(null);
   const [series, setSeries] = useState([]);
-  const [boards, setBoards] = useState({user_id:[],project_id:[],endpoint:[]});
+  const [boards, setBoards] = useState({user_id:[],project_id:[]});
   const [loading, setLoading] = useState(false);
   const chartRef = useRef(null);
   const chartInst = useRef(null);
@@ -1193,19 +1193,17 @@ function OperationsPage({ back }) {
     setLoading(true);
     try {
       const qs = `hours=${hours}`;
-      const [s, ts, lb_user, lb_proj, lb_ep] = await Promise.all([
+      const [s, ts, lb_user, lb_proj] = await Promise.all([
         api(`/metrics/summary?${qs}`),
         api(`/metrics/timeseries?${qs}&bucket=${bucket}${groupBy?`&group_by=${groupBy}`:""}`),
         api(`/metrics/leaderboard?dim=user_id&metric=count&${qs}&top=10`),
         api(`/metrics/leaderboard?dim=project_id&metric=count&${qs}&top=10`),
-        api(`/metrics/leaderboard?dim=endpoint&metric=count&${qs}&top=10`),
       ]);
       setSummary(s);
       setSeries(ts?.series || []);
       setBoards({
         user_id: lb_user?.rows || [],
         project_id: lb_proj?.rows || [],
-        endpoint: lb_ep?.rows || [],
       });
     } finally { setLoading(false); }
   }, [hours, bucket, groupBy]);
@@ -1305,7 +1303,6 @@ function OperationsPage({ back }) {
     <Anim delay={150}><div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:12}}>
       <LB title="用户排行" rows={boards.user_id} unit="次"/>
       <LB title="项目排行" rows={boards.project_id} unit="次"/>
-      <LB title="端点排行" rows={boards.endpoint} unit="次"/>
     </div></Anim>
   </div>;
 }
