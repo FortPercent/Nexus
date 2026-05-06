@@ -938,16 +938,26 @@ function OrgPage_Admin({ back }) {
     <Anim><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
       <div>
         <button onClick={back} style={{background:"none",border:"none",fontSize:11,color:C.slateL,cursor:"pointer",padding:0,marginBottom:4}}>← 返回</button>
-        <div style={{fontSize:20,fontWeight:700,color:C.slate}}>组织树管理</div>
-        <div style={{fontSize:11,color:C.slateL}}>部门 / 成员 / 项目共享 / Letta block 绑定</div>
+        <div style={{fontSize:20,fontWeight:700,color:C.slate}}>组织管理</div>
+        <div style={{fontSize:11,color:C.slateL}}>部门树 · 成员 · 项目共享 · 共享知识</div>
       </div>
       <div style={{display:"flex",gap:8}}>
         <Btn onClick={load}>{loading?"加载中...":"刷新"}</Btn>
-        <Btn v="primary" onClick={()=>setShowCreate(true)}>+ 创建 org</Btn>
+        <Btn v="primary" onClick={()=>setShowCreate(true)}>+ 创建部门</Btn>
       </div>
     </div></Anim>
 
     {msg && <Anim><div style={{padding:"8px 12px",background:"#FEF3C7",border:"1px solid #FCD34D",borderRadius:8,fontSize:11,marginBottom:12,color:"#92400E"}}>{msg}</div></Anim>}
+
+    <Anim delay={30}><div style={{padding:"10px 14px",background:"#F0F9FF",border:"1px solid #BAE6FD",borderRadius:8,fontSize:11,color:"#075985",marginBottom:12,lineHeight:1.7}}>
+      <div style={{fontWeight:600,marginBottom:4}}>这页是干嘛的</div>
+      建组织树 (局/委办局 → 部门/处 → 科/分支), 把<b>用户</b>挂进部门, 再把<b>项目</b>挂到部门下. 这样:
+      <ul style={{margin:"4px 0 0 18px",padding:0}}>
+        <li>部门成员能在聊天侧栏看到部门挂的所有项目, 不用一个个加</li>
+        <li>"共享知识"那段写部门规章 / 汇报口径, 部门所有成员的 AI 助手都能读到</li>
+        <li>子部门递归继承父部门的项目和共享知识</li>
+      </ul>
+    </div></Anim>
 
     <Anim delay={50}><div style={{display:"grid",gridTemplateColumns:"320px 1fr",gap:12}}>
       {/* 左: 树 */}
@@ -974,10 +984,9 @@ function OrgTreeNode({ node, tree, depth, selected, setSelected }) {
   return <div>
     <div onClick={()=>setSelected(node.id)} style={{padding:"6px 8px",borderRadius:6,cursor:"pointer",background:isSel?"#EFF6FF":"transparent",marginLeft:depth*14,fontSize:12}}>
       <span style={{fontWeight:isSel?600:500,color:isSel?"#1D4ED8":C.slate}}>{node.name}</span>
-      <span style={{fontSize:10,color:C.slateL,marginLeft:6,fontFamily:"var(--fn)"}}>{node.code}</span>
-      <span style={{fontSize:10,color:C.slateL,marginLeft:8}}>👥 {node.member_count}</span>
-      {node.project_count>0 && <span style={{fontSize:10,color:C.slateL,marginLeft:6}}>📁 {node.project_count}</span>}
-      {node.letta_block_id && <span style={{fontSize:10,color:"#10B981",marginLeft:6}} title={node.letta_block_id}>● block</span>}
+      <span style={{fontSize:10,color:C.slateL,marginLeft:8}} title="部门成员">👥 {node.member_count}</span>
+      {node.project_count>0 && <span style={{fontSize:10,color:C.slateL,marginLeft:6}} title="挂载项目数">📁 {node.project_count}</span>}
+      {node.letta_block_id && <span style={{fontSize:10,color:"#10B981",marginLeft:6}} title="已配置共享知识">● 共享知识</span>}
     </div>
     {children.map(c => <OrgTreeNode key={c.id} node={c} tree={tree} depth={depth+1} selected={selected} setSelected={setSelected}/>)}
   </div>;
@@ -986,9 +995,10 @@ function OrgTreeNode({ node, tree, depth, selected, setSelected }) {
 function OrgDetailPanel({ orgId, orgs, onChanged }) {
   const node = orgs.find(o => o.id === orgId);
   const [members, setMembers] = useState([]);
-  const [orgProjects, setOrgProjects] = useState([]);  // Day 5: org 关联的 project (反向 endpoint)
+  const [orgProjects, setOrgProjects] = useState([]);
   const [editName, setEditName] = useState("");
-  const [editBlock, setEditBlock] = useState("");
+  const [blockContent, setBlockContent] = useState("");
+  const [blockOrigContent, setBlockOrigContent] = useState("");
   const [newMemberId, setNewMemberId] = useState("");
   const [newMemberRole, setNewMemberRole] = useState("member");
   const [newProjId, setNewProjId] = useState("");
@@ -1002,20 +1012,31 @@ function OrgDetailPanel({ orgId, orgs, onChanged }) {
   useEffect(() => {
     if (!node) return;
     setEditName(node.name);
-    setEditBlock(node.letta_block_id || "");
     api(`/orgs/${orgId}/members`).then(r => setMembers(r?.members || []));
+    api(`/orgs/${orgId}/block-content`).then(r => {
+      const c = r?.content || "";
+      setBlockContent(c); setBlockOrigContent(c);
+    });
     reloadProjects();
   }, [orgId, node, reloadProjects]);
 
   if (!node) return <div style={{padding:24,fontSize:12,color:C.slateL}}>org 未找到</div>;
 
   const saveProfile = async () => {
-    const body = {};
-    if (editName !== node.name) body.name = editName;
-    if (editBlock !== (node.letta_block_id||"")) body.letta_block_id = editBlock;
-    if (Object.keys(body).length === 0) return;
-    try { await api(`/orgs/${orgId}`, {method:"PATCH", body}); onChanged("已保存"); }
-    catch(e) { onChanged("保存失败: "+e.message.slice(0,80)); }
+    let saved = false;
+    if (editName !== node.name) {
+      try { await api(`/orgs/${orgId}`, {method:"PATCH", body:{name: editName}}); saved = true; }
+      catch(e) { onChanged("名称保存失败: "+e.message.slice(0,80)); return; }
+    }
+    if (blockContent !== blockOrigContent) {
+      try {
+        await api(`/orgs/${orgId}/block-content`, {method:"PUT", body:{content: blockContent}});
+        setBlockOrigContent(blockContent);
+        saved = true;
+      }
+      catch(e) { onChanged("共享知识保存失败: "+e.message.slice(0,80)); return; }
+    }
+    if (saved) onChanged("已保存");
   };
 
   const addMember = async () => {
@@ -1061,69 +1082,81 @@ function OrgDetailPanel({ orgId, orgs, onChanged }) {
     } catch(e) { onChanged("失败: "+e.message.slice(0,80)); }
   };
 
+  const orgTypeCN = {bureau:"局/委办局", department:"部门/处", division:"科/分支"}[node.org_type] || node.org_type;
   return <div style={{padding:"16px 18px",background:"#fff",borderRadius:10,border:"1px solid "+C.bdrL}}>
     {/* 基本信息 */}
     <div style={{marginBottom:18}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
         <div style={{fontSize:14,fontWeight:700,color:C.slate}}>{node.name}</div>
-        <div style={{fontSize:10,color:C.slateL,fontFamily:"var(--fn)"}}>{node.code} · {node.org_type} · {node.id}</div>
+        <div style={{fontSize:10,color:C.slateL}}>类型: {orgTypeCN} · 代码: <span style={{fontFamily:"var(--fn)"}}>{node.code}</span></div>
       </div>
-      <div style={{display:"grid",gridTemplateColumns:"100px 1fr",gap:8,fontSize:12,alignItems:"center"}}>
-        <span style={{color:C.slateL}}>名称</span>
+      <div style={{display:"grid",gridTemplateColumns:"100px 1fr",gap:8,fontSize:12,alignItems:"start"}}>
+        <span style={{color:C.slateL,paddingTop:6}}>部门名称</span>
         <input value={editName} onChange={e=>setEditName(e.target.value)} style={{padding:"4px 8px",fontSize:12,borderRadius:6,border:"1px solid "+C.bdrL}}/>
-        <span style={{color:C.slateL}}>Letta block</span>
-        <input value={editBlock} onChange={e=>setEditBlock(e.target.value)} placeholder="block-xxx (可选, 解绑留空)" style={{padding:"4px 8px",fontSize:11,fontFamily:"var(--fn)",borderRadius:6,border:"1px solid "+C.bdrL}}/>
+        <span style={{color:C.slateL,paddingTop:6}}>共享知识</span>
+        <div>
+          <textarea
+            value={blockContent}
+            onChange={e=>setBlockContent(e.target.value)}
+            placeholder="部门规章 / 汇报口径 / 术语表 / 通用要求...&#10;&#10;留空则不挂共享知识. 修改后保存, 该部门成员的所有 AI 助手都会读到."
+            style={{width:"100%",minHeight:120,padding:"6px 10px",fontSize:11,lineHeight:1.6,borderRadius:6,border:"1px solid "+C.bdrL,resize:"vertical",fontFamily:"var(--ft)",boxSizing:"border-box"}}/>
+          <div style={{fontSize:10,color:C.slateL,marginTop:3}}>{blockContent.length} / 10000 字 — 这里写的内容会进入该部门成员所有 AI 助手的系统提示</div>
+        </div>
       </div>
       <div style={{marginTop:10,display:"flex",gap:8}}>
         <Btn v="primary" onClick={saveProfile}>保存</Btn>
-        <Btn onClick={delOrg} style={{background:"#FEE2E2",color:"#991B1B"}}>删除 org</Btn>
+        <Btn onClick={delOrg} style={{background:"#FEE2E2",color:"#991B1B"}}>删除部门</Btn>
       </div>
     </div>
 
-    {/* 成员 */}
+    {/* 部门成员 */}
     <div style={{marginBottom:18}}>
-      <div style={{fontSize:11,fontWeight:600,color:C.slateL,textTransform:"uppercase",marginBottom:8}}>成员 ({members.length})</div>
+      <div style={{fontSize:11,fontWeight:600,color:C.slateL,marginBottom:4}}>部门成员 ({members.length})</div>
+      <div style={{fontSize:10,color:C.slateL,marginBottom:8}}>属于该部门的用户. 部门下"可访问的项目"对所有成员可见.</div>
       <div style={{maxHeight:240,overflowY:"auto",marginBottom:10}}>
         {members.map(m => <div key={m.user_id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"4px 8px",borderBottom:"1px solid #f3f4f6",fontSize:11}}>
           <div>
-            <span style={{fontWeight:500,color:C.slate}}>{m.name||m.user_id}</span>
-            <span style={{color:C.slateL,marginLeft:6}}>{m.email}</span>
-            <span style={{fontSize:9,marginLeft:6,padding:"1px 5px",background:m.role==="admin"?"#DBEAFE":"#F3F4F6",borderRadius:4,color:m.role==="admin"?"#1E40AF":C.slateL}}>{m.role}</span>
+            <span style={{fontWeight:500,color:C.slate}}>{m.name||"(未知用户)"}</span>
+            {m.email && <span style={{color:C.slateL,marginLeft:6}}>{m.email}</span>}
+            <span style={{fontSize:9,marginLeft:6,padding:"1px 5px",background:m.role==="admin"?"#DBEAFE":"#F3F4F6",borderRadius:4,color:m.role==="admin"?"#1E40AF":C.slateL}}>{m.role==="admin"?"管理员":"成员"}</span>
           </div>
           <button onClick={()=>delMember(m.user_id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:10,color:"#DC2626"}}>移除</button>
         </div>)}
         {members.length === 0 && <div style={{fontSize:11,color:C.slateL,padding:8}}>暂无成员</div>}
       </div>
       <div style={{display:"flex",gap:6}}>
-        <input value={newMemberId} onChange={e=>setNewMemberId(e.target.value)} placeholder="user_id" style={{flex:1,padding:"4px 8px",fontSize:11,fontFamily:"var(--fn)",borderRadius:6,border:"1px solid "+C.bdrL}}/>
+        <input value={newMemberId} onChange={e=>setNewMemberId(e.target.value)} placeholder="用户 ID (UUID)" style={{flex:1,padding:"4px 8px",fontSize:11,fontFamily:"var(--fn)",borderRadius:6,border:"1px solid "+C.bdrL}}/>
         <select value={newMemberRole} onChange={e=>setNewMemberRole(e.target.value)} style={{padding:"4px 8px",fontSize:11,borderRadius:6,border:"1px solid "+C.bdrL}}>
-          <option value="member">member</option>
-          <option value="admin">admin</option>
+          <option value="member">成员</option>
+          <option value="admin">管理员</option>
         </select>
         <Btn onClick={addMember}>加入</Btn>
       </div>
     </div>
 
-    {/* 关联项目 (Day 5) */}
+    {/* 该部门可访问的项目 */}
     <div>
-      <div style={{fontSize:11,fontWeight:600,color:C.slateL,textTransform:"uppercase",marginBottom:8}}>关联项目 ({orgProjects.length})</div>
+      <div style={{fontSize:11,fontWeight:600,color:C.slateL,marginBottom:4}}>该部门可访问的项目 ({orgProjects.length})</div>
+      <div style={{fontSize:10,color:C.slateL,marginBottom:8}}>挂上后, 部门成员能在聊天侧栏看到这些项目. 子部门递归继承.</div>
       <div style={{maxHeight:200,overflowY:"auto",marginBottom:10}}>
-        {orgProjects.map(p => <div key={p.project_id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"4px 8px",borderBottom:"1px solid #f3f4f6",fontSize:11}}>
-          <div>
-            <span style={{fontWeight:500,color:C.slate}}>{p.name}</span>
-            <span style={{fontFamily:"var(--fn)",color:C.slateL,marginLeft:6,fontSize:10}}>{p.project_id}</span>
-            <span style={{fontSize:9,marginLeft:6,padding:"1px 5px",borderRadius:4,background:p.access_level==="owner"?"#FEE2E2":p.access_level==="shared_write"?"#DBEAFE":"#F3F4F6",color:p.access_level==="owner"?"#991B1B":p.access_level==="shared_write"?"#1E40AF":C.slateL}}>{p.access_level}</span>
-          </div>
-          <button onClick={()=>detachProject(p.project_id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:10,color:"#DC2626"}}>解绑</button>
-        </div>)}
-        {orgProjects.length === 0 && <div style={{fontSize:11,color:C.slateL,padding:8}}>暂无关联项目</div>}
+        {orgProjects.map(p => {
+          const accessCN = {owner:"项目所有者", shared_write:"可读写", shared_read:"可读"}[p.access_level] || p.access_level;
+          return <div key={p.project_id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"4px 8px",borderBottom:"1px solid #f3f4f6",fontSize:11}}>
+            <div>
+              <span style={{fontWeight:500,color:C.slate}}>{p.name}</span>
+              <span style={{fontSize:9,marginLeft:6,padding:"1px 5px",borderRadius:4,background:p.access_level==="owner"?"#FEE2E2":p.access_level==="shared_write"?"#DBEAFE":"#F3F4F6",color:p.access_level==="owner"?"#991B1B":p.access_level==="shared_write"?"#1E40AF":C.slateL}}>{accessCN}</span>
+            </div>
+            <button onClick={()=>detachProject(p.project_id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:10,color:"#DC2626"}}>解绑</button>
+          </div>;
+        })}
+        {orgProjects.length === 0 && <div style={{fontSize:11,color:C.slateL,padding:8}}>暂未关联项目</div>}
       </div>
       <div style={{display:"flex",gap:6}}>
-        <input value={newProjId} onChange={e=>setNewProjId(e.target.value)} placeholder="project_id" style={{flex:1,padding:"4px 8px",fontSize:11,fontFamily:"var(--fn)",borderRadius:6,border:"1px solid "+C.bdrL}}/>
+        <input value={newProjId} onChange={e=>setNewProjId(e.target.value)} placeholder="项目 ID (slug, 如 ai-infra)" style={{flex:1,padding:"4px 8px",fontSize:11,fontFamily:"var(--fn)",borderRadius:6,border:"1px solid "+C.bdrL}}/>
         <select value={newProjAccess} onChange={e=>setNewProjAccess(e.target.value)} style={{padding:"4px 8px",fontSize:11,borderRadius:6,border:"1px solid "+C.bdrL}}>
-          <option value="shared_read">shared_read</option>
-          <option value="shared_write">shared_write</option>
-          <option value="owner">owner</option>
+          <option value="shared_read">可读</option>
+          <option value="shared_write">可读写</option>
+          <option value="owner">项目所有者</option>
         </select>
         <Btn onClick={attachProject}>挂载</Btn>
       </div>
@@ -1147,23 +1180,27 @@ function CreateOrgModal({ orgs, onClose, onCreated }) {
   };
 
   return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:100,display:"flex",alignItems:"center",justifyContent:"center"}}>
-    <div style={{background:"#fff",borderRadius:12,padding:24,width:420,maxWidth:"90vw"}}>
-      <div style={{fontSize:16,fontWeight:700,color:C.slate,marginBottom:16}}>创建组织</div>
-      <div style={{display:"grid",gridTemplateColumns:"80px 1fr",gap:10,fontSize:12,alignItems:"center"}}>
-        <span>名称</span>
-        <input value={name} onChange={e=>setName(e.target.value)} style={{padding:"6px 10px",fontSize:12,borderRadius:6,border:"1px solid "+C.bdrL}}/>
-        <span>code</span>
-        <input value={code} onChange={e=>setCode(e.target.value.toLowerCase())} placeholder="lowercase-with-hyphens" style={{padding:"6px 10px",fontSize:11,fontFamily:"var(--fn)",borderRadius:6,border:"1px solid "+C.bdrL}}/>
-        <span>类型</span>
+    <div style={{background:"#fff",borderRadius:12,padding:24,width:440,maxWidth:"90vw"}}>
+      <div style={{fontSize:16,fontWeight:700,color:C.slate,marginBottom:4}}>创建部门</div>
+      <div style={{fontSize:11,color:C.slateL,marginBottom:16}}>建一个新的组织节点 (局/部门/科). 创建后可在树里挂用户和项目.</div>
+      <div style={{display:"grid",gridTemplateColumns:"90px 1fr",gap:10,fontSize:12,alignItems:"start"}}>
+        <span style={{paddingTop:6}}>部门名称</span>
+        <input value={name} onChange={e=>setName(e.target.value)} placeholder="例: 市城运 / 应急响应处" style={{padding:"6px 10px",fontSize:12,borderRadius:6,border:"1px solid "+C.bdrL}}/>
+        <span style={{paddingTop:6}}>部门代码</span>
+        <div>
+          <input value={code} onChange={e=>setCode(e.target.value.toLowerCase())} placeholder="例: shchengyun-yingji-chu" style={{width:"100%",padding:"6px 10px",fontSize:11,fontFamily:"var(--fn)",borderRadius:6,border:"1px solid "+C.bdrL,boxSizing:"border-box"}}/>
+          <div style={{fontSize:10,color:C.slateL,marginTop:2}}>仅小写字母 / 数字 / 连字符. 系统内部唯一标识, 一旦确定不建议改.</div>
+        </div>
+        <span style={{paddingTop:6}}>层级</span>
         <select value={orgType} onChange={e=>setOrgType(e.target.value)} style={{padding:"6px 10px",fontSize:12,borderRadius:6,border:"1px solid "+C.bdrL}}>
-          <option value="bureau">bureau (委办局/局)</option>
-          <option value="department">department (处/部门)</option>
-          <option value="division">division (科/分支)</option>
+          <option value="bureau">局 / 委办局</option>
+          <option value="department">部门 / 处</option>
+          <option value="division">科 / 分支</option>
         </select>
-        <span>父节点</span>
+        <span style={{paddingTop:6}}>所属上级</span>
         <select value={parentId} onChange={e=>setParentId(e.target.value)} style={{padding:"6px 10px",fontSize:12,borderRadius:6,border:"1px solid "+C.bdrL}}>
-          <option value="">(顶层)</option>
-          {orgs.map(o => <option key={o.id} value={o.id}>{o.name} · {o.code}</option>)}
+          <option value="">(顶层 / 没有上级)</option>
+          {orgs.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
         </select>
       </div>
       {err && <div style={{padding:"6px 10px",background:"#FEE2E2",color:"#991B1B",fontSize:11,borderRadius:6,marginTop:10}}>{err}</div>}

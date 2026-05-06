@@ -368,6 +368,52 @@ def test_t19b_no_token_401(app_db):
 
 # ---------------- cache invalidation ----------------
 
+def test_t22_list_members_filters_test_users(app_db):
+    """list_org_members 应过滤掉 bench_* 测试用户 + @local.test 邮箱 + admin@aiinfra.local 系统账号."""
+    app, db_path, root_id = app_db
+    c = _client(app)
+    # 插入垃圾 user 到 user_cache + 直接挂 root org_members
+    raw = sqlite3.connect(db_path)
+    raw.execute("INSERT INTO user_cache (user_id, name, email) VALUES (?, ?, ?)",
+                ("bench_999", "bench_clear_999", "bench_999@local.test"))
+    raw.execute("INSERT INTO user_cache (user_id, name, email) VALUES (?, ?, ?)",
+                ("aiinfra-admin", "Admin", "admin@aiinfra.local"))
+    raw.execute("INSERT INTO user_cache (user_id, name, email) VALUES (?, ?, ?)",
+                ("real-user-1", "Real User", "real@example.com"))
+    raw.execute("INSERT OR IGNORE INTO org_members (org_id, user_id, role) VALUES (?, ?, 'member')",
+                (root_id, "bench_999"))
+    raw.execute("INSERT OR IGNORE INTO org_members (org_id, user_id, role) VALUES (?, ?, 'member')",
+                (root_id, "aiinfra-admin"))
+    raw.execute("INSERT OR IGNORE INTO org_members (org_id, user_id, role) VALUES (?, ?, 'member')",
+                (root_id, "real-user-1"))
+    raw.commit(); raw.close()
+
+    r = c.get(f"/admin/api/orgs/{root_id}/members", headers=_hdrs())
+    members = r.json()["members"]
+    user_ids = {m["user_id"] for m in members}
+    assert "bench_999" not in user_ids  # bench_* 过滤
+    assert "aiinfra-admin" not in user_ids  # @aiinfra.local 过滤
+    assert "real-user-1" in user_ids  # 真实用户保留
+
+
+def test_t23_block_content_get_empty_org(app_db):
+    """org 没绑 block → GET 返 content=''."""
+    app, _, _ = app_db
+    c = _client(app)
+    a = c.post("/admin/api/orgs", json={"name":"A", "code":"p23"}, headers=_hdrs()).json()
+    r = c.get(f"/admin/api/orgs/{a['id']}/block-content", headers=_hdrs())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["block_id"] is None
+    assert body["content"] == ""
+
+
+def test_t24_block_content_404_on_unknown_org(app_db):
+    app, _, _ = app_db
+    r = _client(app).get("/admin/api/orgs/no-such-org/block-content", headers=_hdrs())
+    assert r.status_code == 404
+
+
 def test_t21_list_org_projects_reverse(app_db):
     """GET /orgs/{id}/projects 反向列 org 挂的 projects."""
     app, _, _ = app_db

@@ -203,6 +203,7 @@ async def delete_org(org_id: str, user=Depends(require_org_admin)):
 
 @router.get("/orgs/{org_id}/members")
 async def list_org_members(org_id: str, user=Depends(require_org_admin)):
+    """列成员, UI 视角: 过滤掉测试 / 系统账号 (压测脚本残留 + 系统 admin)."""
     async with use_db_async() as db:
         async with db.execute(
             """
@@ -210,12 +211,90 @@ async def list_org_members(org_id: str, user=Depends(require_org_admin)):
               FROM org_members om
               LEFT JOIN user_cache uc ON uc.user_id = om.user_id
              WHERE om.org_id = ?
+               AND om.user_id NOT LIKE 'bench_%'
+               AND COALESCE(uc.email, '') NOT LIKE '%@local.test'
+               AND COALESCE(uc.email, '') NOT LIKE '%@aiinfra.local'
              ORDER BY uc.name, om.user_id
             """,
             (org_id,),
         ) as cur:
             rows = await cur.fetchall()
     return {"members": [dict(r) for r in rows]}
+
+
+# ----------- /admin/api/orgs/{org_id}/block-content (Day 5+: 部门共享知识) -----------
+
+class BlockContentIn(BaseModel):
+    content: str = Field(..., max_length=10000)
+
+
+@router.get("/orgs/{org_id}/block-content")
+async def get_org_block_content(org_id: str, user=Depends(require_org_admin)):
+    """读取部门共享知识 (背后是 Letta block.value). 给 admin UI textarea 显示."""
+    async with use_db_async() as db:
+        async with db.execute("SELECT letta_block_id FROM organizations WHERE id = ?", (org_id,)) as cur:
+            row = await cur.fetchone()
+            if not row:
+                raise HTTPException(404, "org not found")
+            block_id = row["letta_block_id"]
+    if not block_id:
+        return {"block_id": None, "content": ""}
+    try:
+        from routing import letta as letta_client
+        block = letta_client.blocks.retrieve(block_id)
+        return {"block_id": block_id, "content": getattr(block, "value", "") or ""}
+    except Exception as e:
+        # block 在 letta 端被删但 db 引用没清, 显示空但不报错
+        return {"block_id": block_id, "content": "", "error": f"block not retrievable: {type(e).__name__}"}
+
+
+@router.put("/orgs/{org_id}/block-content")
+async def update_org_block_content(org_id: str, payload: BlockContentIn, user=Depends(require_org_admin)):
+    """admin 编辑部门共享知识. 后台 create/update letta block, 返新 block_id.
+
+    传空 content (or 全空白) → 解绑 + 删 block. 让 admin 透明操作 letta 内部.
+    """
+    content = (payload.content or "").strip()
+    async with use_db_async() as db:
+        async with db.execute("SELECT letta_block_id FROM organizations WHERE id = ?", (org_id,)) as cur:
+            row = await cur.fetchone()
+            if not row:
+                raise HTTPException(404, "org not found")
+            existing_block = row["letta_block_id"]
+
+    try:
+        from routing import letta as letta_client
+    except ImportError:
+        raise HTTPException(500, "letta client not available")
+
+    if not content:
+        if existing_block:
+            try:
+                letta_client.blocks.delete(existing_block)
+            except Exception:
+                pass
+        async with use_db_async() as db:
+            await db.execute("UPDATE organizations SET letta_block_id = NULL WHERE id = ?", (org_id,))
+        invalidate_cache()
+        return {"block_id": None, "content": ""}
+
+    label = f"org_{org_id[:12]}"
+    if existing_block:
+        try:
+            letta_client.blocks.update(existing_block, value=content)
+            block_id = existing_block
+        except Exception:
+            # block 在 letta 端不存在了 → 重建
+            block = letta_client.blocks.create(label=label, value=content)
+            block_id = block.id
+    else:
+        block = letta_client.blocks.create(label=label, value=content)
+        block_id = block.id
+
+    async with use_db_async() as db:
+        await db.execute("UPDATE organizations SET letta_block_id = ? WHERE id = ?", (block_id, org_id))
+    invalidate_cache()
+    return {"block_id": block_id, "content": content}
 
 
 @router.post("/orgs/{org_id}/members")
